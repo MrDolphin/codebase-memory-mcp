@@ -85,18 +85,6 @@ extern void suite_stack_overflow(void);
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
 
-/* LeakSanitizer (Linux x64) suppressions. scan_tag_name is in the vendored,
- * shared HTML-family tree-sitter scanner (common/scanner.h, used by cfml/html/…);
- * it leaks a small bounded tag-name buffer in an edge path of scan_start_tag_name's
- * tag-type switch. That is regenerated 3rd-party code whose tag_for_name
- * copy-vs-move ownership cannot be verified without HTML-family parse testing, so
- * the bounded leak is suppressed rather than risking a blind double-free patch.
- * (The larger sql scanner leak WAS fixed properly in sql/scanner.c.) */
-const char *__lsan_default_suppressions(void);
-const char *__lsan_default_suppressions(void) {
-    return "leak:scan_tag_name\n";
-}
-
 int main(void) {
     printf("\n  codebase-memory-mcp  C test suite\n");
 

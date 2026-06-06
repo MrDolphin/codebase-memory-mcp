@@ -1138,18 +1138,22 @@ static bool scan_start_tag_name(Scanner *scanner, TSLexer *lexer, bool is_cf_con
             return true;
         case CF_SET:
             lexer->result_symbol = CF_SET_START_TAG_NAME;
+            tag_free(&tag); /* not pushed to the stack — free its owned tag_name */
             return true;
         case CF_RETURN:
             lexer->result_symbol = CF_RETURN_START_TAG_NAME;
+            tag_free(&tag); /* not pushed to the stack — free its owned tag_name */
             return true;
         case CF_IF:
             lexer->result_symbol = CF_IF_START_TAG_NAME;
             break;
         case CF_ELSEIF:
             lexer->result_symbol = CF_ELSEIF_TAG_NAME;
+            tag_free(&tag); /* not pushed to the stack — free its owned tag_name */
             return true;
         case CF_ELSE:
             lexer->result_symbol = CF_ELSE_TAG_NAME;
+            tag_free(&tag); /* not pushed to the stack — free its owned tag_name */
             return true;
         case CF_XML:
             lexer->result_symbol = CF_XML_START_TAG_NAME;
