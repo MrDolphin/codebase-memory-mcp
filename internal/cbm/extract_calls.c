@@ -880,6 +880,25 @@ static bool is_url_or_topic_keyword(const char *key) {
     return false;
 }
 
+// Check if a struct-field name identifies a queue/topic target.  Cloud SDKs pass
+// the destination via a composite-literal input struct rather than a bare string
+// arg (e.g. Go `SendMessageInput{QueueUrl: ...}`, `PublishInput{TopicArn: ...}`).
+// Case-insensitive so QueueUrl/QueueURL/queue_url all match.
+static bool is_queue_topic_field(const char *key) {
+    static const char *fields[] = {"QueueUrl",  "QueueURL", "TopicArn",   "TopicARN",
+                                   "QueueName", "TopicName", "QueueArn",   "QueueARN",
+                                   "Destination", NULL};
+    if (!key || !key[0]) {
+        return false;
+    }
+    for (int i = 0; fields[i]; i++) {
+        if (strcasecmp(key, fields[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Extract string value from a node (literal or constant reference).
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node) {
     const char *vk = ts_node_type(val_node);
@@ -892,6 +911,73 @@ static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node) {
         char *const_name = cbm_node_text(ctx->arena, val_node, ctx->source);
         if (const_name) {
             return lookup_string_constant(ctx, const_name);
+        }
+    }
+    return NULL;
+}
+
+// Recover a queue/topic identity from a Go composite-literal input struct, e.g.
+//   &sqs.SendMessageInput{QueueUrl: queueUrl, MessageBody: body}
+//   sns.PublishInput{TopicArn: "arn:aws:sns:..."}
+// The dispatch target is carried by a struct field (QueueUrl/TopicArn/...), not a
+// bare string arg, so the async edge would otherwise degrade to a plain CALLS.
+// Returns the field's value: the string-literal content when present, else the
+// referenced identifier text (which still names the queue/topic for edge formation).
+static const char *extract_composite_queue_field(CBMExtractCtx *ctx, TSNode node) {
+    // Unwrap a pointer-of-composite: `&Type{...}` is a unary_expression whose
+    // operand is the composite_literal.
+    if (strcmp(ts_node_type(node), "unary_expression") == 0) {
+        TSNode operand = ts_node_child_by_field_name(node, TS_FIELD("operand"));
+        if (ts_node_is_null(operand)) {
+            return NULL;
+        }
+        node = operand;
+    }
+    if (strcmp(ts_node_type(node), "composite_literal") != 0) {
+        return NULL;
+    }
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        body = cbm_find_child_by_kind(node, "literal_value");
+    }
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode el = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(el), "keyed_element") != 0) {
+            continue;
+        }
+        // keyed_element children: key then value. Each side may be wrapped in a
+        // literal_element; unwrap to the underlying identifier/literal.
+        uint32_t ec = ts_node_named_child_count(el);
+        if (ec < PAIR_LEN) {
+            continue;
+        }
+        TSNode key_n = ts_node_named_child(el, 0);
+        TSNode val_n = ts_node_named_child(el, 1);
+        if (strcmp(ts_node_type(key_n), "literal_element") == 0 &&
+            ts_node_named_child_count(key_n) > 0) {
+            key_n = ts_node_named_child(key_n, 0);
+        }
+        if (strcmp(ts_node_type(val_n), "literal_element") == 0 &&
+            ts_node_named_child_count(val_n) > 0) {
+            val_n = ts_node_named_child(val_n, 0);
+        }
+        char *key = cbm_node_text(ctx->arena, key_n, ctx->source);
+        if (!is_queue_topic_field(key)) {
+            continue;
+        }
+        const char *resolved = extract_string_value(ctx, val_n);
+        if (resolved && resolved[0]) {
+            return resolved;
+        }
+        // Value is a variable/expression (no constant value); use its source text
+        // as the queue/topic identity so the async edge still forms.
+        char *raw = cbm_node_text(ctx->arena, val_n, ctx->source);
+        if (raw && raw[0]) {
+            return raw;
         }
     }
     return NULL;
@@ -950,6 +1036,16 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
                 return val;
             }
             continue;
+        }
+
+        /* Cloud SDK dispatch via input struct: the queue/topic target is a field
+         * of a composite literal (Go `&sqs.SendMessageInput{QueueUrl: ...}`), not
+         * a bare string arg. Recover it so the async edge forms. */
+        if (strcmp(ak, "composite_literal") == 0 || strcmp(ak, "unary_expression") == 0) {
+            const char *val = extract_composite_queue_field(ctx, arg);
+            if (val) {
+                return val;
+            }
         }
 
         if (ai < MAX_POSITIONAL_SCAN) {
