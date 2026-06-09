@@ -3418,11 +3418,22 @@ static int arch_hotspots(cbm_store_t *s, const char *project, cbm_architecture_i
     return CBM_STORE_OK;
 }
 
-/* Look up package name for a node ID in the parallel arrays. */
+/* Look up package name for a node ID in the parallel arrays. nids must be
+ * sorted ascending (the node query orders by id) — a linear scan here is
+ * O(E×N) across the edge loop and spun for >10 minutes on Linux-kernel-sized
+ * graphs (~1.4M defs × ~1.4M CALLS edges). */
 static const char *lookup_pkg(const int64_t *nids, char **npkgs, int nn, int64_t id) {
-    for (int i = 0; i < nn; i++) {
-        if (nids[i] == id) {
-            return npkgs[i];
+    int lo = 0;
+    int hi = nn - SKIP_ONE;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        if (nids[mid] == id) {
+            return npkgs[mid];
+        }
+        if (nids[mid] < id) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid - SKIP_ONE;
         }
     }
     return NULL;
@@ -3450,9 +3461,9 @@ static void accum_boundary(const char *src_pkg, const char *tgt_pkg, char **bfro
 
 static int arch_boundaries(cbm_store_t *s, const char *project, cbm_cross_pkg_boundary_t **out_arr,
                            int *out_count) {
-    /* Build nodeID → package map */
+    /* Build nodeID → package map. ORDER BY id so lookup_pkg can binary-search. */
     const char *nsql = "SELECT id, qualified_name FROM nodes WHERE project=?1 AND label IN "
-                       "('Function','Method','Class')";
+                       "('Function','Method','Class') ORDER BY id";
     sqlite3_stmt *nstmt = NULL;
     if (sqlite3_prepare_v2(s->db, nsql, CBM_NOT_FOUND, &nstmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_boundaries_nodes");

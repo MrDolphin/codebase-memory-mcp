@@ -24,6 +24,8 @@
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
 
 /* ── Helper: create architecture test store ──────────────────────── */
 
@@ -310,6 +312,66 @@ TEST(arch_boundaries) {
     ASSERT_TRUE(found_hs);
 
     cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* arch_boundaries used a LINEAR SCAN over all def nodes for EVERY CALLS edge
+ * (lookup_pkg over parallel arrays) — O(E×N). On the Linux kernel graph
+ * (~1.4M defs × ~1.4M CALLS) get_architecture spun >10 min at 100% CPU. The
+ * bug was latent while C call extraction was broken (few CALLS edges) and
+ * surfaced when extraction was fixed. This guards the linear(ish) behavior:
+ * 80k defs + 160k CALLS must finish the boundaries aspect well under the bound
+ * (the quadratic ≈ 1.3×10^10 scan steps takes ~17 s here; a log-time lookup
+ * is instant). */
+TEST(arch_boundaries_no_quadratic_scan) {
+    enum { BN_NODES = 80000, BN_EDGES = 160000, BN_PKGS = 200, BN_BOUND_MS = 8000 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "perf", "/tmp/perf");
+
+    cbm_store_begin(s);
+    int64_t *ids = malloc(BN_NODES * sizeof(int64_t));
+    ASSERT_NOT_NULL(ids);
+    for (int i = 0; i < BN_NODES; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "perf.pkg%d.fn%d", i % BN_PKGS, i);
+        cbm_node_t n = {.project = "perf",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "f.c"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    uint64_t rng = 42;
+    for (int i = 0; i < BN_EDGES; i++) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        int a = (int)((rng >> 33) % BN_NODES);
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        int b = (int)((rng >> 33) % BN_NODES);
+        cbm_edge_t e = {
+            .project = "perf", .source_id = ids[a], .target_id = ids[b], .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+    cbm_store_commit(s);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"boundaries"};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ASSERT_EQ(cbm_store_get_architecture(s, "perf", aspects, 1, &info), CBM_STORE_OK);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms =
+        (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    printf("    boundaries on %dk nodes/%dk edges: %.0f ms (bound %d)\n", BN_NODES / 1000,
+           BN_EDGES / 1000, ms, BN_BOUND_MS);
+    ASSERT_TRUE(info.boundary_count > 0); /* cross-package CALLS exist */
+    ASSERT_TRUE(ms < (double)BN_BOUND_MS);
+
+    cbm_store_architecture_free(&info);
+    free(ids);
     cbm_store_close(s);
     PASS();
 }
@@ -1194,6 +1256,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_routes);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_boundaries);
+    RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
