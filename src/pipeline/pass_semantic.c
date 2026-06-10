@@ -12,6 +12,7 @@
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
 #include "foundation/constants.h"
+#include "foundation/str_util.h" // cbm_json_escape
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
@@ -398,8 +399,13 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
         }
     }
     if (dec && node->id != dec->id) {
-        char props[CBM_SZ_256];
-        snprintf(props, sizeof(props), "{\"decorator\":\"%s\"}", decorator);
+        /* Decorator source text can contain quotes and raw newlines — escape
+         * it or the edge properties JSON is malformed (twin of the parallel
+         * path in pass_parallel.c). */
+        char esc_dec[CBM_SZ_256];
+        cbm_json_escape(esc_dec, sizeof(esc_dec), decorator);
+        char props[CBM_SZ_512];
+        snprintf(props, sizeof(props), "{\"decorator\":\"%s\"}", esc_dec);
         cbm_gbuf_insert_edge(ctx->gbuf, node->id, dec->id, "DECORATES", props);
         /* Ensure a reference edge exists so the decorator appears in usage queries
          * without being misclassified as a real call by downstream passes. */

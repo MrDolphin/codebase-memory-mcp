@@ -565,6 +565,68 @@ TEST(pipeline_def_props_valid_json_when_oversized) {
     PASS();
 }
 
+/* Edge properties must be VALID JSON. Decorator source text (quotes, raw
+ * newlines: @register.tag("block"), multi-line @override_settings) was
+ * interpolated raw into the DECORATES properties — django produced 3826
+ * malformed edges, and any json_extract-based consumer (including the
+ * url_path_gen generated-column evaluation during PRAGMA integrity_check)
+ * aborts on them. Usage/call emit sites had the same hole for sliced source
+ * text. */
+TEST(pipeline_edge_props_valid_json) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/deco.py", g_tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write deco.py");
+    }
+    fprintf(f, "from x import register\n"
+               "@register.tag(\"block\")\n"
+               "def do_block(parser):\n"
+               "    return parser\n"
+               "@register.tag(\"extends\")\n"
+               "def do_extends(parser):\n"
+               "    return parser\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_edge_props.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, project, "DECORATES", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_GT(edge_count, 0); /* the decorators must produce DECORATES edges */
+    for (int i = 0; i < edge_count; i++) {
+        const char *pj = edges[i].properties_json;
+        if (!pj) {
+            continue;
+        }
+        yyjson_doc *doc = yyjson_read(pj, strlen(pj), 0);
+        if (!doc) {
+            printf("    INVALID edge properties JSON: %.80s\n", pj);
+        }
+        ASSERT_NOT_NULL(doc);
+        yyjson_doc_free(doc);
+    }
+
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* ── Calls pass tests ──────────────────────────────────────────── */
 
 TEST(pipeline_calls_resolution) {
@@ -5630,6 +5692,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_definitions_defines_edges);
     RUN_TEST(pipeline_definitions_properties);
     RUN_TEST(pipeline_def_props_valid_json_when_oversized);
+    RUN_TEST(pipeline_edge_props_valid_json);
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     /* Calls pass */

@@ -1858,7 +1858,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         char uprops[CBM_SZ_256];
-        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", usage->ref_name);
+        char esc_ref[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
+        cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
+        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, "USAGE", uprops);
         ws->usages_resolved++;
     }
@@ -1984,8 +1986,14 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
                 cbm_gbuf_upsert_node(ws->local_edge_buf, "Decorator", fn, syn_qn, "", 0, 0, "{}");
         }
         if (dn_id != 0 && node->id != dn_id) {
-            char dp[CBM_SZ_256];
-            snprintf(dp, sizeof(dp), "{\"decorator\":\"%s\"}", def->decorators[dc]);
+            /* Decorator SOURCE TEXT can contain quotes and raw newlines
+             * (e.g. @register.tag("block"), multi-line @override_settings) —
+             * interpolating it raw produced malformed properties JSON that
+             * aborts every json_extract consumer (django: 3826 such edges). */
+            char esc_dec[CBM_SZ_256];
+            cbm_json_escape(esc_dec, sizeof(esc_dec), def->decorators[dc]);
+            char dp[CBM_SZ_512];
+            snprintf(dp, sizeof(dp), "{\"decorator\":\"%s\"}", esc_dec);
             cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn_id, "DECORATES", dp);
             /* Ensure a reference-style edge exists so the decorator appears in queries
              * without being misclassified as a real call by downstream passes. */
