@@ -162,6 +162,30 @@ If you add a new `system()`, `popen()`, `fork()`, or network call, it must be ju
 
 Check [issues labeled `good first issue`](https://github.com/DeusData/codebase-memory-mcp/labels/good%20first%20issue) for beginner-friendly tasks with clear scope and guidance.
 
-## License
+## License and sign-off (DCO) — required on every commit
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+All contributions are licensed under the project's MIT License
+(inbound = outbound). To make that explicit and permanent, this project
+uses the [Developer Certificate of Origin 1.1](DCO) — the same mechanism
+as the Linux kernel: **every commit must carry a `Signed-off-by` trailer
+matching the commit author.**
+
+```bash
+git commit -s             # adds: Signed-off-by: Your Name <you@example.com>
+```
+
+By signing off you certify (per the [DCO](DCO)) that you wrote the change
+or otherwise have the right to submit it under the MIT license.
+
+Enforcement is strict and automated:
+
+- CI rejects every push and pull request containing an unsigned commit
+  (`scripts/check-dco.sh`).
+- Install the local hook so unsigned commits are rejected at commit time:
+
+```bash
+scripts/install-git-hooks.sh
+```
+
+Forgot to sign? `git commit --amend -s` fixes the last commit;
+`git rebase --signoff <base>` fixes a whole branch.
