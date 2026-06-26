@@ -558,8 +558,9 @@ static TSNode find_first_descendant_by_kind(TSNode node,
     return null_node;
 }
 
-// Forward declaration for mutual recursion.
-static TSNode resolve_func_name(TSNode node, CBMLanguage lang);
+// Forward declaration for mutual recursion. Exported (see helpers.h) so the
+// unified/calls extractor shares this one resolver — see cbm_resolve_func_name.
+TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 
 static bool is_cpp_template_inner_kind(const char *kind) {
     return strcmp(kind, "function_definition") == 0 || strcmp(kind, "declaration") == 0 ||
@@ -639,7 +640,7 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
 
 // Resolve the name node for a function, handling language-specific quirks.
 // Uses a loop to handle template_declaration unwrapping (avoids recursion).
-static TSNode resolve_func_name(TSNode node, CBMLanguage lang) {
+TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
     enum { MAX_TEMPLATE_DEPTH = 2 };
     for (int tmpl_depth = 0; tmpl_depth < MAX_TEMPLATE_DEPTH; tmpl_depth++) {
         const char *kind = ts_node_type(node);
@@ -2671,7 +2672,7 @@ static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source)
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
-    TSNode name_node = resolve_func_name(node, ctx->language);
+    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
     if (ts_node_is_null(name_node)) {
         return;
     }
@@ -3457,7 +3458,7 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
          lang == CBM_LANG_GLSL) &&
         strcmp(ck, "function_definition") == 0) {
-        return resolve_func_name(child, lang);
+        return cbm_resolve_func_name(child, lang);
     }
 
     if (lang == CBM_LANG_GROOVY && strcmp(ck, "function_definition") == 0) {

@@ -87,27 +87,6 @@ static const char *compute_wolfram_func_qn(CBMExtractCtx *ctx, TSNode node) {
     return NULL;
 }
 
-// Resolve the name node for a function, handling arrow functions.
-static TSNode resolve_func_name_node(TSNode node) {
-    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-    if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "arrow_function") == 0) {
-        TSNode parent = ts_node_parent(node);
-        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
-            name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
-        }
-    }
-    /* Grammars without a `name` field (e.g. newer tree-sitter-kotlin): the
-     * function name is a simple_identifier child of function_declaration. */
-    if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "function_declaration") == 0) {
-        name_node = cbm_find_child_by_kind(node, "simple_identifier");
-    }
-    /* C/C++/CUDA/GLSL: function_definition name lives in the declarator chain. */
-    if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "function_definition") == 0) {
-        name_node = cbm_resolve_c_declarator_name_node(node);
-    }
-    return name_node;
-}
-
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
@@ -116,7 +95,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return compute_wolfram_func_qn(ctx, node);
     }
 
-    TSNode name_node = resolve_func_name_node(node);
+    /* Resolve the function name via the single shared resolver (extract_defs) so
+     * call-scope attribution agrees with definition extraction across all ~130
+     * grammars. The old private 4-case copy returned NULL for Fortran subroutine,
+     * SCSS mixin, SQL create_function, Julia short-form, etc., so
+     * push_boundary_scopes never pushed a SCOPE_FUNC and the calls inside were
+     * mis-attributed to the enclosing Module (QUALITY_ANALYSIS gap #3). */
+    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
     if (ts_node_is_null(name_node)) {
         return NULL;
     }

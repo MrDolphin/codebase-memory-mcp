@@ -507,7 +507,7 @@ static const char *elixir_var_types[] = {"binary_operator", NULL};
 
 // ==================== HASKELL ====================
 /* "bind" = a nullary value binding (`foo = 1`); has a `name` field like `function`.
- * `signature` (type annotations) is suppressed in resolve_func_name so it never doubles. */
+ * `signature` (type annotations) is suppressed in cbm_resolve_func_name so it never doubles. */
 static const char *haskell_func_types[] = {"function", "signature", "bind", NULL};
 static const char *haskell_class_types[] = {"class", "data_type", "newtype", NULL};
 static const char *haskell_module_types[] = {"haskell", NULL};
@@ -701,7 +701,7 @@ static const char *clojure_call_types[] = {"list_lit", NULL};
 /* Top-level `let f () = ...` parses to function_or_value_defn (module-level
  * value_declaration is aliased to declaration_expression, which wraps it). The
  * name lives on a function_declaration_left/value_declaration_left child — see
- * the CBM_LANG_FSHARP branch in resolve_func_name. */
+ * the CBM_LANG_FSHARP branch in cbm_resolve_func_name. */
 static const char *fsharp_func_types[] = {"function_declaration", "value_declaration",
                                           "function_or_value_defn", NULL};
 static const char *fsharp_class_types[] = {"type_definition", "exception_definition", NULL};

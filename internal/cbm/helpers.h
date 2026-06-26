@@ -50,6 +50,15 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 
+// Resolve a function/method definition node's NAME node across all ~130 grammars
+// (generic `name` field, arrow→declarator, C/C++ declarator chain, plus the many
+// per-language quirks: Fortran subroutine, SCSS mixin, SQL create_function, R,
+// PowerShell, Ada, the Lisp/FP family, etc.). Defined in extract_defs.c. Shared by
+// the defs, calls, and unified extractors so all three agree on enclosing-function
+// naming — drift between private copies caused the Module-mis-attribution of
+// gap #3 (and #438 for the C-declarator case).
+TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
