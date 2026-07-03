@@ -15,6 +15,7 @@
 #include <windows.h>
 #else
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -225,13 +226,20 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         return -1;
     }
     if (pid == 0) {
-        /* Child: redirect stdout+stderr to the log (or discard), then exec. */
-        if (opts->log_file) {
-            (void)!freopen(opts->log_file, "w", stderr);
-            (void)!freopen(opts->log_file, "a", stdout);
-        } else {
-            (void)!freopen("/dev/null", "w", stderr);
-            (void)!freopen("/dev/null", "w", stdout);
+        /* Child: redirect stdout+stderr to the log (or discard), then exec.
+         * Use open()+dup2() (async-signal-safe, no malloc) rather than freopen():
+         * the parent may be multithreaded (the MCP server holds worker/watcher/http
+         * threads plus mimalloc/sqlite/libgit2 global state), and a fork() copies
+         * only the calling thread — a malloc between fork and exec could deadlock on
+         * a lock another thread held at fork time. open/dup2/execv touch no heap. */
+        const char *target = opts->log_file ? opts->log_file : "/dev/null";
+        int fd = open(target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            (void)dup2(fd, STDOUT_FILENO);
+            (void)dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) {
+                (void)close(fd);
+            }
         }
         execv(bin, (char *const *)argv);
         _exit(127); /* exec failed */

@@ -707,6 +707,47 @@ inv_garbage_files_cli() {
     fi
 }
 
+# ── Invariant: a hard crash on one file is CONTAINED by the supervisor ──────
+# A file that hard-crashes the native indexer (SIGSEGV/abort/stack-overflow) must
+# not take down the whole process. Uses the test-only fault injector
+# (CBM_TEST_CRASH_ON) so the guard is honest: with the supervisor OFF the crash
+# must genuinely escape as a signal (rc>=128), and with it ON (default) the crash
+# must be contained (rc<128) and reported (outcome=crash). If the baseline does
+# not crash, the injector is inactive and the guard would be vacuous → fail.
+inv_crasher_contained_cli() {
+    local crepo="$SCRATCH/crasher_repo"
+    mkdir -p "$crepo"
+    printf 'def good():\n    return 1\n' > "$crepo/good.py"
+    printf 'def boom():\n    return 2\n' > "$crepo/crash_me.py"
+    git -C "$crepo" init -q 2>/dev/null || true
+    local cn; cn="$(native_path "$crepo")"
+
+    # Honesty baseline: supervisor OFF → the injected fault must escape as a signal.
+    export CBM_TEST_CRASH_ON=crash_me
+    export CBM_INDEX_SUPERVISOR=0
+    cli_call 60 index_repository "{\"repo_path\":\"$cn\"}"
+    local base_rc="$CLI_RC"
+    unset CBM_INDEX_SUPERVISOR
+
+    # Supervisor ON (default) → the crash must be contained and reported.
+    cli_call 60 index_repository "{\"repo_path\":\"$cn\"}"
+    local sup_rc="$CLI_RC"
+    local sup_out="$CLI_OUT"
+    unset CBM_TEST_CRASH_ON
+
+    if [ "$base_rc" -le 128 ]; then
+        fail "crasher-contained-cli" "baseline did not crash (rc=$base_rc) — injector inactive, guard would be vacuous"
+    elif [ "$sup_rc" -eq 124 ]; then
+        fail "crasher-contained-cli" "supervised run hung (rc=124)"
+    elif [ "$sup_rc" -gt 128 ]; then
+        fail "crasher-contained-cli" "crash escaped the supervisor (signal $((sup_rc-128)))"
+    elif ! printf '%s' "$sup_out" | grep -q '"outcome":"crash"'; then
+        fail "crasher-contained-cli" "crash not reported (no outcome=crash): $sup_out"
+    else
+        pass "crasher-contained-cli (baseline rc=$base_rc escaped; supervised rc=$sup_rc contained + reported)"
+    fi
+}
+
 # ── Invariant 8: clean exit on stdin EOF within a bounded wait (no hang) ────
 # Close the server's stdin (fd3). The server must reach EOF, break its loop, and
 # exit cleanly. We bound the wait WITHOUT sleep: closing stdin makes the server
@@ -841,6 +882,7 @@ inv_index_status_cli
 inv_nonexistent_repo_cli
 inv_empty_repo_cli
 inv_garbage_files_cli
+inv_crasher_contained_cli
 
 # MCP server-lifecycle invariants (one shared server instance).
 inv_mcp_initialize

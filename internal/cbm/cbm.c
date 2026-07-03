@@ -494,9 +494,33 @@ static int count_params_from_signature(const char *sig) {
 
 // --- Main extraction function ---
 
+/* Test-only deterministic fault injection for the crash/hang supervisor tests.
+ * Gated entirely behind env vars that are never set in production; a matching
+ * rel_path either aborts (a fault signal the supervisor classifies as a crash)
+ * or spins forever (an external-scanner infinite loop the quiet-timeout kills).
+ * This gives an honest guard — green iff the supervisor actually contains a real
+ * fault — instead of a fixture that may stop faulting once a root cause is fixed. */
+static void cbm_test_fault_inject(const char *rel_path) {
+    if (!rel_path || !rel_path[0]) {
+        return;
+    }
+    const char *crash_on = getenv("CBM_TEST_CRASH_ON");
+    if (crash_on && crash_on[0] && strstr(rel_path, crash_on)) {
+        abort(); /* SIGABRT → WIFSIGNALED → classified as a crash */
+    }
+    const char *hang_on = getenv("CBM_TEST_HANG_ON");
+    if (hang_on && hang_on[0] && strstr(rel_path, hang_on)) {
+        for (;;) {
+            /* Busy-spin: the supervisor's quiet-timeout kills + reports us. */
+        }
+    }
+}
+
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
+    cbm_test_fault_inject(rel_path);
+
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));

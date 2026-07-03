@@ -1,0 +1,179 @@
+/*
+ * index_supervisor.c — see index_supervisor.h.
+ */
+#include "index_supervisor.h"
+
+#include "foundation/compat_fs.h" /* cbm_mkdir_p, cbm_fopen */
+#include "foundation/log.h"
+#include "foundation/platform.h"  /* cbm_resolve_cache_dir */
+#include "ui/http_server.h"       /* cbm_http_server_resolve_binary_path */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#include <process.h> /* _getpid */
+#define cbm_getpid _getpid
+#else
+#include <unistd.h> /* getpid */
+#define cbm_getpid getpid
+#endif
+
+/* ── Worker-role state ────────────────────────────────────────────── */
+
+static bool g_worker_active = false;
+static char g_worker_response_out[1024] = {0};
+
+void cbm_index_set_worker_role(bool is_worker, const char *response_out) {
+    g_worker_active = is_worker;
+    if (response_out && response_out[0]) {
+        snprintf(g_worker_response_out, sizeof(g_worker_response_out), "%s", response_out);
+    } else {
+        g_worker_response_out[0] = '\0';
+    }
+}
+
+bool cbm_index_worker_active(void) {
+    return g_worker_active;
+}
+
+const char *cbm_index_worker_response_out(void) {
+    return g_worker_response_out[0] ? g_worker_response_out : NULL;
+}
+
+bool cbm_index_supervisor_should_wrap(void) {
+    if (g_worker_active) {
+        return false; /* I am the worker — run in-process, never re-supervise */
+    }
+    const char *sv = getenv("CBM_INDEX_SUPERVISOR");
+    if (sv && strcmp(sv, "0") == 0) {
+        return false; /* kill switch → in-process */
+    }
+    return true;
+}
+
+/* Quiet-timeout (ms) for a supervised worker: killed + reported as a hang if it
+ * emits no progress within the window. 0 => disabled. Full hang coverage (a
+ * generous default + attribution) is wired in a later stage; for now honour the
+ * env override and default to disabled so crash containment ships independently. */
+static int worker_quiet_timeout_ms(void) {
+    const char *e = getenv("CBM_INDEX_WORKER_TIMEOUT_S");
+    if (e && e[0]) {
+        long s = atol(e);
+        if (s > 0) {
+            return (int)(s * 1000);
+        }
+    }
+    return 0;
+}
+
+/* Read an entire file into a heap string (NUL-terminated). NULL on error. */
+static char *slurp_file(const char *path) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        (void)fclose(f);
+        return NULL;
+    }
+    long n = ftell(f);
+    if (n < 0) {
+        (void)fclose(f);
+        return NULL;
+    }
+    (void)fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        (void)fclose(f);
+        return NULL;
+    }
+    size_t rd = fread(buf, 1, (size_t)n, f);
+    (void)fclose(f);
+    buf[rd] = '\0';
+    return buf;
+}
+
+/* Resolve a per-run temp path <cache_dir>/logs/.worker-<pid><suffix>. */
+static void worker_tmp_path(char *out, size_t out_sz, int pid, const char *suffix) {
+    const char *cdir = cbm_resolve_cache_dir();
+    if (cdir && cdir[0]) {
+        char dir[900];
+        snprintf(dir, sizeof(dir), "%s/logs", cdir);
+        cbm_mkdir_p(dir, 0755);
+        snprintf(out, out_sz, "%s/.worker-%d%s", dir, pid, suffix);
+    } else {
+        snprintf(out, out_sz, ".worker-%d%s", pid, suffix);
+    }
+}
+
+int cbm_index_spawn_worker(const char *args_json, const char *exclude_file,
+                           cbm_index_worker_result_t *result) {
+    result->outcome = CBM_PROC_SPAWN_FAILED;
+    result->exit_code = -1;
+    result->term_signal = 0;
+    result->response = NULL;
+
+    char self[1024] = {0};
+    if (!cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)) || !self[0]) {
+        cbm_log_warn("index.supervisor.no_self_path", "action", "degrade_in_process");
+        return -1;
+    }
+
+    int pid = (int)cbm_getpid();
+    char resp_path[1024];
+    char log_path[1024];
+    worker_tmp_path(resp_path, sizeof(resp_path), pid, ".response");
+    worker_tmp_path(log_path, sizeof(log_path), pid, ".log");
+    (void)remove(resp_path); /* clear any stale file */
+
+    const char *argv[12];
+    int n = 0;
+    argv[n++] = self;
+    argv[n++] = "cli";
+    argv[n++] = "--index-worker";
+    argv[n++] = "index_repository";
+    argv[n++] = args_json;
+    argv[n++] = "--response-out";
+    argv[n++] = resp_path;
+    if (exclude_file && exclude_file[0]) {
+        argv[n++] = "--exclude-file";
+        argv[n++] = exclude_file;
+    }
+    argv[n] = NULL;
+
+    cbm_proc_opts_t opts = {0};
+    opts.bin = self;
+    opts.argv = argv;
+    opts.log_file = log_path;
+    opts.quiet_timeout_ms = worker_quiet_timeout_ms();
+    opts.delete_log_on_exit = true;
+
+    cbm_proc_result_t r;
+    if (cbm_subprocess_run(&opts, &r) != 0) {
+        (void)remove(resp_path);
+        cbm_log_warn("index.supervisor.spawn_failed", "action", "degrade_in_process");
+        return -1;
+    }
+
+    result->outcome = r.outcome;
+    result->exit_code = r.exit_code;
+    result->term_signal = r.term_signal;
+    if (r.outcome == CBM_PROC_CLEAN) {
+        result->response = slurp_file(resp_path);
+    }
+    (void)remove(resp_path);
+
+    char sig[16];
+    snprintf(sig, sizeof(sig), "%d", r.term_signal);
+    cbm_log_info("index.supervisor.reap", "outcome", cbm_proc_outcome_str(r.outcome), "signal", sig);
+    return 0;
+}
+
+void cbm_index_worker_result_free(cbm_index_worker_result_t *result) {
+    if (result) {
+        free(result->response);
+        result->response = NULL;
+    }
+}

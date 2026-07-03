@@ -15,6 +15,7 @@
  */
 #include "cbm.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
 #include "mcp/mcp.h"
+#include "mcp/index_supervisor.h"
 #include "watcher/watcher.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
@@ -37,6 +38,7 @@ enum {
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
 #include "foundation/profile.h"
@@ -228,6 +230,25 @@ static bool cli_strip_flag(int *argc, char **argv, const char *flag) {
     return false;
 }
 
+/* Strip a flag AND its following value from argv, returning the value (a pointer
+ * into the original argv strings, valid for the process lifetime) or NULL if the
+ * flag is absent. */
+static const char *cli_strip_flag_value(int *argc, char **argv, const char *flag) {
+    for (int i = 0; i < *argc; i++) {
+        if (strcmp(argv[i], flag) != 0) {
+            continue;
+        }
+        const char *value = (i + SKIP_ONE < *argc) ? argv[i + SKIP_ONE] : NULL;
+        int remove_count = value ? 2 : 1;
+        for (int j = i; j < *argc - remove_count; j++) {
+            argv[j] = argv[j + remove_count];
+        }
+        *argc -= remove_count;
+        return value;
+    }
+    return NULL;
+}
+
 /* Portable "is fd a terminal?" — _isatty on Windows, isatty on POSIX. */
 #ifdef _WIN32
 #define cli_isatty(fd) _isatty(fd)
@@ -295,6 +316,14 @@ static int run_cli(int argc, char **argv) {
 
     bool progress = cli_strip_flag(&argc, argv, "--progress");
     bool raw_json = cli_strip_flag(&argc, argv, "--json");
+
+    /* Supervisor worker role: when this process was spawned as a supervised index
+     * worker, run indexing in-process (never re-supervise) and write the result to
+     * the given file for the parent to read back. Stripped here so the tool
+     * dispatch below sees only the tool name + its args. */
+    bool index_worker = cli_strip_flag(&argc, argv, "--index-worker");
+    const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
+    cbm_index_set_worker_role(index_worker, response_out);
 
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
@@ -390,6 +419,16 @@ static int run_cli(int argc, char **argv) {
     int exit_code = 0;
 
     if (result) {
+        /* Supervised worker: hand the full result string to the parent via the
+         * response file before printing (parent reads it back on a clean exit). */
+        const char *ro = cbm_index_worker_response_out();
+        if (ro) {
+            FILE *rf = cbm_fopen(ro, "wb");
+            if (rf) {
+                (void)fputs(result, rf);
+                (void)fclose(rf);
+            }
+        }
         if (raw_json) {
             printf("%s\n", result);
         } else {
