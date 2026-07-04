@@ -9,10 +9,73 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
-#include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
+#include "foundation/compat.h"    /* cbm_setenv — #845 supervisor kill switch */
+#include "foundation/compat_fs.h" /* cbm_fopen — worker response file */
+#include "foundation/mem.h"       /* cbm_mem_init — worker budget */
+#include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
+#include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
 #include <sqlite3.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* #832 guard support: when the index supervisor spawns THIS binary as
+ * `<self> cli --index-worker index_repository <args_json> --response-out <file>`
+ * (exactly the argv cbm_index_spawn_worker builds), act as a faithful in-process
+ * index worker instead of re-running the test suites. This lets the deterministic
+ * gating guard (test_mcp.c) spawn a REAL worker child that indexes the fixture and
+ * writes its response back, using only public APIs — no production test seam.
+ * Returns an exit code (>=0) when it handled a worker invocation, else -1. */
+static int tf_maybe_run_index_worker(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[1], "cli") != 0) {
+        return -1;
+    }
+    bool is_worker = false;
+    const char *tool = NULL;
+    const char *args_json = "{}";
+    const char *response_out = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--index-worker") == 0) {
+            is_worker = true;
+        } else if (strcmp(argv[i], "--response-out") == 0) {
+            if (i + 1 < argc) {
+                response_out = argv[++i];
+            }
+        } else if (argv[i][0] == '{') {
+            args_json = argv[i];
+        } else if (argv[i][0] != '-' && !tool) {
+            tool = argv[i];
+        }
+    }
+    if (!is_worker) {
+        return -1;
+    }
+    if (!tool) {
+        tool = "index_repository";
+    }
+
+    cbm_mem_init(0.5);
+    cbm_index_set_worker_role(true, response_out); /* worker role → index in-process */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return 1;
+    }
+    char *result = cbm_mcp_handle_tool(srv, tool, args_json);
+    if (result) {
+        const char *ro = cbm_index_worker_response_out();
+        if (ro) {
+            FILE *rf = cbm_fopen(ro, "wb");
+            if (rf) {
+                (void)fputs(result, rf);
+                (void)fclose(rf);
+            }
+        }
+        free(result);
+    }
+    cbm_mcp_server_free(srv);
+    return 0;
+}
 
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
@@ -135,6 +198,13 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    /* #832: if spawned as a supervised index worker, do the real work and exit
+     * before any suite runs (see tf_maybe_run_index_worker). */
+    int worker_rc = tf_maybe_run_index_worker(argc, argv);
+    if (worker_rc >= 0) {
+        return worker_rc;
+    }
+
     /* #845 belt-and-suspenders: this binary EMBEDS cbm_mcp_handle_tool. The
      * supervisor gate already ignores unmarked hosts, but pin the kill switch
      * too so even a future supervisor-marked test host can never resolve THIS

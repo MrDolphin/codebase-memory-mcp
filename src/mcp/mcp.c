@@ -3481,8 +3481,14 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
 }
 
 /* Drop the cached store so the next query reopens whatever the worker wrote (each
- * worker is a fresh process that deletes + recreates the .db). */
+ * worker is a fresh process that deletes + recreates the .db). NULL-safe: the
+ * background watcher path (main.c) has no MCP server / cached store — the child
+ * writes the DB and the parent only needs the return code, so there is nothing
+ * to invalidate. */
 static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
         srv->store = NULL;
@@ -3685,6 +3691,34 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         return resp;
     }
     return build_worker_failure_response(args, last_outcome);
+}
+
+/* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and
+ * run it through index_run_supervised. Shared by the session auto-index (srv
+ * present → its cached store is invalidated) and the watcher re-index (srv NULL).
+ * Returns the worker's response string (caller frees) or NULL to degrade. */
+static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path) {
+    if (!root_path || !root_path[0]) {
+        return NULL;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path);
+    char *args = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!args) {
+        return NULL;
+    }
+    char *resp = index_run_supervised(srv, args);
+    free(args);
+    return resp;
+}
+
+/* Public entry (see mcp.h): the watcher re-index in main.c has no MCP server, so
+ * it reaches the supervised runner through this srv-less wrapper. */
+char *cbm_mcp_index_run_supervised_path(const char *root_path) {
+    return index_run_supervised_path(NULL, root_path);
 }
 
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
@@ -5638,6 +5672,25 @@ static void *autoindex_thread(void *arg) {
 
     cbm_log_info("autoindex.start", "project", srv->session_project, "path", srv->session_root);
 
+    /* #832: prefer the supervised worker subprocess. Indexing the whole session in
+     * this long-lived server thread ratchets RSS (mimalloc v3 does not reclaim the
+     * pages worker threads abandon at exit); running it in a child that exits hands
+     * 100% of that memory back to the OS every cycle. Degrade to the in-process
+     * pipeline below when the supervisor is off (kill switch) or the spawn fails. */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *resp = index_run_supervised_path(srv, srv->session_root);
+        if (resp) {
+            free(resp);
+            cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
+            /* Register with watcher for ongoing change detection */
+            if (srv->watcher) {
+                cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+            }
+            return NULL;
+        }
+        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
+
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
     if (!p) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
@@ -5650,7 +5703,7 @@ static void *autoindex_thread(void *arg) {
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
-    cbm_mem_collect(); /* return mimalloc pages to OS after indexing */
+    cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
         cbm_log_info("autoindex.done", "project", srv->session_project);

@@ -171,6 +171,23 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
 
+    /* #832: route the re-index through the supervised worker subprocess so this
+     * long-lived server process hands its RSS back to the OS on every cycle
+     * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
+     * threads abandon at exit). The child writes the DB; the parent only needs the
+     * return code. The pipeline lock (already held) still serialises re-indexes.
+     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
+     * or the spawn fails. */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *resp = cbm_mcp_index_run_supervised_path(root_path);
+        if (resp) {
+            free(resp);
+            cbm_pipeline_unlock();
+            return 0;
+        }
+        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
+
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
         cbm_pipeline_unlock();

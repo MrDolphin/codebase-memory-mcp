@@ -122,6 +122,15 @@ void cbm_mem_init(double ram_fraction) {
     mi_option_set(mi_option_arena_eager_commit, 0);
     mi_option_set(mi_option_purge_decommits, SKIP_ONE);
     mi_option_set(mi_option_purge_delay, 0); /* immediate purge, no 1s delay */
+    /* v3 (#832): reclaim abandoned pages on ANY thread's free (=1), restoring the
+     * v2 behaviour. mimalloc v3 defaults page_reclaim_on_free=0, so pages a worker
+     * thread abandons at exit are NOT reclaimed when the main thread later frees
+     * their blocks (and mi_collect cannot touch abandoned pages) — RSS then
+     * ratchets across repeated in-process index cycles. The supervised subprocess
+     * is the primary cure (the child returns 100% RSS on exit); this is the
+     * in-process fallback for any path that stays in-process (kill switch,
+     * spawn-fail degrade, embedders). */
+    mi_option_set(mi_option_page_reclaim_on_free, 1);
 
     /* CBM_MEM_BUDGET_MB env override (memory analogue of CBM_WORKERS).
      * Lets users cap the budget directly without an enclosing cgroup —
