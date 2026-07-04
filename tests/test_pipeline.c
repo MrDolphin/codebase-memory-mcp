@@ -4845,6 +4845,129 @@ TEST(envscan_non_url_values_skipped) {
     PASS();
 }
 
+/* ── Discovery-exclusion plumbing in auxiliary repo walks (#792) ── */
+
+/* Boundary semantics of the shared exclusion predicate: anchored at the
+ * repo root, matches the excluded dir itself and its subtree, but never
+ * sibling names sharing a prefix. Regression guard for issue #792. */
+TEST(pipeline_relpath_excluded_boundary) {
+    char *excluded[] = {(char *)"vendor_big", (char *)"packages/big"};
+
+    /* Exact match and subtree paths are excluded. */
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("vendor_big", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("vendor_big/lib/package.json", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("packages/big", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("packages/big/src/x.ts", excluded, 2));
+
+    /* Sibling names sharing the prefix are NOT excluded ('/'-boundary). */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_bigger", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("packages/bigger/x.ts", excluded, 2));
+
+    /* Exclusions are root-anchored prefixes, not substring matches. */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("src/vendor_big/x.c", excluded, 2));
+
+    /* NULL / empty safety. */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded(NULL, excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", NULL, 0));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", excluded, 0));
+    char *with_empty[] = {(char *)""};
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", with_empty, 1));
+    PASS();
+}
+
+/* Helper: does the entries array contain a package with this name? */
+static int pkg_entries_has_name(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* The pkgmap repo walk must honor discovery exclusions (issue #792: a
+ * gitignored huge subtree kept the pkgmap walk busy for 15 minutes).
+ * Control run first (no exclusions → BOTH manifests parsed) so the
+ * exclusion assertion below cannot pass vacuously. */
+TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_excl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/packages", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/packages/app", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor_big", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor_big/lib", tmpdir);
+    cbm_mkdir(dir);
+
+    write_temp_file(tmpdir, "packages/app/package.json",
+                    "{\"name\":\"@org/app\",\"main\":\"index.js\"}\n");
+    write_temp_file(tmpdir, "vendor_big/lib/package.json",
+                    "{\"name\":\"@org/vendored\",\"main\":\"index.js\"}\n");
+
+    /* Control: NULL exclusion list — the walk reaches and parses BOTH
+     * manifests (proves the excluded one is reachable + parseable). */
+    cbm_pkg_entries_t control;
+    cbm_pkg_entries_init(&control);
+    cbm_pkgmap_scan_repo(tmpdir, &control, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&control, "@org/app"));
+    ASSERT_TRUE(pkg_entries_has_name(&control, "@org/vendored"));
+    cbm_pkg_entries_free(&control);
+
+    /* With vendor_big excluded (as discovery reports for a gitignored
+     * subtree): the walk must not descend into it. */
+    char *excluded[] = {(char *)"vendor_big"};
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_repo(tmpdir, &entries, excluded, 1);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "@org/app"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "@org/vendored"));
+    cbm_pkg_entries_free(&entries);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* The env-URL walk must honor discovery exclusions the same way (#792).
+ * Control run first via the NULL-exclusion wrapper so the exclusion
+ * assertion cannot pass vacuously. */
+TEST(envscan_walk_honors_discovery_exclusions) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_excl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/big_generated", tmpdir);
+    cbm_mkdir(dir);
+
+    write_temp_file(tmpdir, "deploy.sh",
+                    "#!/bin/bash\nexport CONTROL_URL=\"https://api.example.com/v1\"\n");
+    write_temp_file(tmpdir, "big_generated/env.sh",
+                    "#!/bin/bash\nexport EXCLUDED_URL=\"https://excluded.example.com/v1\"\n");
+
+    /* Control: the NULL-exclusion wrapper sees both bindings. */
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "EXCLUDED_URL"));
+
+    /* With big_generated excluded, its binding must disappear. */
+    char *excluded[] = {(char *)"big_generated"};
+    count = cbm_scan_project_env_urls_excluded(tmpdir, bindings, 32, excluded, 1);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "EXCLUDED_URL") == NULL);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ── Git history tests (port of githistory_test.go) ────────────── */
 
 /* Port of Go TestIsTrackableFile from githistory_test.go */
@@ -6364,6 +6487,10 @@ SUITE(pipeline) {
     RUN_TEST(envscan_secret_file_exclusion);
     RUN_TEST(envscan_skips_ignored_dirs);
     RUN_TEST(envscan_non_url_values_skipped);
+    /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
+    RUN_TEST(pipeline_relpath_excluded_boundary);
+    RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
+    RUN_TEST(envscan_walk_honors_discovery_exclusions);
     /* Function registry / resolver */
     RUN_TEST(registry_resolve_single_candidate);
     RUN_TEST(registry_fuzzy_nonexistent);

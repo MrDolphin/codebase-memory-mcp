@@ -336,6 +336,62 @@ TEST(path_alias_loader_monorepo_dotdot_climb) {
     PASS();
 }
 
+/* ── Loader honors discovery exclusions (#792) ─────────────────── */
+
+/* find_alias_files must not descend into discovery-excluded subtrees.
+ * Control run first (no exclusions → both configs collected) so the
+ * exclusion assertion below cannot pass vacuously. */
+TEST(path_alias_loader_honors_discovery_exclusions) {
+    char tmpl[256];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_excl_XXXXXX");
+    char *root = cbm_mkdtemp(tmpl);
+    ASSERT_NOT_NULL(root);
+
+    char sub[512];
+    snprintf(sub, sizeof(sub), "%s/big_generated", root);
+    cbm_mkdir(sub);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/tsconfig.json", root);
+    ASSERT_EQ(write_file(path,
+                         "{\n  \"compilerOptions\": {\n    \"paths\": {\n"
+                         "      \"@root/*\": [\"shared/*\"]\n    }\n  }\n}\n"),
+              0);
+    snprintf(path, sizeof(path), "%s/big_generated/tsconfig.json", root);
+    ASSERT_EQ(write_file(path,
+                         "{\n  \"compilerOptions\": {\n    \"paths\": {\n"
+                         "      \"@gen/*\": [\"./src/*\"]\n    }\n  }\n}\n"),
+              0);
+
+    /* Control: the unexcluded loader collects BOTH configs. */
+    cbm_path_alias_collection_t *coll = cbm_load_path_aliases(root);
+    ASSERT_NOT_NULL(coll);
+    ASSERT_EQ(coll->count, 2);
+    cbm_path_alias_collection_free(coll);
+
+    /* Excluding big_generated drops its config; the root one survives. */
+    char *excluded[] = {(char *)"big_generated"};
+    coll = cbm_load_path_aliases_excluded(root, excluded, 1);
+    ASSERT_NOT_NULL(coll);
+    ASSERT_EQ(coll->count, 1);
+    const cbm_path_alias_map_t *m = cbm_path_alias_find_for_file(coll, "src/x.ts");
+    ASSERT_NOT_NULL(m);
+    char *r = cbm_path_alias_resolve(m, "@root/utils");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "shared/utils");
+    free(r);
+    cbm_path_alias_collection_free(coll);
+
+    snprintf(path, sizeof(path), "%s/big_generated/tsconfig.json", root);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/tsconfig.json", root);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/big_generated", root);
+    rmdir(path);
+    rmdir(root);
+    PASS();
+}
+
 /* ── Loader returns NULL when no configs found ─────────────────── */
 
 TEST(path_alias_loader_no_configs) {
@@ -363,5 +419,6 @@ void suite_path_alias(void) {
     RUN_TEST(path_alias_find_for_file_nearest_ancestor);
     RUN_TEST(path_alias_loader_monorepo);
     RUN_TEST(path_alias_loader_monorepo_dotdot_climb);
+    RUN_TEST(path_alias_loader_honors_discovery_exclusions);
     RUN_TEST(path_alias_loader_no_configs);
 }
