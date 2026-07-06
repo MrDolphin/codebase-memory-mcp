@@ -2334,10 +2334,16 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
     }
 
     /* Look at every type whose embedded_types include the receiver_type_qn
-     * (treated as a trait): pick the single-impl case. */
+     * (treated as a trait): pick the single-impl case. Prefilter to the types whose
+     * embedded_types carry a matching BARE name via the registry index; the exact
+     * full-QN check below is unchanged, so the result set is identical. */
     const CBMRegisteredFunc *unique = NULL;
     int impls = 0;
-    for (int ti = 0; ti < reg->type_count && impls < 3; ti++) {
+    const char *rdot = strrchr(receiver_type_qn, '.');
+    const char *rbare = rdot ? rdot + 1 : receiver_type_qn;
+    CBMTypeEmbedIter eit;
+    cbm_registry_types_by_embedded_bare(reg, rbare, &eit);
+    for (int ti; impls < 3 && (ti = cbm_type_embed_iter_next(&eit)) >= 0;) {
         const CBMRegisteredType *t = &reg->types[ti];
         if (!t->embedded_types)
             continue;
@@ -2400,7 +2406,12 @@ static const CBMRegisteredFunc *rust_find_sole_trait_impl(RustLSPContext *ctx, c
     const CBMRegisteredFunc *first = NULL;
     const char *first_qn = NULL;
     int n = 0;
-    for (int ti = 0; ti < reg->type_count && n < 2; ti++) {
+    /* Prefilter to types whose embedded_types carry the trait's BARE name; the
+     * exact (full-QN OR bare) check below is unchanged. tbare-keyed index captures
+     * every original match (a full-QN match implies a bare-name match). */
+    CBMTypeEmbedIter eit;
+    cbm_registry_types_by_embedded_bare(reg, tbare, &eit);
+    for (int ti; n < 2 && (ti = cbm_type_embed_iter_next(&eit)) >= 0;) {
         const CBMRegisteredType *t = &reg->types[ti];
         if (!t->embedded_types || !t->qualified_name)
             continue;
@@ -3762,7 +3773,11 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
                     char *needle = cbm_arena_sprintf(ctx->arena, ".%s.", head);
                     const CBMRegisteredFunc *mem_unique = NULL;
                     int mem_matches = 0;
-                    for (int i = 0; i < ctx->registry->func_count && mem_matches < 2; i++) {
+                    /* Iterate only free funcs whose short_name == tail via the index;
+                     * the receiver/short_name/needle re-checks below are unchanged. */
+                    CBMFreeFuncIter ffit;
+                    cbm_registry_free_funcs_by_short_name(ctx->registry, tail, &ffit);
+                    for (int i; mem_matches < 2 && (i = cbm_free_func_iter_next(&ffit)) >= 0;) {
                         const CBMRegisteredFunc *f = &ctx->registry->funcs[i];
                         if (!f->short_name || !f->qualified_name)
                             continue;
@@ -3800,7 +3815,11 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
                 first_dot ? (size_t)(first_dot - ctx->module_qn) : strlen(ctx->module_qn);
             const CBMRegisteredFunc *unique = NULL;
             int matches = 0;
-            for (int i = 0; i < ctx->registry->func_count && matches < 2; i++) {
+            /* Iterate only free funcs whose short_name == tail via the index; the
+             * receiver/short_name/crate-prefix re-checks below are unchanged. */
+            CBMFreeFuncIter ffit;
+            cbm_registry_free_funcs_by_short_name(ctx->registry, tail, &ffit);
+            for (int i; matches < 2 && (i = cbm_free_func_iter_next(&ffit)) >= 0;) {
                 const CBMRegisteredFunc *f = &ctx->registry->funcs[i];
                 if (!f->short_name || !f->qualified_name)
                     continue;

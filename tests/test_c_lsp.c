@@ -15231,6 +15231,99 @@ TEST(clsp_tier2_shared_registry_readonly_c) {
     PASS();
 }
 
+/* Direct guard for the finalize-time short-name / embedded-type indexes and their
+ * iterators (type_registry.c), which the Rust trait/free-func fast paths rely on.
+ * Verifies: embed index yields exactly the types whose embedded_types carry a
+ * matching BARE name, in ascending registry order, deduped when a type lists the
+ * same bare twice; free-func index yields only free funcs (receiver_type==NULL) with
+ * the given short_name, not methods. */
+TEST(registry_short_name_indexes) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+
+    /* type 0: Trait (no embeds). type 1: A impl "pkg.Trait". type 2: B impl bare
+     * "Trait" AND a second embed also bare "Trait" (dedup case). type 3: C impl
+     * "pkg.Other". */
+    const char *a_emb[] = {"pkg.Trait", NULL};
+    const char *b_emb[] = {"other.Trait", "misc.Trait", NULL}; /* two entries, bare "Trait" */
+    const char *c_emb[] = {"pkg.Other", NULL};
+    CBMRegisteredType t;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.A";
+    t.short_name = "A";
+    t.embedded_types = a_emb;
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.B";
+    t.short_name = "B";
+    t.embedded_types = b_emb;
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.C";
+    t.short_name = "C";
+    t.embedded_types = c_emb;
+    cbm_registry_add_type(&reg, t);
+
+    /* free func "helper" (x2 — different QNs), method "M.helper", free func "other". */
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.helper";
+    f.short_name = "helper";
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.sub.helper";
+    f.short_name = "helper";
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.M.helper";
+    f.short_name = "helper";
+    f.receiver_type = "pkg.M"; /* method — must NOT appear in the free-func index */
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.other";
+    f.short_name = "other";
+    cbm_registry_add_func(&reg, f);
+
+    cbm_registry_finalize(&reg);
+
+    /* Embed index for bare "Trait": types 1 (A) then 2 (B), ascending, B once. */
+    CBMTypeEmbedIter it;
+    cbm_registry_types_by_embedded_bare(&reg, "Trait", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 1);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 2);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Bare "Other": only type 3 (C). */
+    cbm_registry_types_by_embedded_bare(&reg, "Other", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 3);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Bare with no implementers: empty. */
+    cbm_registry_types_by_embedded_bare(&reg, "Nope", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Free-func index for "helper": func 0 then 1 (ascending), NOT the method (2). */
+    CBMFreeFuncIter fit;
+    cbm_registry_free_funcs_by_short_name(&reg, "helper", &fit);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 0);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 1);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    /* Free-func "other": only func 3. */
+    cbm_registry_free_funcs_by_short_name(&reg, "other", &fit);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 3);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* C++ sibling guard: the same shared-registry read-only invariant for the
@@ -15417,6 +15510,7 @@ SUITE(c_lsp) {
     RUN_TEST(seal_cs_shared_registry_readonly);
     RUN_TEST(seal_ts_shared_registry_readonly);
     RUN_TEST(seal_go_shared_registry_readonly);
+    RUN_TEST(registry_short_name_indexes);
     RUN_TEST(clsp_simple_var_decl);
     RUN_TEST(clsp_pointer_arrow);
     RUN_TEST(clsp_dot_access);
