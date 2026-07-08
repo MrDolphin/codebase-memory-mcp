@@ -4497,7 +4497,8 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
             snprintf(
                 cmd, cmd_sz,
                 "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
+                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
+                "-LiteralPath $_ -Pattern $pat%s "
                 "-ErrorAction SilentlyContinue }"
                 " | Where-Object { $_.Path -like '*%s' }"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
@@ -4506,7 +4507,8 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
             snprintf(
                 cmd, cmd_sz,
                 "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
+                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
+                "-LiteralPath $_ -Pattern $pat%s "
                 "-ErrorAction SilentlyContinue }"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
                 tmpfile, filelist, sm);
@@ -4517,7 +4519,8 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 cmd, cmd_sz,
                 "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
                 "-ErrorAction SilentlyContinue"
-                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s -ErrorAction SilentlyContinue"
+                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
+                "-ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
                 root_path, file_pattern, tmpfile, sm);
         } else {
@@ -4525,7 +4528,8 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 cmd, cmd_sz,
                 "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction "
                 "SilentlyContinue"
-                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s -ErrorAction SilentlyContinue"
+                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
+                "-ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
                 root_path, tmpfile, sm);
         }
