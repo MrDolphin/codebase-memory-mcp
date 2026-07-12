@@ -448,10 +448,10 @@ TEST(mcp_text_result) {
     PASS();
 }
 
-TEST(mcp_text_result_skips_structured_content_for_plain_text) {
+TEST(mcp_text_result_wraps_plain_text_as_structured_content) {
     char *json = cbm_mcp_text_result("plain text", false);
     ASSERT_NOT_NULL(json);
-    ASSERT_NULL(strstr(json, "\"structuredContent\""));
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"text\":\"plain text\"}"));
     ASSERT_NOT_NULL(strstr(json, "\"isError\":false"));
     free(json);
     PASS();
@@ -470,6 +470,7 @@ TEST(mcp_cancel_matches_request_id) {
 TEST(mcp_text_result_error) {
     char *json = cbm_mcp_text_result("something failed", true);
     ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"error\":\"something failed\"}"));
     ASSERT_NOT_NULL(strstr(json, "\"isError\":true"));
     ASSERT_NOT_NULL(strstr(json, "something failed"));
     free(json);
@@ -756,6 +757,7 @@ TEST(tool_search_graph_includes_node_properties) {
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
              "\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "results[")); /* TOON table header */
@@ -5611,7 +5613,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
     RUN_TEST(mcp_text_result);
-    RUN_TEST(mcp_text_result_skips_structured_content_for_plain_text);
+    RUN_TEST(mcp_text_result_wraps_plain_text_as_structured_content);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
 

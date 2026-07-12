@@ -258,16 +258,29 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     yyjson_mut_arr_add_val(content, item);
     yyjson_mut_obj_add_val(doc, root, "content", content);
 
-    if (!is_error && text) {
+    bool has_structured_content = false;
+    if (text) {
         yyjson_doc *structured_doc = yyjson_read(text, strlen(text), 0);
         if (structured_doc) {
             yyjson_val *structured_root = yyjson_doc_get_root(structured_doc);
             if (yyjson_is_obj(structured_root)) {
                 yyjson_mut_val *structured = yyjson_val_mut_copy(doc, structured_root);
-                yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
+                if (structured) {
+                    yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
+                    has_structured_content = true;
+                }
             }
             yyjson_doc_free(structured_doc);
         }
+    }
+    if (!has_structured_content) {
+        /* Every advertised MCP tool has an object outputSchema, so even compact
+         * TOON/plain-text and error results must carry a conforming structured
+         * object. Keep the text Content block above for model visibility and
+         * backwards compatibility. */
+        yyjson_mut_val *structured = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, structured, is_error ? "error" : "text", text ? text : "");
+        yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
     }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
 
