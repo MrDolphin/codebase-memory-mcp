@@ -2160,8 +2160,10 @@ static void enrich_add_bfs(yyjson_mut_doc *doc, yyjson_mut_val *arr, cbm_travers
 }
 
 /* Enrich search result with 1-hop connected node names (inbound + outbound). */
-static void enrich_connected(yyjson_mut_doc *doc, yyjson_mut_val *item, cbm_store_t *store,
-                             int64_t node_id, const char *relationship) {
+/* Build the connected-names array (1-hop callers + callees) for a node.
+ * Returns a (possibly empty) yyjson array owned by doc. */
+static yyjson_mut_val *enrich_connected(yyjson_mut_doc *doc, cbm_store_t *store, int64_t node_id,
+                                        const char *relationship) {
     const char *et[] = {relationship ? relationship : "CALLS"};
     yyjson_mut_val *conn = yyjson_mut_arr(doc);
 
@@ -2176,8 +2178,33 @@ static void enrich_connected(yyjson_mut_doc *doc, yyjson_mut_val *item, cbm_stor
     enrich_add_bfs(doc, conn, &tr_out);
     cbm_store_traverse_free(&tr_out);
 
-    if (yyjson_mut_arr_size(conn) > 0) {
-        yyjson_mut_obj_add_val(doc, item, "connected_names", conn);
+    return conn;
+}
+
+/* Text-tree variant: the same 1-hop neighbor names ';'-joined into buf (no
+ * commas/spaces in names, so the cell needs no quoting). Empty when none. */
+static void enrich_connected_joined(cbm_store_t *store, int64_t node_id, const char *relationship,
+                                    char *buf, size_t bufsz) {
+    buf[0] = '\0';
+    const char *et[] = {relationship ? relationship : "CALLS"};
+    size_t off = 0;
+    const char *dirs[2] = {"inbound", "outbound"};
+    for (int d = 0; d < 2; d++) {
+        cbm_traverse_result_t tr = {0};
+        cbm_store_bfs(store, node_id, dirs[d], et, SKIP_ONE, SKIP_ONE, MCP_DEFAULT_LIMIT, &tr);
+        for (int j = 0; j < tr.visited_count && off + 2 < bufsz; j++) {
+            if (!tr.visited[j].node.name) {
+                continue;
+            }
+            int n =
+                snprintf(buf + off, bufsz - off, "%s%s", off ? ";" : "", tr.visited[j].node.name);
+            if (n < 0 || (size_t)n >= bufsz - off) {
+                buf[off] = '\0';
+                break;
+            }
+            off += (size_t)n;
+        }
+        cbm_store_traverse_free(&tr);
     }
 }
 
@@ -2427,85 +2454,50 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         return cbm_sb_finish(&sb);
     }
 
+    /* format:"json" = json-stringified tree: cols + column-ordered row
+     * arrays (rank order preserved — no grouping on ranked output). */
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_int(doc, root, "total", total);
     yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
+    yyjson_mut_val *jcols = yyjson_mut_arr(doc);
+    static const char *const bm25_cols[] = {"qn", "label", "file", "lines", "rank"};
+    for (size_t ci = 0; ci < sizeof(bm25_cols) / sizeof(bm25_cols[0]); ci++) {
+        yyjson_mut_arr_add_str(doc, jcols, bm25_cols[ci]);
+    }
+    yyjson_mut_obj_add_val(doc, root, "cols", jcols);
 
-    yyjson_mut_val *results = yyjson_mut_arr(doc);
+    yyjson_mut_val *rows = yyjson_mut_arr(doc);
     int emitted = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_strcpy(doc, item, "name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
-        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_QN));
-        yyjson_mut_obj_add_strcpy(doc, item, "label",
+        char lines[CBM_SZ_32];
+        int sl = sqlite3_column_int(stmt, BM25_COL_START);
+        int el = sqlite3_column_int(stmt, BM25_COL_END);
+        if (sl > 0) {
+            snprintf(lines, sizeof(lines), "%d-%d", sl, el > sl ? el : sl);
+        } else {
+            lines[0] = '\0';
+        }
+        yyjson_mut_val *row = yyjson_mut_arr(doc);
+        yyjson_mut_arr_add_strcpy(doc, row, (const char *)sqlite3_column_text(stmt, BM25_COL_QN));
+        yyjson_mut_arr_add_strcpy(doc, row,
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
-        yyjson_mut_obj_add_strcpy(doc, item, "file_path",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
-        yyjson_mut_obj_add_int(doc, item, "start_line", sqlite3_column_int(stmt, BM25_COL_START));
-        yyjson_mut_obj_add_int(doc, item, "end_line", sqlite3_column_int(stmt, BM25_COL_END));
-        yyjson_mut_obj_add_real(doc, item, "rank", sqlite3_column_double(stmt, BM25_COL_RANK));
-        yyjson_mut_arr_add_val(results, item);
+        yyjson_mut_arr_add_strcpy(doc, row, (const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
+        yyjson_mut_arr_add_strcpy(doc, row, lines);
+        yyjson_mut_arr_add_real(doc, row, sqlite3_column_double(stmt, BM25_COL_RANK));
+        yyjson_mut_arr_add_val(rows, row);
         emitted++;
     }
     sqlite3_finalize(stmt);
     free(file_like);
 
-    yyjson_mut_obj_add_val(doc, root, "results", results);
+    yyjson_mut_obj_add_val(doc, root, "rows", rows);
     yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emitted);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json;
-}
-
-/* Forward declaration — defined later. enrich_node_properties parses the
- * node's properties_json and grafts the parsed values onto the result item.
- * It returns the parsed yyjson_doc which must outlive the serialization
- * because yyjson_mut_obj_add_val uses zero-copy strings into that doc. */
-static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
-                                          const char *properties_json);
-
-/* Emit the cbm_store_search results as a JSON "results" array on the doc.
- * Property docs created via enrich_node_properties are collected in
- * *out_pdocs (count in *out_pdoc_count) and must be freed by the caller
- * AFTER serializing doc, since yyjson_mut strings are zero-copy pointers
- * into those parsed docs. The caller also frees out_pdocs itself. */
-static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                const cbm_search_output_t *out, cbm_store_t *store,
-                                const char *relationship, bool include_connected, int offset,
-                                yyjson_doc ***out_pdocs, int *out_pdoc_count) {
-    yyjson_doc **pdocs = out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
-    int pdoc_count = 0;
-    yyjson_mut_obj_add_int(doc, root, "total", out->total);
-    yyjson_mut_val *results = yyjson_mut_arr(doc);
-    for (int i = 0; i < out->count; i++) {
-        cbm_search_result_t *sr = &out->results[i];
-        yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
-        yyjson_mut_obj_add_str(doc, item, "qualified_name",
-                               sr->node.qualified_name ? sr->node.qualified_name : "");
-        yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
-        yyjson_mut_obj_add_str(doc, item, "file_path",
-                               sr->node.file_path ? sr->node.file_path : "");
-        yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
-        yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
-        if (include_connected && sr->node.id > 0) {
-            enrich_connected(doc, item, store, sr->node.id, relationship);
-        }
-        yyjson_doc *pdoc = enrich_node_properties(doc, item, sr->node.properties_json);
-        if (pdoc && pdocs) {
-            pdocs[pdoc_count++] = pdoc;
-        }
-        yyjson_mut_arr_add_val(results, item);
-    }
-    yyjson_mut_obj_add_val(doc, root, "results", results);
-    yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
-    *out_pdocs = pdocs;
-    *out_pdoc_count = pdoc_count;
 }
 
 /* Extract keyword strings from a yyjson array into `keywords`.  Returns the
@@ -2527,20 +2519,28 @@ static int extract_semantic_keywords(yyjson_val *sq_val, const char **keywords, 
     return ki;
 }
 
-/* Emit cbm_vector_result_t entries as a "semantic_results" array on the doc. */
+/* Emit vector-search hits in the json-tree model: "semantic": {cols, rows}
+ * — score order preserved (ranked output is never regrouped). */
 static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   cbm_vector_result_t *vresults, int vcount) {
+    yyjson_mut_val *sem = yyjson_mut_obj(doc);
+    yyjson_mut_val *scols = yyjson_mut_arr(doc);
+    static const char *const sem_cols[] = {"qn", "label", "file", "score"};
+    for (size_t ci = 0; ci < sizeof(sem_cols) / sizeof(sem_cols[0]); ci++) {
+        yyjson_mut_arr_add_str(doc, scols, sem_cols[ci]);
+    }
+    yyjson_mut_obj_add_val(doc, sem, "cols", scols);
     yyjson_mut_val *sem_results = yyjson_mut_arr(doc);
     for (int v = 0; v < vcount; v++) {
-        yyjson_mut_val *vitem = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_strcpy(doc, vitem, "name", vresults[v].name);
-        yyjson_mut_obj_add_strcpy(doc, vitem, "qualified_name", vresults[v].qualified_name);
-        yyjson_mut_obj_add_strcpy(doc, vitem, "label", vresults[v].label);
-        yyjson_mut_obj_add_strcpy(doc, vitem, "file_path", vresults[v].file_path);
-        yyjson_mut_obj_add_real(doc, vitem, "score", vresults[v].score);
+        yyjson_mut_val *vitem = yyjson_mut_arr(doc);
+        yyjson_mut_arr_add_strcpy(doc, vitem, vresults[v].qualified_name);
+        yyjson_mut_arr_add_strcpy(doc, vitem, vresults[v].label);
+        yyjson_mut_arr_add_strcpy(doc, vitem, vresults[v].file_path);
+        yyjson_mut_arr_add_real(doc, vitem, vresults[v].score);
         yyjson_mut_arr_add_val(sem_results, vitem);
     }
-    yyjson_mut_obj_add_val(doc, root, "semantic_results", sem_results);
+    yyjson_mut_obj_add_val(doc, sem, "rows", sem_results);
+    yyjson_mut_obj_add_val(doc, root, "semantic", sem);
 }
 
 /* Run the semantic_query vector search from raw args. Sets *out_vresults /
@@ -2600,10 +2600,10 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
     return type_error;
 }
 
-/* ── TOON output for search_graph ───────────────────────────────────
- * Default response encoding: header+rows tables (compact_out.h). The
- * verbose per-node JSON objects remain available via format:"json" and
- * are forced for include_connected=true (nested neighbor lists). */
+/* ── Tree output for search_graph ───────────────────────────────────
+ * Default response encoding: grouped tree rows (compact_out.h). The same
+ * model is available as structured JSON via format:"json"; include_connected
+ * adds a `connected` column in BOTH encodings. */
 
 enum { SG_MAX_EXTRA_FIELDS = 12 };
 
@@ -2769,12 +2769,16 @@ static int sg_cmp_by_qn(const void *pa, const void *pb) {
 }
 
 static void emit_search_results_tree(cbm_sb_t *sb, cbm_search_output_t *out, int offset,
-                                     const char *const *fields, int nfields) {
+                                     const char *const *fields, int nfields, cbm_store_t *store,
+                                     const char *relationship, bool include_connected) {
     char buf[CBM_SZ_512];
     char extra_cols[CBM_SZ_256] = "";
     for (int f = 0; f < nfields; f++) {
         strncat(extra_cols, " ", sizeof(extra_cols) - strlen(extra_cols) - 1);
         strncat(extra_cols, fields[f], sizeof(extra_cols) - strlen(extra_cols) - 1);
+    }
+    if (include_connected) {
+        strncat(extra_cols, " connected", sizeof(extra_cols) - strlen(extra_cols) - 1);
     }
     snprintf(buf, sizeof(buf),
              "total: %d\nresults: %d  (rows: name label lines in out%s; "
@@ -2833,6 +2837,11 @@ static void emit_search_results_tree(cbm_sb_t *sb, cbm_search_output_t *out, int
                 yyjson_doc_free(pd);
             }
         }
+        if (include_connected && sr->node.id > 0) {
+            char joined[CBM_SZ_1K];
+            enrich_connected_joined(store, sr->node.id, relationship, joined, sizeof(joined));
+            cbm_tree_cell_str(sb, joined, false); /* empty emits "-" */
+        }
         cbm_sb_append(sb, "\n");
     }
     snprintf(buf, sizeof(buf), "has_more: %s\n",
@@ -2846,7 +2855,9 @@ static void emit_search_results_tree(cbm_sb_t *sb, cbm_search_output_t *out, int
  * envelopes; that legacy shape was 84% key overhead). */
 static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                           cbm_search_output_t *out, int offset,
-                                          const char *const *fields, int nfields) {
+                                          const char *const *fields, int nfields,
+                                          cbm_store_t *store, const char *relationship,
+                                          bool include_connected) {
     yyjson_mut_obj_add_int(doc, root, "total", out->total);
     yyjson_mut_obj_add_int(doc, root, "count", out->count);
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
@@ -2856,6 +2867,9 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
     }
     for (int f = 0; f < nfields; f++) {
         yyjson_mut_arr_add_strcpy(doc, cols, fields[f]);
+    }
+    if (include_connected) {
+        yyjson_mut_arr_add_str(doc, cols, "connected");
     }
     yyjson_mut_obj_add_val(doc, root, "cols", cols);
     if (out->count > 1) {
@@ -2915,6 +2929,9 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
                 yyjson_doc_free(pd);
             }
         }
+        if (include_connected && sr->node.id > 0) {
+            yyjson_mut_arr_add_val(row, enrich_connected(doc, store, sr->node.id, relationship));
+        }
         yyjson_mut_arr_add_val(cur_rows, row);
     }
     yyjson_mut_obj_add_val(doc, root, "groups", groups);
@@ -2947,17 +2964,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
-    /* Response encoding: grouped tree rows by default.
-     * format:"json" restores the legacy verbose per-node objects; nested
-     * neighbor lists (include_connected) need them, so they force JSON.
-     * format:"tree" is the Phase-2 A/B candidate: rows grouped by
-     * (qn-prefix, file) with the shared prefix printed once. */
+    /* Response encoding: grouped tree rows by default; format:"json" emits
+     * the SAME tree model as structured JSON (groups + row arrays). */
     char *format_arg = cbm_mcp_get_string_arg(args, "format");
     bool legacy_json = format_arg && strcmp(format_arg, "json") == 0;
     free(format_arg);
-    if (cbm_mcp_get_bool_arg(args, "include_connected")) {
-        legacy_json = true;
-    }
 
     /* BM25 path: if `query` is set, run FTS5 full-text search with ranking
      * and return early.  The regex/vector path below is untouched for all
@@ -3052,7 +3063,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                 if (detail_ids) {
                     emit_search_results_toon(&sb, &tout, offset, fields, nfields, detail_ids);
                 } else {
-                    emit_search_results_tree(&sb, &tout, offset, fields, nfields);
+                    emit_search_results_tree(&sb, &tout, offset, fields, nfields, store,
+                                             relationship, include_connected);
                 }
                 if (core_fields_requested) {
                     cbm_tree_scalar_str(
@@ -3130,21 +3142,16 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_doc **props_docs = NULL;
-    int props_doc_count = 0;
-    if (include_connected) {
-        /* Nested neighbor lists keep the per-node object shape (the only
-         * remaining consumer of it; conversion tracked for the tree-json
-         * model's nested form). */
-        emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
-                            &props_docs, &props_doc_count);
-    } else {
-        /* format:"json" = json-stringified tree: same grouped model as the
-         * default text output, structured for parsing. */
+    /* format:"json" = json-stringified tree: same grouped model as the
+     * default text output, structured for parsing. include_connected adds a
+     * nested per-row `connected` array — the legacy per-node-object shape is
+     * gone. */
+    {
         const char *jfields[SG_MAX_EXTRA_FIELDS];
         yyjson_doc *jfields_owner = NULL;
         int jnfields = sg_parse_fields(args, jfields, SG_MAX_EXTRA_FIELDS, &jfields_owner, NULL);
-        emit_search_results_tree_json(doc, root, &out, offset, jfields, jnfields);
+        emit_search_results_tree_json(doc, root, &out, offset, jfields, jnfields, store,
+                                      relationship, include_connected);
         if (jfields_owner) {
             yyjson_doc_free(jfields_owner);
         }
@@ -3171,10 +3178,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool sq_type_error = run_semantic_query(doc, root, args, store, project, limit);
 
     if (sq_type_error) {
-        for (int pi = 0; pi < props_doc_count; pi++) {
-            yyjson_doc_free(props_docs[pi]);
-        }
-        free(props_docs);
         yyjson_mut_doc_free(doc);
         cbm_store_search_free(&out);
         free(project);
@@ -3192,12 +3195,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *json = yy_doc_to_str(doc);
-    /* Property docs are zero-copy referenced by the mut doc — they must
-     * outlive yy_doc_to_str. Free them once serialization is complete. */
-    for (int pi = 0; pi < props_doc_count; pi++) {
-        yyjson_doc_free(props_docs[pi]);
-    }
-    free(props_docs);
     yyjson_mut_doc_free(doc);
     cbm_store_search_free(&out);
 
@@ -4405,6 +4402,22 @@ static int arch_compute_cycles(cbm_store_t *store, const char *project, int64_t 
     return CBM_STORE_OK;
 }
 
+/* Begin a json-tree {cols, rows} section under `key` on root; returns the
+ * rows array for the caller to fill with column-ordered row arrays. */
+static yyjson_mut_val *arch_json_section(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *key,
+                                         const char *const *cols, int ncols) {
+    yyjson_mut_val *sec = yyjson_mut_obj(doc);
+    yyjson_mut_val *c = yyjson_mut_arr(doc);
+    for (int i = 0; i < ncols; i++) {
+        yyjson_mut_arr_add_str(doc, c, cols[i]);
+    }
+    yyjson_mut_obj_add_val(doc, sec, "cols", c);
+    yyjson_mut_val *rows = yyjson_mut_arr(doc);
+    yyjson_mut_obj_add_val(doc, sec, "rows", rows);
+    yyjson_mut_obj_add_val(doc, root, key, sec);
+    return rows;
+}
+
 /* Fetch the qualified_name for a node id, or a "#<id>" fallback. */
 static void arch_node_qn(cbm_store_t *store, int64_t id, char *out, size_t outsz) {
     cbm_node_t n = {0};
@@ -4519,7 +4532,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
 
     /* Response encoding: tree tables by default; format:"json" emits the
-     * legacy per-item objects. */
+     * same model as structured JSON ({cols, rows} per section). */
     char *arch_format = cbm_mcp_get_string_arg(args, "format");
     bool arch_legacy_json = arch_format && strcmp(arch_format, "json") == 0;
     free(arch_format);
@@ -4804,31 +4817,31 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count);
 
-    /* Node label summary */
+    /* Every section below is the json-tree model: {cols, rows[[...]]} —
+     * mirrors the text tree tables one-for-one. */
     if (aspect_wanted(aspects_doc, aspects_arr, "structure")) {
-        yyjson_mut_val *labels = yyjson_mut_arr(doc);
+        static const char *const lcols[] = {"label", "count"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "node_labels", lcols, 2);
         for (int i = 0; i < schema.node_label_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "label", schema.node_labels[i].label);
-            yyjson_mut_obj_add_int(doc, item, "count", schema.node_labels[i].count);
-            yyjson_mut_arr_add_val(labels, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, schema.node_labels[i].label);
+            yyjson_mut_arr_add_int(doc, row, schema.node_labels[i].count);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "node_labels", labels);
     }
 
-    /* Edge type summary */
     if (aspect_wanted(aspects_doc, aspects_arr, "dependencies")) {
-        yyjson_mut_val *types = yyjson_mut_arr(doc);
+        static const char *const tcols[] = {"type", "count"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "edge_types", tcols, 2);
         for (int i = 0; i < schema.edge_type_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "type", schema.edge_types[i].type);
-            yyjson_mut_obj_add_int(doc, item, "count", schema.edge_types[i].count);
-            yyjson_mut_arr_add_val(types, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, schema.edge_types[i].type);
+            yyjson_mut_arr_add_int(doc, row, schema.edge_types[i].count);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "edge_types", types);
     }
 
-    /* Relationship patterns */
+    /* Relationship patterns (a plain list — no columns to factor) */
     if (aspect_wanted(aspects_doc, aspects_arr, "routes") && schema.rel_pattern_count > 0) {
         yyjson_mut_val *pats = yyjson_mut_arr(doc);
         for (int i = 0; i < schema.rel_pattern_count; i++) {
@@ -4837,173 +4850,151 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", pats);
     }
 
-    /* Languages */
     if (arch.language_count > 0) {
-        yyjson_mut_val *langs = yyjson_mut_arr(doc);
+        static const char *const gcols[] = {"language", "files"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "languages", gcols, 2);
         for (int i = 0; i < arch.language_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "language",
-                                   arch.languages[i].language ? arch.languages[i].language : "");
-            yyjson_mut_obj_add_int(doc, item, "file_count", arch.languages[i].file_count);
-            yyjson_mut_arr_add_val(langs, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row,
+                                      arch.languages[i].language ? arch.languages[i].language : "");
+            yyjson_mut_arr_add_int(doc, row, arch.languages[i].file_count);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "languages", langs);
     }
 
-    /* Packages */
     if (arch.package_count > 0) {
-        yyjson_mut_val *pkgs = yyjson_mut_arr(doc);
+        static const char *const kcols[] = {"name", "nodes", "fan_in", "fan_out"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "packages", kcols, 4);
         for (int i = 0; i < arch.package_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.packages[i].name ? arch.packages[i].name : "");
-            yyjson_mut_obj_add_int(doc, item, "node_count", arch.packages[i].node_count);
-            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.packages[i].fan_in);
-            yyjson_mut_obj_add_int(doc, item, "fan_out", arch.packages[i].fan_out);
-            yyjson_mut_arr_add_val(pkgs, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, arch.packages[i].name ? arch.packages[i].name : "");
+            yyjson_mut_arr_add_int(doc, row, arch.packages[i].node_count);
+            yyjson_mut_arr_add_int(doc, row, arch.packages[i].fan_in);
+            yyjson_mut_arr_add_int(doc, row, arch.packages[i].fan_out);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "packages", pkgs);
     }
 
-    /* Entry points */
     if (arch.entry_point_count > 0) {
-        yyjson_mut_val *eps = yyjson_mut_arr(doc);
+        static const char *const ecols[] = {"qn", "file"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "entry_points", ecols, 2);
         for (int i = 0; i < arch.entry_point_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.entry_points[i].name ? arch.entry_points[i].name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(
+                doc, row,
                 arch.entry_points[i].qualified_name ? arch.entry_points[i].qualified_name : "");
-            yyjson_mut_obj_add_str(doc, item, "file",
-                                   arch.entry_points[i].file ? arch.entry_points[i].file : "");
-            yyjson_mut_arr_add_val(eps, item);
+            yyjson_mut_arr_add_strcpy(doc, row,
+                                      arch.entry_points[i].file ? arch.entry_points[i].file : "");
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "entry_points", eps);
     }
 
-    /* HTTP routes */
     if (arch.route_count > 0) {
-        yyjson_mut_val *routes = yyjson_mut_arr(doc);
+        static const char *const rcols[] = {"method", "path", "handler"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "routes", rcols, 3);
         for (int i = 0; i < arch.route_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "method",
-                                   arch.routes[i].method ? arch.routes[i].method : "");
-            yyjson_mut_obj_add_str(doc, item, "path",
-                                   arch.routes[i].path ? arch.routes[i].path : "");
-            yyjson_mut_obj_add_str(doc, item, "handler",
-                                   arch.routes[i].handler ? arch.routes[i].handler : "");
-            yyjson_mut_arr_add_val(routes, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, arch.routes[i].method ? arch.routes[i].method : "");
+            yyjson_mut_arr_add_strcpy(doc, row, arch.routes[i].path ? arch.routes[i].path : "");
+            yyjson_mut_arr_add_strcpy(doc, row,
+                                      arch.routes[i].handler ? arch.routes[i].handler : "");
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "routes", routes);
     }
 
-    /* Hotspots */
     if (arch.hotspot_count > 0) {
-        yyjson_mut_val *hotspots = yyjson_mut_arr(doc);
+        static const char *const hcols[] = {"qn", "fan_in"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "hotspots", hcols, 2);
         for (int i = 0; i < arch.hotspot_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.hotspots[i].name ? arch.hotspots[i].name : "");
-            yyjson_mut_obj_add_str(doc, item, "qualified_name",
-                                   arch.hotspots[i].qualified_name ? arch.hotspots[i].qualified_name
-                                                                   : "");
-            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.hotspots[i].fan_in);
-            yyjson_mut_arr_add_val(hotspots, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(
+                doc, row, arch.hotspots[i].qualified_name ? arch.hotspots[i].qualified_name : "");
+            yyjson_mut_arr_add_int(doc, row, arch.hotspots[i].fan_in);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "hotspots", hotspots);
     }
 
-    /* Cross-package boundaries */
     if (arch.boundary_count > 0) {
-        yyjson_mut_val *boundaries = yyjson_mut_arr(doc);
+        static const char *const bcols[] = {"from", "to", "calls"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "boundaries", bcols, 3);
         for (int i = 0; i < arch.boundary_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "from",
-                                   arch.boundaries[i].from ? arch.boundaries[i].from : "");
-            yyjson_mut_obj_add_str(doc, item, "to",
-                                   arch.boundaries[i].to ? arch.boundaries[i].to : "");
-            yyjson_mut_obj_add_int(doc, item, "call_count", arch.boundaries[i].call_count);
-            yyjson_mut_arr_add_val(boundaries, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row,
+                                      arch.boundaries[i].from ? arch.boundaries[i].from : "");
+            yyjson_mut_arr_add_strcpy(doc, row, arch.boundaries[i].to ? arch.boundaries[i].to : "");
+            yyjson_mut_arr_add_int(doc, row, arch.boundaries[i].call_count);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "boundaries", boundaries);
     }
 
-    /* Cross-service links (HTTP/async between services) */
     if (arch.service_count > 0) {
-        yyjson_mut_val *services = yyjson_mut_arr(doc);
+        static const char *const scols[] = {"from", "to", "type", "count"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "services", scols, 4);
         for (int i = 0; i < arch.service_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "from",
-                                   arch.services[i].from ? arch.services[i].from : "");
-            yyjson_mut_obj_add_str(doc, item, "to", arch.services[i].to ? arch.services[i].to : "");
-            yyjson_mut_obj_add_str(doc, item, "type",
-                                   arch.services[i].type ? arch.services[i].type : "");
-            yyjson_mut_obj_add_int(doc, item, "count", arch.services[i].count);
-            yyjson_mut_arr_add_val(services, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, arch.services[i].from ? arch.services[i].from : "");
+            yyjson_mut_arr_add_strcpy(doc, row, arch.services[i].to ? arch.services[i].to : "");
+            yyjson_mut_arr_add_strcpy(doc, row, arch.services[i].type ? arch.services[i].type : "");
+            yyjson_mut_arr_add_int(doc, row, arch.services[i].count);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "services", services);
     }
 
-    /* Package layers */
     if (arch.layer_count > 0) {
-        yyjson_mut_val *layers = yyjson_mut_arr(doc);
+        static const char *const ycols[] = {"name", "layer", "reason"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "layers", ycols, 3);
         for (int i = 0; i < arch.layer_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.layers[i].name ? arch.layers[i].name : "");
-            yyjson_mut_obj_add_str(doc, item, "layer",
-                                   arch.layers[i].layer ? arch.layers[i].layer : "");
-            yyjson_mut_obj_add_str(doc, item, "reason",
-                                   arch.layers[i].reason ? arch.layers[i].reason : "");
-            yyjson_mut_arr_add_val(layers, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, arch.layers[i].name ? arch.layers[i].name : "");
+            yyjson_mut_arr_add_strcpy(doc, row, arch.layers[i].layer ? arch.layers[i].layer : "");
+            yyjson_mut_arr_add_strcpy(doc, row, arch.layers[i].reason ? arch.layers[i].reason : "");
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "layers", layers);
     }
 
-    /* Clusters (community detection) */
     if (arch.cluster_count > 0) {
-        yyjson_mut_val *clusters = yyjson_mut_arr(doc);
+        /* Nested lists stay nested arrays within the row (tree-json). */
+        static const char *const ccols[] = {"id",        "label",    "members",   "cohesion",
+                                            "top_nodes", "packages", "edge_types"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "clusters", ccols, 7);
         for (int i = 0; i < arch.cluster_count; i++) {
             const cbm_cluster_info_t *c = &arch.clusters[i];
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_int(doc, item, "id", c->id);
-            yyjson_mut_obj_add_str(doc, item, "label", c->label ? c->label : "");
-            yyjson_mut_obj_add_int(doc, item, "members", c->members);
-            yyjson_mut_obj_add_real(doc, item, "cohesion", c->cohesion);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_int(doc, row, c->id);
+            yyjson_mut_arr_add_strcpy(doc, row, c->label ? c->label : "");
+            yyjson_mut_arr_add_int(doc, row, c->members);
+            yyjson_mut_arr_add_real(doc, row, c->cohesion);
             yyjson_mut_val *top = yyjson_mut_arr(doc);
             for (int j = 0; j < c->top_node_count; j++) {
                 yyjson_mut_arr_add_str(doc, top, c->top_nodes[j] ? c->top_nodes[j] : "");
             }
-            yyjson_mut_obj_add_val(doc, item, "top_nodes", top);
+            yyjson_mut_arr_add_val(row, top);
             yyjson_mut_val *pkgs = yyjson_mut_arr(doc);
             for (int j = 0; j < c->package_count; j++) {
                 yyjson_mut_arr_add_str(doc, pkgs, c->packages[j] ? c->packages[j] : "");
             }
-            yyjson_mut_obj_add_val(doc, item, "packages", pkgs);
+            yyjson_mut_arr_add_val(row, pkgs);
             yyjson_mut_val *etypes = yyjson_mut_arr(doc);
             for (int j = 0; j < c->edge_type_count; j++) {
                 yyjson_mut_arr_add_str(doc, etypes, c->edge_types[j] ? c->edge_types[j] : "");
             }
-            yyjson_mut_obj_add_val(doc, item, "edge_types", etypes);
-            yyjson_mut_arr_add_val(clusters, item);
+            yyjson_mut_arr_add_val(row, etypes);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "clusters", clusters);
     }
 
-    /* File tree */
     if (arch.file_tree_count > 0) {
-        yyjson_mut_val *file_tree = yyjson_mut_arr(doc);
+        static const char *const fcols[] = {"path", "type", "children"};
+        yyjson_mut_val *rows = arch_json_section(doc, root, "file_tree", fcols, 3);
         for (int i = 0; i < arch.file_tree_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "path",
-                                   arch.file_tree[i].path ? arch.file_tree[i].path : "");
-            yyjson_mut_obj_add_str(doc, item, "type",
-                                   arch.file_tree[i].type ? arch.file_tree[i].type : "");
-            yyjson_mut_obj_add_int(doc, item, "children", arch.file_tree[i].children);
-            yyjson_mut_arr_add_val(file_tree, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row,
+                                      arch.file_tree[i].path ? arch.file_tree[i].path : "");
+            yyjson_mut_arr_add_strcpy(doc, row,
+                                      arch.file_tree[i].type ? arch.file_tree[i].type : "");
+            yyjson_mut_arr_add_int(doc, row, arch.file_tree[i].children);
+            yyjson_mut_arr_add_val(rows, row);
         }
-        yyjson_mut_obj_add_val(doc, root, "file_tree", file_tree);
     }
 
     append_cross_repo_summary(doc, root, &schema);
@@ -5690,6 +5681,24 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *cursor_arg = cbm_mcp_get_string_arg(args, "cursor");
     trace_cursor_t cur = {0};
     bool have_cursor = false;
+    /* A "legacy" generation (pre-migration DB, e.g. opened read-only before
+     * any reindex) offers NO staleness detection: "legacy" == "legacy" across
+     * rebuilds, so a stale watermark would silently resume on wrong node ids.
+     * Cursors are therefore never minted nor accepted under it. */
+    bool gen_legacy = strcmp(generation, "legacy") == 0;
+    if (gen_legacy && cursor_arg && cursor_arg[0]) {
+        free(cursor_arg);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        free(param_name);
+        return cbm_mcp_text_result(
+            "cursor_unsupported: this project's index predates generation tracking, so cursor "
+            "staleness cannot be detected. Re-call with a higher 'limit' instead, or re-index "
+            "the project to enable pagination.",
+            true);
+    }
     if (cursor_arg && cursor_arg[0]) {
         uint64_t qh =
             trace_params_hash(project, func_name, direction ? direction : "both", mode,
@@ -5786,8 +5795,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Response encoding: tree tables by default; format:"json" emits the
-     * legacy verbose per-hop objects; format:"tree" = Phase-2 A/B candidate
-     * (qn-prefix-grouped rows). */
+     * same grouped model as structured JSON. */
     char *trace_format = cbm_mcp_get_string_arg(args, "format");
     bool trace_legacy_json = trace_format && strcmp(trace_format, "json") == 0;
     free(trace_format);
@@ -5856,8 +5864,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
     bool out_more = do_outbound && out_start + out_len < tr_out.visited_count;
     bool in_more = do_inbound && in_start + in_len < tr_in.visited_count;
+    bool more_rows = out_more || in_more;
     char next_tok[192] = "";
-    if (out_more || in_more) {
+    /* Never mint a cursor under a "legacy" generation (no staleness
+     * detection); the truncated flag + raise-limit hint still fire below. */
+    if (more_rows && !gen_legacy) {
         trace_cursor_t nc = {0};
         snprintf(nc.generation, sizeof(nc.generation), "%s", generation);
         nc.qhash = trace_params_hash(project, func_name, direction, mode, depth, include_tests,
@@ -5930,13 +5941,19 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 bfs_to_tree_table(&sb, "callers", &view_in, include_tests);
             }
         }
-        if (next_tok[0]) {
+        if (more_rows) {
             cbm_tree_scalar_bool(&sb, "truncated", true);
-            cbm_tree_scalar_str(&sb, "next", next_tok);
-            cbm_tree_scalar_str(&sb, "hint",
-                                "more rows exist — re-call with cursor set to 'next' and ALL "
-                                "other arguments identical (no duplicates), or narrow with "
-                                "depth/edge_types");
+            if (next_tok[0]) {
+                cbm_tree_scalar_str(&sb, "next", next_tok);
+                cbm_tree_scalar_str(&sb, "hint",
+                                    "more rows exist — re-call with cursor set to 'next' and ALL "
+                                    "other arguments identical (no duplicates), or narrow with "
+                                    "depth/edge_types");
+            } else {
+                cbm_tree_scalar_str(&sb, "hint",
+                                    "more rows exist — re-call with a higher 'limit' (cursors "
+                                    "unavailable: index predates generation tracking)");
+            }
         }
         json = cbm_sb_finish(&sb);
     } else {
@@ -5961,9 +5978,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, root, "callers",
                 bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow));
         }
-        if (next_tok[0]) {
+        if (more_rows) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
-            yyjson_mut_obj_add_strcpy(doc, root, "next_cursor", next_tok);
+            if (next_tok[0]) {
+                yyjson_mut_obj_add_strcpy(doc, root, "next_cursor", next_tok);
+            }
         }
         /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
         json = yy_doc_to_str(doc);
@@ -7036,44 +7055,6 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
     return result;
 }
 
-/* Enrich a mutable JSON object with key-value pairs from a node's properties_json.
- * Returns the parsed yyjson_doc (caller frees AFTER serialization — zero-copy). */
-static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
-                                          const char *properties_json) {
-    if (!properties_json || properties_json[0] == '\0') {
-        return NULL;
-    }
-    yyjson_doc *props_doc = yyjson_read(properties_json, strlen(properties_json), 0);
-    if (!props_doc) {
-        return NULL;
-    }
-    yyjson_val *props_root = yyjson_doc_get_root(props_doc);
-    if (!props_root || !yyjson_is_obj(props_root)) {
-        yyjson_doc_free(props_doc);
-        return NULL;
-    }
-    yyjson_obj_iter iter;
-    yyjson_obj_iter_init(props_root, &iter);
-    yyjson_val *key;
-    while ((key = yyjson_obj_iter_next(&iter))) {
-        yyjson_val *val = yyjson_obj_iter_get_val(key);
-        const char *k = yyjson_get_str(key);
-        if (!k) {
-            continue;
-        }
-        if (yyjson_is_str(val)) {
-            yyjson_mut_obj_add_str(doc, obj, k, yyjson_get_str(val));
-        } else if (yyjson_is_bool(val)) {
-            yyjson_mut_obj_add_bool(doc, obj, k, yyjson_get_bool(val));
-        } else if (yyjson_is_int(val)) {
-            yyjson_mut_obj_add_int(doc, obj, k, yyjson_get_int(val));
-        } else if (yyjson_is_real(val)) {
-            yyjson_mut_obj_add_real(doc, obj, k, yyjson_get_real(val));
-        }
-    }
-    return props_doc; /* caller frees after serialization */
-}
-
 /* Resolve an absolute path from root_path + file_path, verify containment,
  * and read source lines. Sets *out_abs_path (caller frees). Returns source
  * string (caller frees) or NULL if path is invalid/unreadable. */
@@ -7863,41 +7844,69 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
         yyjson_mut_obj_add_val(doc, root_obj, "files",
                                build_dedup_files_array(doc, sr, output_count, raw, raw_count));
     } else {
+        /* json-stringified tree: cols + column-ordered row arrays. FULL mode
+         * appends a per-row object cell with the (guarded, windowed) source —
+         * attach_result_source semantics unchanged. */
+        yyjson_mut_val *jcols = yyjson_mut_arr(doc);
+        static const char *const sc_cols[] = {"qn",      "label", "file", "lines",
+                                              "matches", "in",    "out"};
+        for (size_t ci = 0; ci < sizeof(sc_cols) / sizeof(sc_cols[0]); ci++) {
+            yyjson_mut_arr_add_str(doc, jcols, sc_cols[ci]);
+        }
+        if (mode == MODE_FULL) {
+            yyjson_mut_arr_add_str(doc, jcols, "source");
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "cols", jcols);
+
         yyjson_mut_val *results_arr = yyjson_mut_arr(doc);
         for (int ri = 0; ri < output_count; ri++) {
             search_result_t *r = &sr[ri];
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-
-            yyjson_mut_obj_add_str(doc, item, "node", r->node_name);
-            yyjson_mut_obj_add_str(doc, item, "qualified_name", r->qualified_name);
-            yyjson_mut_obj_add_str(doc, item, "label", r->label);
-            yyjson_mut_obj_add_str(doc, item, "file", r->file);
-            yyjson_mut_obj_add_int(doc, item, "start_line", r->start_line);
-            yyjson_mut_obj_add_int(doc, item, "end_line", r->end_line);
-            yyjson_mut_obj_add_int(doc, item, "in_degree", r->in_degree);
-            yyjson_mut_obj_add_int(doc, item, "out_degree", r->out_degree);
-
+            char lines[CBM_SZ_32];
+            if (r->start_line > 0) {
+                snprintf(lines, sizeof(lines), "%d-%d", r->start_line,
+                         r->end_line > r->start_line ? r->end_line : r->start_line);
+            } else {
+                lines[0] = '\0';
+            }
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, r->qualified_name);
+            yyjson_mut_arr_add_strcpy(doc, row, r->label);
+            yyjson_mut_arr_add_strcpy(doc, row, r->file);
+            yyjson_mut_arr_add_strcpy(doc, row, lines);
             yyjson_mut_val *ml = yyjson_mut_arr(doc);
             for (int j = 0; j < r->match_count; j++) {
                 yyjson_mut_arr_add_int(doc, ml, r->match_lines[j]);
             }
-            yyjson_mut_obj_add_val(doc, item, "match_lines", ml);
-            attach_result_source(doc, item, r, mode, context_lines, root_path);
-            yyjson_mut_arr_add_val(results_arr, item);
+            yyjson_mut_arr_add_val(row, ml);
+            yyjson_mut_arr_add_int(doc, row, r->in_degree);
+            yyjson_mut_arr_add_int(doc, row, r->out_degree);
+            if (mode == MODE_FULL) {
+                yyjson_mut_val *src = yyjson_mut_obj(doc);
+                attach_result_source(doc, src, r, mode, context_lines, root_path);
+                yyjson_mut_arr_add_val(row, src);
+            }
+            yyjson_mut_arr_add_val(results_arr, row);
         }
-        yyjson_mut_obj_add_val(doc, root_obj, "results", results_arr);
+        yyjson_mut_obj_add_val(doc, root_obj, "rows", results_arr);
 
         enum { MAX_RAW = 20 };
+        yyjson_mut_val *raw_obj = yyjson_mut_obj(doc);
+        yyjson_mut_val *rcols = yyjson_mut_arr(doc);
+        yyjson_mut_arr_add_str(doc, rcols, "file");
+        yyjson_mut_arr_add_str(doc, rcols, "line");
+        yyjson_mut_arr_add_str(doc, rcols, "content");
+        yyjson_mut_obj_add_val(doc, raw_obj, "cols", rcols);
         yyjson_mut_val *raw_arr = yyjson_mut_arr(doc);
         int raw_output = raw_count < MAX_RAW ? raw_count : MAX_RAW;
         for (int ri = 0; ri < raw_output; ri++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "file", raw[ri].file);
-            yyjson_mut_obj_add_int(doc, item, "line", raw[ri].line);
-            yyjson_mut_obj_add_str(doc, item, "content", raw[ri].content);
-            yyjson_mut_arr_add_val(raw_arr, item);
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_str(doc, row, raw[ri].file);
+            yyjson_mut_arr_add_int(doc, row, raw[ri].line);
+            yyjson_mut_arr_add_str(doc, row, raw[ri].content);
+            yyjson_mut_arr_add_val(raw_arr, row);
         }
-        yyjson_mut_obj_add_val(doc, root_obj, "raw_matches", raw_arr);
+        yyjson_mut_obj_add_val(doc, raw_obj, "rows", raw_arr);
+        yyjson_mut_obj_add_val(doc, root_obj, "raw_matches", raw_obj);
     }
 
     yyjson_mut_obj_add_val(doc, root_obj, "directories", build_dir_distribution(doc, sr, sr_count));
@@ -8506,9 +8515,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
-    /* compact mode (default) emits tree tables; format:"json" keeps the
-     * legacy per-hit objects. full/files keep their JSON shapes (full is
-     * source-block-heavy; files is already minimal). */
+    /* compact mode (default) emits tree tables; format:"json" emits the
+     * same model as structured JSON ({cols, rows}; full adds a per-row
+     * source cell; files is a plain list). */
     char *sc_format = cbm_mcp_get_string_arg(args, "format");
     bool sc_legacy_json = sc_format && strcmp(sc_format, "json") == 0;
     free(sc_format);
@@ -8775,10 +8784,22 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     if (!direction) {
         direction = heap_strdup("inbound");
     }
+    /* Teaching error, same contract as trace_path: never silently correct an
+     * unknown direction — the caller would misread the result's semantics. */
     if (strcmp(direction, "inbound") != 0 && strcmp(direction, "outbound") != 0 &&
         strcmp(direction, "both") != 0) {
+        char errbuf[CBM_SZ_256];
+        snprintf(errbuf, sizeof(errbuf),
+                 "invalid direction \"%s\" — use \"inbound\" (blast radius: transitive callers), "
+                 "\"outbound\" (dependencies), or \"both\"",
+                 direction);
         free(direction);
-        direction = heap_strdup("inbound");
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        (void)cbm_pclose(fp);
+        return cbm_mcp_text_result(errbuf, true);
     }
     char *fmt = cbm_mcp_get_string_arg(args, "format");
     bool legacy_json = fmt && strcmp(fmt, "json") == 0;
