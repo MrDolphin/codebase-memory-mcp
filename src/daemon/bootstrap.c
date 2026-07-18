@@ -29,6 +29,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <spawn.h>
+extern char **environ;
+#endif
 #endif
 
 enum {
@@ -712,6 +716,90 @@ static bool bootstrap_production_spawn(void *context,
     (void)CloseHandle(child.hThread);
     (void)CloseHandle(child.hProcess);
     return true;
+}
+#elif defined(__APPLE__)
+static bool bootstrap_darwin_spawn_state_init(posix_spawn_file_actions_t *actions,
+                                              posix_spawnattr_t *attributes) {
+    if (posix_spawn_file_actions_init(actions) != 0) {
+        return false;
+    }
+    bool actions_ready =
+        posix_spawn_file_actions_addopen(actions, STDIN_FILENO, "/dev/null", O_RDWR, 0) == 0 &&
+        posix_spawn_file_actions_addopen(actions, STDOUT_FILENO, "/dev/null", O_RDWR, 0) == 0 &&
+        posix_spawn_file_actions_addopen(actions, STDERR_FILENO, "/dev/null", O_RDWR, 0) == 0;
+    if (!actions_ready) {
+        (void)posix_spawn_file_actions_destroy(actions);
+        return false;
+    }
+    if (posix_spawnattr_init(attributes) != 0) {
+        (void)posix_spawn_file_actions_destroy(actions);
+        return false;
+    }
+    sigset_t empty;
+    (void)sigemptyset(&empty);
+    short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT;
+    if (posix_spawnattr_setsigmask(attributes, &empty) != 0 ||
+        posix_spawnattr_setflags(attributes, flags) != 0) {
+        (void)posix_spawnattr_destroy(attributes);
+        (void)posix_spawn_file_actions_destroy(actions);
+        return false;
+    }
+    return true;
+}
+
+static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec,
+                                        const posix_spawn_file_actions_t *actions,
+                                        const posix_spawnattr_t *attributes) {
+    (void)umask(077);
+    pid_t daemon = 0;
+    int status = posix_spawn(&daemon, spec->executable_path, actions, attributes,
+                             (char *const *)spec->argv, environ);
+    _exit(status == 0 ? 0 : 127);
+}
+
+static bool bootstrap_production_spawn(void *context,
+                                       const cbm_daemon_bootstrap_launch_spec_t *spec) {
+    (void)context;
+    if (!spec || !spec->detached || spec->inherit_standard_handles || spec->use_shell) {
+        return false;
+    }
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    if (!bootstrap_darwin_spawn_state_init(&actions, &attributes)) {
+        return false;
+    }
+    pid_t first = fork();
+    if (first < 0) {
+        (void)posix_spawnattr_destroy(&attributes);
+        (void)posix_spawn_file_actions_destroy(&actions);
+        return false;
+    }
+    if (first == 0) {
+        if (setsid() < 0) {
+            _exit(127);
+        }
+        pid_t grandchild = fork();
+        if (grandchild < 0) {
+            _exit(127);
+        }
+        if (grandchild > 0) {
+            _exit(0);
+        }
+        /* Darwin commonly reports OPEN_MAX near one million. Iterating every
+         * possible descriptor after fork can consume the entire cold-start
+         * budget. CLOEXEC_DEFAULT closes the actual inherited set in the
+         * kernel while the double fork still provides daemon detachment. */
+        bootstrap_daemon_grandchild(spec, &actions, &attributes);
+    }
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(first, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    (void)posix_spawnattr_destroy(&attributes);
+    (void)posix_spawn_file_actions_destroy(&actions);
+    return waited == first && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 #else
 static void bootstrap_child_close_fds(void) {

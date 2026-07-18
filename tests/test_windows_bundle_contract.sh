@@ -137,15 +137,16 @@ for relative, patterns in portable_cache_contracts.items():
 
 # Portable package shims keep an immutable, exact-version launcher/payload pair.
 # The launcher resolves its adjacent payload for every native command.
-# Concurrent first-run contenders publish launcher first and payload
-# last; payload is therefore the readiness signal. They never pre-delete or
-# roll back a destination, and may accept a collision only after proving that
-# the winner is byte-identical to the authenticated staged source and runnable.
+# Concurrent first-run contenders publish launcher first and payload last;
+# payload is therefore the readiness signal. npm and Go serialize pair repair,
+# preserve any complete runnable winner, and roll back only bytes proven to
+# belong to their own transaction. PyPI uses identical-byte collision checks.
 immutable_pair_cache_contracts = {
     "pkg/npm/install.js": (
         "const cacheNames = platform === 'windows'",
-        "const publishNames = platform === 'windows'",
-        "filesEqualSha256",
+        "const lock = acquireWindowsPairLock(destDir)",
+        "publishedDigests.set(name, stagedDigests.get(name))",
+        "if (digest && pathMatchesDigest(target, digest))",
     ),
     "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
         "cache_names = extraction_names",
@@ -154,7 +155,9 @@ immutable_pair_cache_contracts = {
     ),
     "pkg/go/cmd/codebase-memory-mcp/main.go": (
         "installWindowsPairAtomically(tmp, filepath.Dir(dest))",
-        "filesEqualSHA256",
+        "lock, err := acquireWindowsPairLock(dstDir)",
+        "publishedDigests[name] = stagedDigests[name]",
+        "if ok && pathMatchesSHA256(target, digest)",
     ),
 }
 for relative, needles in immutable_pair_cache_contracts.items():
@@ -172,14 +175,12 @@ for relative, needles in immutable_pair_cache_contracts.items():
 
 npm_installer = read("pkg/npm/install.js")
 require(
-    re.search(
-        r"const publishNames = platform === 'windows'\s*\?\s*"
-        r"\[WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME\]",
-        npm_installer,
-    ) is not None
-    and "filesEqualSha256(stagedPaths.get(name), destination)" in npm_installer
-    and "fs.unlinkSync(destination)" not in npm_installer,
-    "npm must publish launcher then payload and only accept an identical collision",
+    "for (const name of [WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME])" in npm_installer
+    and "windowsPairReady(destDir, verifier)" in npm_installer
+    and "publishedDigests.set(name, stagedDigests.get(name))" in npm_installer
+    and "if (digest && pathMatchesDigest(target, digest))" in npm_installer,
+    "npm must publish launcher then payload, preserve a coherent winner, and "
+    "roll back only transaction-owned bytes",
 )
 python_wrapper = read("pkg/pypi/src/codebase_memory_mcp/_cli.py")
 require(
@@ -194,9 +195,11 @@ require(
 go_wrapper = read("pkg/go/cmd/codebase-memory-mcp/main.go")
 require(
     "names := []string{windowsLauncherName, windowsPayloadName}" in go_wrapper
-    and "filesEqualSHA256(staged[name], target)" in go_wrapper
-    and "os.Remove(target)" not in go_wrapper,
-    "Go must publish launcher then payload and only accept an identical collision",
+    and "windowsPairReady(dstDir, verifier)" in go_wrapper
+    and "publishedDigests[name] = stagedDigests[name]" in go_wrapper
+    and "if ok && pathMatchesSHA256(target, digest)" in go_wrapper,
+    "Go must publish launcher then payload, preserve a coherent winner, and "
+    "roll back only transaction-owned bytes",
 )
 
 npm_shim = read("pkg/npm/bin.js")
@@ -214,7 +217,8 @@ require(
 )
 require(
     "verifyCandidate(extractedPaths.get(WINDOWS_LAUNCHER_NAME))" in npm_installer
-    and "verifyCandidate(path.join(BIN_DIR, WINDOWS_LAUNCHER_NAME))" in npm_installer,
+    and "if (platform === 'windows' && windowsPairReady(BIN_DIR)) return;" in npm_installer
+    and "verifier(launcher)" in npm_installer,
     "npm must validate extracted and cached Windows pairs through the launcher",
 )
 require(
@@ -429,11 +433,28 @@ require(
     any("zip" in block and launcher in block and payload in block for block in smoke_blocks),
     "Windows artifact-server smoke archive must contain launcher and payload",
 )
+windows_release_smoke_blocks = [
+    re.sub(r"\s+", " ", re.sub(r"\\\s*\n\s*", " ", block)).strip()
+    for block in smoke_blocks
+    if "scripts/smoke-test.sh ./codebase-memory-mcp.exe" in block
+]
+require(
+    len(windows_release_smoke_blocks) == 1
+    and 'SMOKE_TEMP_ROOT="$(cygpath -u "$RUNNER_TEMP")" '
+    'scripts/smoke-test.sh ./codebase-memory-mcp.exe' in windows_release_smoke_blocks[0],
+    "Windows release smoke must keep every launcher fixture under runner-private temp",
+)
 
 # Native update transport remains HTTPS-only in production. Release smoke may
 # use an explicit file:// CBM_DOWNLOAD_URL only for its local fixture, while the
 # installer and raw-curl phases continue to exercise the loopback HTTP server.
 smoke_script = read("scripts/smoke-test.sh")
+require(
+    "smoke_mktemp_file" in smoke_script
+    and "smoke_mktemp_dir" in smoke_script
+    and re.search(r"\$\(\s*mktemp(?:\s+-d)?(?:\s|\))", smoke_script) is None,
+    "smoke-test.sh must route every temporary fixture through its private-root helpers",
+)
 require(
     'SMOKE_UPDATE_FIXTURE_DIR' in smoke_script
     and 'UPDATE_DOWNLOAD_URL="file://$UPDATE_FIXTURE_DIR"' in smoke_script
@@ -465,7 +486,7 @@ protocol_match = re.search(
 file_override = file_override_match.group(0) if file_override_match else ""
 protocol = protocol_match.group(0) if protocol_match else ""
 require(
-    'cbm_safe_getenv(\n        "CBM_DOWNLOAD_URL"' in file_override
+    re.search(r'cbm_safe_getenv\s*\(\s*"CBM_DOWNLOAD_URL"', file_override) is not None
     and 'strncmp(override, "file://", 7)' in file_override
     and "strncmp(url, override, override_length)" in file_override,
     "file:// downloads must remain restricted to the explicit test override",
@@ -511,19 +532,21 @@ if pr_windows_blocks:
     pr_windows_block = re.sub(r"\\\s*\n\s*", " ", pr_windows_blocks[0])
     pr_windows_block = re.sub(r"\s+", " ", pr_windows_block).strip()
     staging_steps = (
-        'SMOKE_DIR="$(mktemp -d)"',
+        'SMOKE_ROOT="$(cygpath -u "$RUNNER_TEMP")"',
+        'SMOKE_DIR="$(mktemp -d "$SMOKE_ROOT/cbm-pr-smoke.XXXXXX")"',
         'trap \'rm -rf "$SMOKE_DIR"\' EXIT',
         'cp build/c/codebase-memory-mcp-launcher.exe '
         '"$SMOKE_DIR/codebase-memory-mcp.exe"',
         'cp build/c/codebase-memory-mcp.exe '
         '"$SMOKE_DIR/codebase-memory-mcp.payload.exe"',
+        'SMOKE_TEMP_ROOT="$SMOKE_ROOT" '
         'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"',
     )
     positions = [pr_windows_block.find(step) for step in staging_steps]
     require(
         all(position >= 0 for position in positions),
         "Windows PR smoke must stage launcher and payload under release names "
-        "and invoke the canonical launcher",
+        "in the runner-private native temp directory and invoke the canonical launcher",
     )
     require(
         all(left < right for left, right in zip(positions, positions[1:])),

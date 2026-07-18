@@ -19,6 +19,22 @@ if [ -n "$SMOKE_MODE" ] && [ "$SMOKE_MODE" != "--agent-config-only" ]; then
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
+smoke_mktemp_file() {
+  if [ -n "${SMOKE_TEMP_ROOT:-}" ]; then
+    mktemp "$SMOKE_TEMP_ROOT/cbm-smoke.XXXXXX"
+  else
+    mktemp
+  fi
+}
+
+smoke_mktemp_dir() {
+  if [ -n "${SMOKE_TEMP_ROOT:-}" ]; then
+    mktemp -d "$SMOKE_TEMP_ROOT/cbm-smoke.XXXXXX"
+  else
+    mktemp -d
+  fi
+}
+
 # Windows release archives contain a small permanent launcher plus a portable
 # payload. Whenever a smoke fixture copies the launcher, keep the payload next
 # to it so the copied fixture remains a complete portable bundle.
@@ -39,7 +55,7 @@ copy_smoke_binary() {
   fi
 }
 
-TMPDIR=$(mktemp -d)
+TMPDIR=$(smoke_mktemp_dir)
 DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
@@ -47,12 +63,17 @@ if command -v cygpath &>/dev/null; then
 fi
 trap 'rm -rf "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
 
-CLI_STDERR=$(mktemp)
+CLI_STDERR=$(smoke_mktemp_file)
 cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
 
 echo "=== Phase 1: version ==="
-OUTPUT=$("$BINARY" --version 2>&1)
+VERSION_STATUS=0
+OUTPUT=$("$BINARY" --version 2>&1) || VERSION_STATUS=$?
 echo "$OUTPUT"
+if [ "$VERSION_STATUS" -ne 0 ]; then
+  echo "FAIL: --version exited with status $VERSION_STATUS"
+  exit 1
+fi
 if ! echo "$OUTPUT" | grep -qE 'v?[0-9]+\.[0-9]+|dev'; then
   echo "FAIL: unexpected version output"
   exit 1
@@ -496,7 +517,7 @@ fi
 echo "OK B4: STDIN input resolves, no deprecation warning"
 
 # B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
-IM_ARGS_FILE=$(mktemp)
+IM_ARGS_FILE=$(smoke_mktemp_file)
 echo "{\"project\":\"$PROJECT\"}" > "$IM_ARGS_FILE"
 if ! IM_AF=$(cli get_graph_schema --args-file "$IM_ARGS_FILE"); then
   echo "FAIL B5: get_graph_schema --args-file exited non-zero"; cat "$CLI_STDERR"; rm -f "$IM_ARGS_FILE"; exit 1
@@ -613,8 +634,8 @@ mcp_run() {
   wait "$pid" 2>/dev/null || true
 }
 
-MCP_INPUT=$(mktemp)
-MCP_OUTPUT=$(mktemp)
+MCP_INPUT=$(smoke_mktemp_file)
+MCP_OUTPUT=$(smoke_mktemp_file)
 cat > "$MCP_INPUT" << 'MCPEOF'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
@@ -666,7 +687,7 @@ rm -f "$MCP_INPUT" "$MCP_OUTPUT"
 # 5e: MCP tool call via JSON-RPC (index + search round-trip)
 echo ""
 echo "--- Phase 5e: MCP tool call round-trip ---"
-MCP_TOOL_OUTPUT=$(mktemp)
+MCP_TOOL_OUTPUT=$(smoke_mktemp_file)
 
 if ! python3 "$REPO_ROOT/scripts/test_mcp_interactive.py" \
     "$BINARY" --scenario roundtrip --repo-path "$TMPDIR" \
@@ -695,8 +716,8 @@ echo "OK: MCP tool call round-trip (index + search) succeeded"
 # 5f: Content-Length framing (OpenCode compatibility)
 echo ""
 echo "--- Phase 5f: Content-Length framing ---"
-MCP_CL_INPUT=$(mktemp)
-MCP_CL_OUTPUT=$(mktemp)
+MCP_CL_INPUT=$(smoke_mktemp_file)
+MCP_CL_OUTPUT=$(smoke_mktemp_file)
 
 INIT_MSG='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cl-test","version":"1.0"}}}'
 INIT_LEN=${#INIT_MSG}
@@ -721,7 +742,7 @@ rm -f "$MCP_CL_INPUT" "$MCP_CL_OUTPUT" "$MCP_TOOL_OUTPUT"
 echo ""
 echo "=== Phase 6: CLI subcommands ==="
 
-DRYRUN_HOME=$(mktemp -d)
+DRYRUN_HOME=$(smoke_mktemp_dir)
 DRYRUN_CACHE="$DRYRUN_HOME/.cache/codebase-memory-mcp"
 mkdir -p "$DRYRUN_CACHE" \
   "$DRYRUN_HOME/.local/bin" \
@@ -827,7 +848,7 @@ echo "OK: config set/get/reset round-trip"
 # Simulates the update command's Steps 3-6: extract, replace, verify.
 # Uses a copy of the test binary as the "downloaded" version.
 echo "--- Phase 6e: simulated binary replacement ---"
-REPLACE_DIR=$(mktemp -d)
+REPLACE_DIR=$(smoke_mktemp_dir)
 INSTALL_DIR="$REPLACE_DIR/install"
 mkdir -p "$INSTALL_DIR"
 
@@ -881,7 +902,7 @@ echo "=== Phase 7: MCP advanced tool calls ==="
 
 # 7a: search_code via MCP (graph-augmented v2)
 echo "--- Phase 7a: search_code via MCP ---"
-MCP_SC_OUTPUT=$(mktemp)
+MCP_SC_OUTPUT=$(smoke_mktemp_file)
 if ! python3 "$REPO_ROOT/scripts/test_mcp_interactive.py" \
     "$BINARY" --scenario advanced --repo-path "$TMPDIR" \
     > "$MCP_SC_OUTPUT"; then
@@ -914,7 +935,7 @@ echo "=== Phase 8: agent config install E2E ==="
 # Set up an isolated HOME. Directory-only agents get only the root required for
 # detection; CLI-detected agents use stubs below so install must create their
 # config parents from scratch.
-FAKE_HOME=$(mktemp -d)
+FAKE_HOME=$(smoke_mktemp_dir)
 mkdir -p "$FAKE_HOME/.claude"
 mkdir -p "$FAKE_HOME/.codex"
 mkdir -p "$FAKE_HOME/.gemini/antigravity-cli"
@@ -2474,7 +2495,7 @@ echo "--- Phase 9b: adversarial install/uninstall tests ---"
 # Note: cbm_find_cli searches hardcoded paths (/usr/local/bin, /opt/homebrew/bin)
 # so PATH-based agents like aider may still be detected. We verify the install
 # completes without crash and prints "Detected agents:" line.
-EMPTY_HOME=$(mktemp -d)
+EMPTY_HOME=$(smoke_mktemp_dir)
 mkdir -p "$EMPTY_HOME/.local/bin"
 INSTALL_OUT=$(HOME="$EMPTY_HOME" "$BINARY" install -y 2>&1) || true
 if ! echo "$INSTALL_OUT" | grep -qi 'detected agents'; then
@@ -2485,7 +2506,7 @@ echo "OK 9b-1: install with minimal agents exits cleanly"
 rm -rf "$EMPTY_HOME"
 
 # 9b-2: Install twice (idempotent)
-IDEM_HOME=$(mktemp -d)
+IDEM_HOME=$(smoke_mktemp_dir)
 mkdir -p "$IDEM_HOME/.claude" "$IDEM_HOME/.local/bin"
 copy_smoke_binary "$IDEM_HOME/.local/bin/codebase-memory-mcp"
 HOME="$IDEM_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
@@ -2508,14 +2529,14 @@ echo "OK 9b-2: double install is idempotent"
 rm -rf "$IDEM_HOME"
 
 # 9b-3: Uninstall without prior install
-CLEAN_HOME=$(mktemp -d)
+CLEAN_HOME=$(smoke_mktemp_dir)
 mkdir -p "$CLEAN_HOME/.claude" "$CLEAN_HOME/.local/bin"
 UNINSTALL_OUT=$(HOME="$CLEAN_HOME" "$BINARY" uninstall -y -n 2>&1) || true
 echo "OK 9b-3: uninstall without install doesn't crash"
 rm -rf "$CLEAN_HOME"
 
 # 9b-4: Install over corrupt JSON
-CORRUPT_HOME=$(mktemp -d)
+CORRUPT_HOME=$(smoke_mktemp_dir)
 mkdir -p "$CORRUPT_HOME/.claude" "$CORRUPT_HOME/.local/bin"
 copy_smoke_binary "$CORRUPT_HOME/.local/bin/codebase-memory-mcp"
 echo '{invalid json here' > "$CORRUPT_HOME/.claude.json"
@@ -2525,7 +2546,7 @@ echo "OK 9b-4: install over corrupt JSON doesn't crash"
 rm -rf "$CORRUPT_HOME"
 
 # 9b-8: Double uninstall
-DBL_HOME=$(mktemp -d)
+DBL_HOME=$(smoke_mktemp_dir)
 mkdir -p "$DBL_HOME/.claude" "$DBL_HOME/.local/bin"
 copy_smoke_binary "$DBL_HOME/.local/bin/codebase-memory-mcp"
 HOME="$DBL_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
@@ -2560,7 +2581,7 @@ fi
 echo ""
 echo "=== Phase 10: binary security E2E ==="
 
-SECURITY_DIR=$(mktemp -d)
+SECURITY_DIR=$(smoke_mktemp_dir)
 SECURITY_BIN="$SECURITY_DIR/codebase-memory-mcp"
 copy_smoke_binary "$SECURITY_BIN"
 chmod 755 "$SECURITY_BIN"
@@ -2655,7 +2676,7 @@ echo ""
 echo "=== Phase 11: process kill E2E ==="
 
 # Start MCP server in background
-MCP_KILL_INPUT=$(mktemp)
+MCP_KILL_INPUT=$(smoke_mktemp_file)
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"kill-test","version":"1.0"}}}' > "$MCP_KILL_INPUT"
 "$BINARY" < "$MCP_KILL_INPUT" > /dev/null 2>&1 &
 KILL_PID=$!
@@ -2698,7 +2719,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
       exit 1
     fi
   fi
-  UPDATE_HOME=$(mktemp -d)
+  UPDATE_HOME=$(smoke_mktemp_dir)
   mkdir -p "$UPDATE_HOME/.claude" "$UPDATE_HOME/.local/bin"
   if [[ "$BINARY" == *.exe ]]; then
     copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
@@ -2801,7 +2822,7 @@ sys.exit(0)
 
 else
   # Local mode: basic binary replacement test (no download)
-  UPDATE_DIR=$(mktemp -d)
+  UPDATE_DIR=$(smoke_mktemp_dir)
   mkdir -p "$UPDATE_DIR/install"
   copy_smoke_binary "$UPDATE_DIR/install/codebase-memory-mcp"
   chmod 755 "$UPDATE_DIR/install/codebase-memory-mcp"
@@ -2829,7 +2850,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
 echo ""
 echo "=== Phase 12: download + checksum + extraction E2E ==="
 
-DL_DIR=$(mktemp -d)
+DL_DIR=$(smoke_mktemp_dir)
 
 # Detect platform for archive name
 DL_OS=$(uname -s | tr 'A-Z' 'a-z')
@@ -2977,8 +2998,8 @@ echo "=== Phase 13: install script E2E ==="
 
 if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
   echo "--- Phase 13: install.sh E2E ---"
-  INSTALL_TEST_HOME=$(mktemp -d)
-  INSTALL_TEST_DIR=$(mktemp -d)
+  INSTALL_TEST_HOME=$(smoke_mktemp_dir)
+  INSTALL_TEST_DIR=$(smoke_mktemp_dir)
   mkdir -p "$INSTALL_TEST_HOME/.claude"
   mkdir -p "$INSTALL_TEST_HOME/.local/bin"
 
@@ -3041,8 +3062,8 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
 
 elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; then
   echo "--- Phase 13: install.ps1 E2E (Windows) ---"
-  PS1_TEST_HOME=$(mktemp -d)
-  PS1_TEST_DIR=$(mktemp -d)
+  PS1_TEST_HOME=$(smoke_mktemp_dir)
+  PS1_TEST_DIR=$(smoke_mktemp_dir)
   mkdir -p "$PS1_TEST_HOME/.claude"
 
   # Convert MSYS paths to Windows paths for PowerShell
@@ -3100,7 +3121,7 @@ echo ""
 echo "=== Phase 15: UI HTTP server ==="
 
 UI_PORT=19876
-UI_INPUT=$(mktemp)
+UI_INPUT=$(smoke_mktemp_file)
 "$BINARY" --port "$UI_PORT" < "$UI_INPUT" > /dev/null 2>&1 &
 UI_PID=$!
 sleep 1

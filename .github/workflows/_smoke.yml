@@ -239,7 +239,9 @@ jobs:
 
       - name: Smoke test
         shell: msys2 {0}
-        run: scripts/smoke-test.sh ./codebase-memory-mcp.exe
+        run: |
+          SMOKE_TEMP_ROOT="$(cygpath -u "$RUNNER_TEMP")" \
+            scripts/smoke-test.sh ./codebase-memory-mcp.exe
         env:
           SMOKE_DOWNLOAD_URL: http://127.0.0.1:18080
           SMOKE_UPDATE_FIXTURE_DIR: /tmp/smoke-server

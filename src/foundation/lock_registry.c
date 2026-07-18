@@ -198,11 +198,13 @@ static void lock_registry_notify(cbm_lock_registry_t *registry, cbm_private_file
         return;
     }
     cbm_lock_registry_stage_hook_fn hook = registry->stage_hook;
+    if (!hook) {
+        lock_registry_unlock(registry);
+        return;
+    }
     void *context = registry->stage_context;
     lock_registry_unlock(registry);
-    if (hook) {
-        hook(context, mode, stage);
-    }
+    hook(context, mode, stage);
 }
 
 static lock_registry_entry_t *lock_registry_find_entry(cbm_lock_registry_t *registry,
