@@ -415,6 +415,7 @@ static int lock_registry_abort_bookkeeping_failure_retains_cleanup(
     ASSERT_EQ(final_free, CBM_PRIVATE_FILE_LOCK_OK);
     PASS();
 }
+#endif
 
 TEST(lock_registry_terminal_close_error_finishes_pending_accounting) {
 #ifdef _WIN32
@@ -472,7 +473,6 @@ TEST(lock_registry_terminal_close_error_finishes_pending_accounting) {
     PASS();
 #endif
 }
-#endif
 
 TEST(lock_registry_abort_lock_failure_returns_waiter_cleanup_lease) {
 #ifdef _WIN32

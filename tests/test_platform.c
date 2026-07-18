@@ -292,7 +292,7 @@ TEST(platform_setenv_preserves_utf8_in_wide_environment) {
  * partially initialized paths. */
 TEST(platform_windows_empty_environment_is_read_and_unset_idempotently) {
     ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", "", 1), 0);
-    char observed[8] = "sentinel";
+    char observed[9] = "sentinel";
     ASSERT_NOT_NULL(cbm_safe_getenv("CBM_CACHE_DIR", observed, sizeof(observed), "fallback"));
     ASSERT_STR_EQ(observed, "");
     ASSERT_EQ(cbm_unsetenv("CBM_CACHE_DIR"), 0);

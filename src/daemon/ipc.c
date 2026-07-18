@@ -3840,7 +3840,13 @@ static bool win_file_owner_secure(win_security_t *security, HANDLE file,
     return secure;
 }
 
-static bool win_file_acl_secure(win_security_t *security, HANDLE file) {
+static DWORD win_private_mutation_rights(void) {
+    return GENERIC_ALL | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_ADD_FILE |
+           FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+           DELETE | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
+}
+
+static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mutation) {
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR descriptor = NULL;
     DWORD status = security->get_security_info(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
@@ -3850,10 +3856,6 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file) {
     bool secure =
         status == ERROR_SUCCESS && descriptor && dacl && security->is_valid_acl(dacl) &&
         security->get_acl_information(dacl, &information, sizeof(information), AclSizeInformation);
-    const DWORD mutation = GENERIC_ALL | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
-                           FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD |
-                           FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC |
-                           WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
     enum {
         WIN_FILE_ACE_ALLOW = 0x00,
         WIN_FILE_ACE_DENY = 0x01,
@@ -3896,9 +3898,9 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file) {
 }
 
 static bool win_file_security_secure(win_security_t *security, HANDLE file,
-                                     bool require_current_user) {
+                                     bool require_current_user, DWORD mutation) {
     return win_file_owner_secure(security, file, require_current_user) &&
-           win_file_acl_secure(security, file);
+           win_file_acl_secure(security, file, mutation);
 }
 
 static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
@@ -3938,7 +3940,8 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
                                                    NULL, NULL, security.acl, NULL);
     }
     bool final_private =
-        secure_result == ERROR_SUCCESS && win_file_security_secure(&security, directory, true);
+        secure_result == ERROR_SUCCESS &&
+        win_file_security_secure(&security, directory, true, win_private_mutation_rights());
     (void)CloseHandle(directory);
     win_security_destroy(&security);
     return valid_handle && owner_ok && final_private;
@@ -3953,10 +3956,15 @@ static bool win_directory_component_secure(win_security_t *security, const wchar
         return false;
     }
     BY_HANDLE_FILE_INFORMATION info;
+    /* Default Windows profile ancestors grant cross-account add-subdirectory.
+     * That permits siblings but cannot replace the existing next path
+     * component. Keep every other mutation right forbidden; the final runtime
+     * directory is separately owner-validated and given a protected DACL. */
+    DWORD mutation = win_private_mutation_rights() & ~((DWORD)FILE_ADD_SUBDIRECTORY);
     bool valid = GetFileInformationByHandle(directory, &info) != 0 &&
                  (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                  (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                 win_file_security_secure(security, directory, false);
+                 win_file_security_secure(security, directory, false, mutation);
     (void)CloseHandle(directory);
     return valid;
 }

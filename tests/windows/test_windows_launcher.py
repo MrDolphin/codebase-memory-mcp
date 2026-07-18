@@ -399,7 +399,9 @@ def assert_untrusted_ancestor_acl_rejected(
 
 def assert_add_only_ancestor_acl_allowed(source_launcher, source_payload, env, work):
     ancestor = work / "cross-account add-only ancestor"
-    launcher, _ = copy_portable_pair(source_launcher, source_payload, ancestor / "bundle")
+    launcher, portable_payload = copy_portable_pair(
+        source_launcher, source_payload, ancestor / "bundle"
+    )
     grant = run(["icacls", ancestor, "/grant", "*S-1-1-0:(AD)"], env)
     require(
         grant.returncode == 0,
@@ -417,13 +419,44 @@ def assert_add_only_ancestor_acl_allowed(source_launcher, source_payload, env, w
                 "%s launcher path treated sibling creation as replacement access: %s"
                 % (spelling, output_text(result)[-600:]),
             )
+
+        managed_dir = ancestor / "managed install under add-only ancestor"
+        install = run(
+            [
+                portable_payload,
+                "install",
+                "--yes",
+                "--force",
+                "--skip-config",
+                "--dir",
+                managed_dir,
+            ],
+            env,
+            timeout=60,
+        )
+        require(
+            install.returncode == 0,
+            "managed install rejected a standard add-subdirectory-only ancestor: %s"
+            % output_text(install)[-800:],
+        )
+        managed_launcher = managed_dir / "codebase-memory-mcp.exe"
+        require(managed_launcher.is_file(), "add-only managed install produced no launcher")
+        uninstall = run([managed_launcher, "uninstall", "--yes"], env, timeout=60)
+        require(
+            uninstall.returncode == 0,
+            "add-only managed install could not be uninstalled: %s"
+            % output_text(uninstall)[-800:],
+        )
     finally:
         remove = run(["icacls", ancestor, "/remove:g", "*S-1-1-0"], env)
         require(
             remove.returncode == 0,
             "could not remove native Everyone-add-subdirectory ancestor fixture",
         )
-    print("PASS: launcher allowed add-only sibling creation without weakening path integrity")
+    print(
+        "PASS: launcher and managed install allowed add-only sibling creation "
+        "without weakening path integrity"
+    )
 
 
 def assert_targeted_ancestor_acl_rejected(path, launcher, right, description, env):

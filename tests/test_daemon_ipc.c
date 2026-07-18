@@ -58,7 +58,9 @@
 
 enum { TEST_PATH_CAP = 1024 };
 
+#ifndef _WIN32
 static bool ipc_test_write_byte(const char *path, unsigned char byte);
+#endif
 
 static bool ipc_test_parent_new(char out[TEST_PATH_CAP], const char *tag) {
     int n = snprintf(out, TEST_PATH_CAP, "%s/cbm-ipc-%s-XXXXXX", cbm_tmpdir(), tag);
@@ -289,7 +291,7 @@ typedef struct {
     bool present;
 } ipc_test_win_env_t;
 
-static bool ipc_test_win_grant_everyone_mutation(const char *path) {
+static bool ipc_test_win_grant_everyone_rights(const char *path, DWORD rights) {
     wchar_t *wide_path = cbm_utf8_to_wide(path);
     BYTE world_buffer[SECURITY_MAX_SID_SIZE];
     DWORD world_size = sizeof(world_buffer);
@@ -301,8 +303,7 @@ static bool ipc_test_win_grant_everyone_mutation(const char *path) {
                                     NULL, &existing, NULL, &descriptor) == ERROR_SUCCESS;
     EXPLICIT_ACCESSW access;
     memset(&access, 0, sizeof(access));
-    access.grfAccessPermissions = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD |
-                                  DELETE | WRITE_DAC | WRITE_OWNER;
+    access.grfAccessPermissions = rights;
     access.grfAccessMode = GRANT_ACCESS;
     access.grfInheritance = NO_INHERITANCE;
     access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
@@ -323,6 +324,12 @@ static bool ipc_test_win_grant_everyone_mutation(const char *path) {
     }
     free(wide_path);
     return ok;
+}
+
+static bool ipc_test_win_grant_everyone_mutation(const char *path) {
+    return ipc_test_win_grant_everyone_rights(path, FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY |
+                                                        FILE_DELETE_CHILD | DELETE | WRITE_DAC |
+                                                        WRITE_OWNER);
 }
 
 static bool ipc_test_win_env_capture(const wchar_t *name, ipc_test_win_env_t *saved) {
@@ -734,6 +741,48 @@ TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl) {
     ASSERT_TRUE(acl_injected);
     ASSERT_TRUE(rejected);
     ASSERT_TRUE(cache_absent);
+    PASS();
+}
+
+TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor) {
+    char parent[TEST_PATH_CAP] = {0};
+    char add_only[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    bool ancestor_created = false;
+    bool acl_injected = false;
+    bool secured = false;
+    bool cache_created = false;
+
+    if (ipc_test_parent_new(parent, "win-add-only-ancestor")) {
+        int ancestor_written = snprintf(add_only, sizeof(add_only), "%s/add-only", parent);
+        int cache_written = snprintf(cache, sizeof(cache), "%s/cache", add_only);
+        paths_ok = ancestor_written > 0 && ancestor_written < (int)sizeof(add_only) &&
+                   cache_written > 0 && cache_written < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        ancestor_created = CreateDirectoryA(add_only, NULL) != 0;
+    }
+    if (ancestor_created) {
+        acl_injected = ipc_test_win_grant_everyone_rights(add_only, FILE_ADD_SUBDIRECTORY);
+    }
+    if (acl_injected) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+        DWORD attributes = GetFileAttributesA(cache);
+        cache_created = attributes != INVALID_FILE_ATTRIBUTES &&
+                        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+    }
+
+    (void)RemoveDirectoryA(cache);
+    (void)RemoveDirectoryA(add_only);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_created);
+    ASSERT_TRUE(acl_injected);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(cache_created);
     PASS();
 }
 
@@ -4504,6 +4553,7 @@ SUITE(daemon_ipc) {
 #ifdef _WIN32
     RUN_TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment);
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
+    RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);
     RUN_TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader);

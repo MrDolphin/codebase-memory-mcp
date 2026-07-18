@@ -585,7 +585,13 @@ static bool windows_owner_is_current(HANDLE file) {
     return windows_owner_secure(file, true);
 }
 
-static bool windows_acl_secure(HANDLE file) {
+static DWORD windows_private_mutation_rights(void) {
+    return GENERIC_ALL | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_ADD_FILE |
+           FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+           DELETE | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
+}
+
+static bool windows_acl_secure_for_mutation(HANDLE file, DWORD mutation) {
     HANDLE token = NULL;
     DWORD token_size = 0U;
     PTOKEN_USER user = NULL;
@@ -604,10 +610,6 @@ static bool windows_acl_secure(HANDLE file) {
     memset(&information, 0, sizeof(information));
     secure = secure && status == ERROR_SUCCESS && descriptor && dacl && IsValidAcl(dacl) != 0 &&
              GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation) != 0;
-    const DWORD mutation = GENERIC_ALL | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
-                           FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD |
-                           FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC |
-                           WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
     enum {
         CBM_ACE_ALLOW = 0x00,
         CBM_ACE_DENY = 0x01,
@@ -649,6 +651,10 @@ static bool windows_acl_secure(HANDLE file) {
     return secure;
 }
 
+static bool windows_acl_secure(HANDLE file) {
+    return windows_acl_secure_for_mutation(file, windows_private_mutation_rights());
+}
+
 static bool windows_path_tree_plain(const wchar_t *file_path) {
     size_t length = file_path ? wcslen(file_path) : 0U;
     if (length < 4U || length >= CBM_WINDOWS_LAUNCHER_PATH_CAP || file_path[1] != L':' ||
@@ -682,11 +688,19 @@ static bool windows_path_tree_plain(const wchar_t *file_path) {
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         BY_HANDLE_FILE_INFORMATION information;
+        DWORD mutation = windows_private_mutation_rights();
+        if (index < directory_length) {
+            /* Default C:\\Users ACLs allow sibling-directory creation. That
+             * cannot replace the existing next component. The executable's
+             * immediate parent remains fully private. */
+            mutation &= ~((DWORD)FILE_ADD_SUBDIRECTORY);
+        }
         valid = component != INVALID_HANDLE_VALUE && GetFileType(component) == FILE_TYPE_DISK &&
                 GetFileInformationByHandle(component, &information) != 0 &&
                 (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                 (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                windows_owner_secure(component, false) && windows_acl_secure(component);
+                windows_owner_secure(component, false) &&
+                windows_acl_secure_for_mutation(component, mutation);
         if (component != INVALID_HANDLE_VALUE)
             (void)CloseHandle(component);
         path[index] = saved;
@@ -1693,15 +1707,23 @@ static bool windows_prepare_probe_directory(const wchar_t *target,
         DWORD attributes = GetFileAttributesW(cursor);
         if (attributes != INVALID_FILE_ATTRIBUTES) {
             HANDLE ancestor = CreateFileW(
-                cursor, FILE_READ_ATTRIBUTES,
+                cursor, FILE_READ_ATTRIBUTES | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
             BY_HANDLE_FILE_INFORMATION information;
+            DWORD mutation = windows_private_mutation_rights();
+            if (created->count > 0U) {
+                /* Only a missing descendant will be created below this
+                 * existing ancestor; sibling-directory creation is sufficient
+                 * and cannot replace an existing component. */
+                mutation &= ~((DWORD)FILE_ADD_SUBDIRECTORY);
+            }
             valid = ancestor != INVALID_HANDLE_VALUE && GetFileType(ancestor) == FILE_TYPE_DISK &&
                     GetFileInformationByHandle(ancestor, &information) != 0 &&
                     (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                     (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                    windows_owner_secure(ancestor, false) && windows_acl_secure(ancestor);
+                    windows_owner_secure(ancestor, false) &&
+                    windows_acl_secure_for_mutation(ancestor, mutation);
             if (ancestor != INVALID_HANDLE_VALUE)
                 (void)CloseHandle(ancestor);
             break;

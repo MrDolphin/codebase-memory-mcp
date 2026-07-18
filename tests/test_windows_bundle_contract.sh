@@ -418,20 +418,35 @@ require(
 # Every native path-tree trust boundary must validate opened ancestor handles,
 # reject reparse points, inspect mutation-capable allow ACEs, and recognize the
 # bounded privileged-principal set (current user, SYSTEM, Administrators, and
-# the fixed TrustedInstaller service SID).  The native test injects a real
-# Everyone-modify ACE; these static markers keep all three independently linked
-# implementations aligned even on non-Windows presubmit hosts.
+# the fixed TrustedInstaller service SID). The normal C:\\Users ancestor grants
+# cross-account add-subdirectory, so each implementation permits only that
+# right on intermediate components while keeping its final private directory
+# strict. The native tests inject real ACLs; these static markers preserve the
+# narrow exception and its surrounding defenses on non-Windows presubmit hosts.
 ancestor_security_contracts = {
     "src/daemon/ipc.c": (
         "win_directory_component_secure",
-        "win_file_security_secure(security, directory, false)",
+        "win_file_security_secure(security, directory, false, mutation)",
+        "win_private_mutation_rights()",
+        "~((DWORD)FILE_ADD_SUBDIRECTORY)",
+        "FILE_ADD_FILE",
+        "FILE_DELETE_CHILD",
+        "final runtime",
         "ACCESS_SYSTEM_SECURITY",
         "956008885U",
         "FILE_ATTRIBUTE_REPARSE_POINT",
     ),
     "src/cli/windows_launcher_state.c": (
         "windows_owner_secure(component, false)",
-        "windows_acl_secure(component)",
+        "windows_acl_secure_for_mutation(component, mutation)",
+        "windows_private_mutation_rights()",
+        "if (index < directory_length)",
+        "if (created->count > 0U)",
+        "mutation &= ~((DWORD)FILE_ADD_SUBDIRECTORY)",
+        "FILE_ADD_FILE",
+        "FILE_DELETE_CHILD",
+        "immediate parent remains fully private",
+        "FILE_READ_ATTRIBUTES | READ_CONTROL",
         "ACCESS_SYSTEM_SECURITY",
         "956008885U",
         "FILE_FLAG_OPEN_REPARSE_POINT",

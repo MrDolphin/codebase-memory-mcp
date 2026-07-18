@@ -89,8 +89,10 @@ _Static_assert(CBM_DAEMON_RUNTIME_OP_ACTIVATION_SHUTDOWN == 8 &&
 
 static const char RUNTIME_BUILD_B[] =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+#ifndef _WIN32
 static const char RUNTIME_CACHE_A[] =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+#endif
 static char runtime_self_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
 static atomic_bool runtime_conflict_log_fallback_seen;
 static atomic_bool runtime_activation_shutdown_log_seen;

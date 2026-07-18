@@ -1390,33 +1390,11 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     char codex_dir[512];
     char codex_config[640];
     char release_dir[512];
-    char archive_path[768];
-    char checksum_path[640];
     snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
     snprintf(codex_config, sizeof(codex_config), "%s/config.toml", codex_dir);
     snprintf(release_dir, sizeof(release_dir), "%s/release", tmpdir);
     test_mkdirp(codex_dir);
     test_mkdirp(release_dir);
-
-#if defined(__APPLE__)
-#if defined(__aarch64__) || defined(__arm64__)
-    const char *asset_name = "codebase-memory-mcp-darwin-arm64.tar.gz";
-#else
-    const char *asset_name = "codebase-memory-mcp-darwin-amd64.tar.gz";
-#endif
-#elif defined(_WIN32)
-#if defined(_M_ARM64)
-    const char *asset_name = "codebase-memory-mcp-windows-arm64.zip";
-#else
-    const char *asset_name = "codebase-memory-mcp-windows-amd64.zip";
-#endif
-#else
-#if defined(__aarch64__)
-    const char *asset_name = "codebase-memory-mcp-linux-arm64-portable.tar.gz";
-#else
-    const char *asset_name = "codebase-memory-mcp-linux-amd64-portable.tar.gz";
-#endif
-#endif
 
 #ifdef _WIN32
     /* The existing ZIP fixture helper is intentionally exercised elsewhere;
@@ -1431,6 +1409,21 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     test_rmdir_r(tmpdir);
     PASS();
 #else
+    char archive_path[768];
+    char checksum_path[640];
+#if defined(__APPLE__)
+#if defined(__aarch64__) || defined(__arm64__)
+    const char *asset_name = "codebase-memory-mcp-darwin-arm64.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-darwin-amd64.tar.gz";
+#endif
+#else
+#if defined(__aarch64__)
+    const char *asset_name = "codebase-memory-mcp-linux-arm64-portable.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-linux-amd64-portable.tar.gz";
+#endif
+#endif
     const char *native_fixture =
 #ifdef __APPLE__
         "/usr/bin/true";
