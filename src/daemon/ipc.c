@@ -5192,6 +5192,10 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
         return result;
     }
     if (!win_pipe_client_is_current_user(listener->pipe)) {
+        /* The daemon-side twin of the client's server_identity log: without
+         * it a server-initiated disconnect is indistinguishable from a
+         * client-side failure in the field. */
+        cbm_log_warn("daemon.accept.client_rejected", "stage", "client_identity");
         (void)DisconnectNamedPipe(listener->pipe);
         (void)CloseHandle(listener->pipe);
         listener->pipe = INVALID_HANDLE_VALUE;
@@ -5220,8 +5224,17 @@ static bool win_pipe_server_is_current_user(HANDLE pipe) {
                                                                      "GetNamedPipeServerProcessId")
                : NULL;
     ULONG process_id = 0;
-    if (!get_server_pid || !get_server_pid(pipe, &process_id) || process_id == 0) {
-        cbm_log_warn("daemon.client.server_identity", "step", "server_pid_query");
+    if (!get_server_pid) {
+        cbm_log_warn("daemon.client.server_identity", "step", "pid_fn_missing");
+        return false;
+    }
+    if (!get_server_pid(pipe, &process_id) || process_id == 0) {
+        char error_text[16];
+        (void)snprintf(error_text, sizeof(error_text), "%lu", (unsigned long)GetLastError());
+        char pid_text[16];
+        (void)snprintf(pid_text, sizeof(pid_text), "%lu", (unsigned long)process_id);
+        cbm_log_warn("daemon.client.server_identity", "step", "server_pid_query", "error",
+                     error_text, "pid", pid_text);
         return false;
     }
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
