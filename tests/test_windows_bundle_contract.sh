@@ -374,6 +374,41 @@ require(
     "Windows launcher guard setup must be covered by profile-fixture cleanup",
 )
 
+# The hosted runner profile can itself be trusted while newly-created children
+# still inherit mutation-capable principals. Require the guard root to replace
+# that inherited DACL with a protected, current-account-owned ACL before any
+# launcher bundle or Python temporary descendants are created below it.
+guard_root_creation = (
+    'New-Item -ItemType Directory -Path $guardRoot | Out-Null'
+)
+guard_bundle_creation = '$guardBundle = Join-Path $guardRoot '
+acl_start = windows_test_driver.find(guard_root_creation)
+acl_end = windows_test_driver.find(guard_bundle_creation, acl_start + 1)
+guard_acl_setup = (
+    windows_test_driver[acl_start:acl_end]
+    if acl_start >= 0 and acl_end > acl_start
+    else ""
+)
+require(
+    all(
+        needle in guard_acl_setup
+        for needle in (
+            '[System.Security.Principal.WindowsIdentity]::GetCurrent().User',
+            '[System.Security.AccessControl.DirectorySecurity]::new()',
+            '$guardAcl.SetOwner($currentSid)',
+            '$guardAcl.SetAccessRuleProtection($true, $false)',
+            '[System.Security.AccessControl.FileSystemRights]::FullControl',
+            '[System.Security.AccessControl.InheritanceFlags]::ContainerInherit',
+            '[System.Security.AccessControl.InheritanceFlags]::ObjectInherit',
+            '[System.Security.AccessControl.PropagationFlags]::None',
+            '[System.Security.AccessControl.AccessControlType]::Allow',
+            'Set-Acl -LiteralPath $guardRoot -AclObject $guardAcl',
+        )
+    ),
+    "Windows launcher guards must protect the guard-root DACL and grant only "
+    "the current account inheritable full control before creating descendants",
+)
+
 # Launcher supervision has two distinct failure directions: killing the
 # launcher must kill its payload job, and killing only the launcher's immediate
 # parent must terminate the launcher plus every descendant. Require the native

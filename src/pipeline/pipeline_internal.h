@@ -639,6 +639,14 @@ void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
                                             int (*hook)(const char *, const char *, void *),
                                             void *ctx);
 
+/* Synchronous thread-local seam for deterministic cross-repo cancellation
+ * tests. The callback runs immediately after a CROSS_* edge is committed and
+ * is never retained; it must not re-enter cross-repo matching. */
+typedef void (*cbm_cross_repo_after_insert_test_hook_t)(const char *project, const char *edge_type,
+                                                        void *context);
+void cbm_cross_repo_set_after_insert_hook_for_tests(cbm_cross_repo_after_insert_test_hook_t hook,
+                                                    void *context);
+
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client
  * suffix is present (the stub-type signal that gates Route emission, #294).

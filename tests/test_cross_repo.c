@@ -6,8 +6,8 @@
 #include "test_helpers.h"
 
 #include "foundation/compat.h"
-#include "foundation/compat_thread.h"
 #include "pipeline/pass_cross_repo.h"
+#include "pipeline/pipeline_internal.h"
 
 #include <sqlite3/sqlite3.h>
 #include <stdatomic.h>
@@ -382,77 +382,18 @@ TEST(cross_repo_failed_bidirectional_insert_is_not_counted) {
     PASS();
 }
 
-/* Keep the source scan active after the target-b match is published. This
- * gives the watcher a deterministic observable hand-off point without adding
- * a test hook to the production pass. */
-static bool cross_repo_seed_cancel_scan_tail(const cross_repo_fixture_t *fixture,
-                                             const char *source_project) {
-    enum { CANCEL_SCAN_TOTAL_ROWS = 4096, SEEDED_MATCH_ROWS = 3 };
-    char source_path[512];
-    if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path))) {
-        return false;
-    }
-    cbm_store_t *source = cbm_store_open_path_existing(source_path);
-    if (!source) {
-        return false;
-    }
-    bool ok =
-        sqlite3_exec(cbm_store_get_db(source), "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;
-    cbm_node_t caller = {.project = source_project,
-                         .label = "Function",
-                         .name = "cancel_tail_caller",
-                         .qualified_name = "cancel.source.tail-caller",
-                         .file_path = "cancel-tail.c"};
-    int64_t caller_id = ok ? cbm_store_upsert_node(source, &caller) : 0;
-    ok = ok && caller_id > 0;
-    for (int i = SEEDED_MATCH_ROWS; ok && i < CANCEL_SCAN_TOTAL_ROWS; i++) {
-        char name[64];
-        char qn[96];
-        snprintf(name, sizeof(name), "cancel_tail_route_%d", i);
-        snprintf(qn, sizeof(qn), "%s.cancel-tail.%d", source_project, i);
-        cbm_node_t route = {.project = source_project,
-                            .label = "Route",
-                            .name = name,
-                            .qualified_name = qn,
-                            .file_path = "cancel-tail.c"};
-        int64_t route_id = cbm_store_upsert_node(source, &route);
-        cbm_edge_t edge = {.project = source_project,
-                           .source_id = caller_id,
-                           .target_id = route_id,
-                           .type = "HTTP_CALLS",
-                           .properties_json = "{}"};
-        ok = route_id > 0 && caller_id > 0 && cbm_store_insert_edge(source, &edge) > 0;
-    }
-    if (ok) {
-        ok = sqlite3_exec(cbm_store_get_db(source), "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
-    } else {
-        (void)sqlite3_exec(cbm_store_get_db(source), "ROLLBACK", NULL, NULL, NULL);
-    }
-    cbm_store_close(source);
-    return ok;
-}
-
 typedef struct {
-    const cross_repo_fixture_t *fixture;
     atomic_int *cancelled;
-    atomic_bool observed_target_write;
-} cross_repo_cancel_watcher_t;
+    int fired;
+} cross_repo_cancel_hook_t;
 
-static void *cross_repo_cancel_after_target_write(void *arg) {
-    enum { CANCEL_POLL_LIMIT = 10000 };
-    cross_repo_cancel_watcher_t *watcher = arg;
-    for (int i = 0; i < CANCEL_POLL_LIMIT; i++) {
-        int count = cross_repo_count_edges(watcher->fixture, "cancel-target-b", "CROSS_HTTP_CALLS");
-        if (count > 0) {
-            atomic_store_explicit(&watcher->observed_target_write, true, memory_order_release);
-            atomic_store_explicit(watcher->cancelled, 1, memory_order_release);
-            return NULL;
-        }
-        cbm_usleep(1000);
+static void cross_repo_cancel_after_target_write(const char *project, const char *edge_type,
+                                                 void *opaque) {
+    cross_repo_cancel_hook_t *hook = opaque;
+    if (strcmp(project, "cancel-target-b") == 0 && strcmp(edge_type, "CROSS_HTTP_CALLS") == 0) {
+        hook->fired++;
+        atomic_store_explicit(hook->cancelled, 1, memory_order_release);
     }
-    /* Bound a broken implementation too: the test should fail, not hang. */
-    atomic_store_explicit(watcher->cancelled, 1, memory_order_release);
-    return NULL;
 }
 
 TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_target) {
@@ -461,8 +402,7 @@ TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_tar
         cross_repo_fixture_begin(&fixture) &&
         cross_repo_seed_http_pair(&fixture, "cancel-source", "cancel-target-a", "/cancel-a", "a") &&
         cross_repo_seed_http_pair(&fixture, "cancel-source", "cancel-target-b", "/cancel-b", "b") &&
-        cross_repo_seed_http_pair(&fixture, "cancel-source", "cancel-target-c", "/cancel-c", "c") &&
-        cross_repo_seed_cancel_scan_tail(&fixture, "cancel-source");
+        cross_repo_seed_http_pair(&fixture, "cancel-source", "cancel-target-c", "/cancel-c", "c");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed cancellation fixture");
@@ -470,23 +410,16 @@ TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_tar
 
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
-    cross_repo_cancel_watcher_t watcher = {
-        .fixture = &fixture,
+    cross_repo_cancel_hook_t hook = {
         .cancelled = &cancelled,
     };
-    atomic_init(&watcher.observed_target_write, false);
-    cbm_thread_t watcher_thread;
-    bool watcher_started =
-        cbm_thread_create(&watcher_thread, 0, cross_repo_cancel_after_target_write, &watcher) == 0;
 
     const char *targets[] = {"cancel-target-c", "cancel-target-a", "cancel-target-b"};
-    cbm_cross_repo_result_t result = {0};
-    if (watcher_started) {
-        result = cbm_cross_repo_match_cancellable("cancel-source", targets, 3, &cancelled);
-        (void)cbm_thread_join(&watcher_thread);
-    }
+    cbm_cross_repo_set_after_insert_hook_for_tests(cross_repo_cancel_after_target_write, &hook);
+    cbm_cross_repo_result_t result =
+        cbm_cross_repo_match_cancellable("cancel-source", targets, 3, &cancelled);
+    cbm_cross_repo_set_after_insert_hook_for_tests(NULL, NULL);
 
-    bool observed = atomic_load_explicit(&watcher.observed_target_write, memory_order_acquire);
     int completed_target_edges =
         cross_repo_count_edges(&fixture, "cancel-target-a", "CROSS_HTTP_CALLS");
     int interrupted_target_edges =
@@ -495,8 +428,7 @@ TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_tar
         cross_repo_count_edges(&fixture, "cancel-target-c", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
 
-    ASSERT_TRUE(watcher_started);
-    ASSERT_TRUE(observed);
+    ASSERT_EQ(hook.fired, 1);
     ASSERT_TRUE(result.cancelled);
     ASSERT_TRUE(result.partial_results);
     ASSERT_FALSE(result.failed);

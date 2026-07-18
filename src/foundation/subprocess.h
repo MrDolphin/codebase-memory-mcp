@@ -14,8 +14,8 @@
  *      tree-sitter scanners that infinite-loop (a hang, not a crash).
  *
  * The reap loop is EINTR-safe. Line tailing keeps a partial final line buffered
- * (an incomplete, un-newline-terminated line is not yet "progress" and is not
- * mis-read as a completed marker).
+ * while the child tree can still write, then delivers that final fragment once
+ * the tree is quiescent.
  */
 #ifndef CBM_SUBPROCESS_H
 #define CBM_SUBPROCESS_H
@@ -44,8 +44,12 @@ typedef struct {
     bool supervision_failed; /* the bounded containment deadline expired; tree_quiesced is false */
 } cbm_proc_result_t;
 
-/* Called for each newly-completed (newline-terminated) log line while the child
- * runs. A completed line also resets the quiet-timeout (it is progress). */
+/* Called synchronously for each newly-completed log chunk while the child runs.
+ * Newline-terminated lines are delivered without their newline; oversized lines
+ * may be split into 1023-byte chunks, and the final unterminated remainder is
+ * delivered after the tree is quiescent. Each delivered chunk resets the quiet
+ * timeout. Poll bounds callback work by chunk/byte count, not elapsed time, so
+ * callbacks must return promptly. */
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
 typedef struct {
@@ -98,6 +102,12 @@ int cbm_subprocess_spawn(const cbm_proc_opts_t *opts, cbm_subprocess_t **out);
  * true and tree_quiesced is false; callers must log this as a critical teardown
  * failure. *out is optional and is not modified for RUNNING or ERROR.
  *
+ * Each poll delivers at most 64 log chunks / 64 KiB. On the normal callback
+ * delivery path, RUNNING may continue after the process tree is quiescent while
+ * remaining log batches drain, and TERMINAL follows successful catch-up. A
+ * final-drain I/O error instead terminates without changing process-tree
+ * classification and does not attempt to delete the log.
+ *
  * Poll performs the graceful->force state transition: after explicit cancel (or
  * quiet-timeout), it requests graceful termination once, then force-terminates the
  * tree when cancel_grace_ms elapses. Callers must keep polling to make progress. */
@@ -106,8 +116,9 @@ cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t
 /* Record an explicit cancellation request without waiting. Safe to repeat and
  * safe to call from a cancellation thread while one owner thread polls. The
  * owner must stop cancellation producers before destroying the handle. true
- * means the process is live and cancellation is now/already pending; false means
- * process is NULL or already terminal. Poll performs signal delivery/escalation. */
+ * means the process tree is live and cancellation is now/already pending; false
+ * means process is NULL, draining terminal logs, or already terminal. Poll
+ * performs signal delivery/escalation. */
 bool cbm_subprocess_request_cancel(cbm_subprocess_t *process);
 
 /* Release a terminal handle. This never waits or implicitly cancels; passing a

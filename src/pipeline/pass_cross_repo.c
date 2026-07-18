@@ -58,6 +58,15 @@ typedef struct {
     bool mutated;
 } cr_run_context_t;
 
+static CBM_TLS cbm_cross_repo_after_insert_test_hook_t cr_after_insert_test_hook = NULL;
+static CBM_TLS void *cr_after_insert_test_context = NULL;
+
+void cbm_cross_repo_set_after_insert_hook_for_tests(cbm_cross_repo_after_insert_test_hook_t hook,
+                                                    void *context) {
+    cr_after_insert_test_hook = hook;
+    cr_after_insert_test_context = context;
+}
+
 typedef struct {
     int count;
     cr_run_status_t status;
@@ -240,6 +249,9 @@ static bool insert_cross_edge(cbm_store_t *store, const char *project, int64_t f
     bool inserted = cbm_store_insert_edge(store, &edge) > 0;
     if (inserted) {
         ctx->mutated = true;
+        if (cr_after_insert_test_hook) {
+            cr_after_insert_test_hook(project, edge_type, cr_after_insert_test_context);
+        }
     }
     return inserted;
 }

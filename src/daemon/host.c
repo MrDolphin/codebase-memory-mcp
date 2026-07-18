@@ -798,21 +798,22 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         host_log_close();
         return -1;
     }
-    cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation = NULL;
-    if (host_lifetime_reservation_acquire(config->endpoint, &lifetime_reservation) != 1) {
-        cbm_log_error("daemon.start_failed", "component", "lifetime");
-        host_participant_guard_close(&participant_guard);
-        host_cohort_close(&cohort_lease, &cohort_manager);
-        host_log_close();
-        return -1;
-    }
     cbm_version_cohort_daemon_claim_t *daemon_claim = NULL;
     if (cbm_version_cohort_daemon_claim_acquire(cohort_manager, &daemon_claim) !=
         CBM_VERSION_COHORT_OK) {
         cbm_log_error("daemon.start_failed", "component", "claim");
-        cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
-        host_daemon_claim_close(&daemon_claim);
         host_participant_guard_close(&participant_guard);
+        host_daemon_claim_close(&daemon_claim);
+        host_cohort_close(&cohort_lease, &cohort_manager);
+        host_log_close();
+        return -1;
+    }
+    cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation = NULL;
+    if (host_lifetime_reservation_acquire(config->endpoint, &lifetime_reservation) != 1) {
+        cbm_log_error("daemon.start_failed", "component", "lifetime");
+        cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
+        host_participant_guard_close(&participant_guard);
+        host_daemon_claim_close(&daemon_claim);
         host_cohort_close(&cohort_lease, &cohort_manager);
         host_log_close();
         return -1;
@@ -827,8 +828,8 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         host_state_free(&host);
         host_log_close();
         cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
-        host_daemon_claim_close(&daemon_claim);
         host_participant_guard_close(&participant_guard);
+        host_daemon_claim_close(&daemon_claim);
         host_cohort_close(&cohort_lease, &cohort_manager);
         return -1;
     }
@@ -853,8 +854,8 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         cbm_log_error("daemon.start_failed", "component", "runtime");
         host_state_free(&host);
         host_log_close();
-        host_daemon_claim_close(&daemon_claim);
         host_participant_guard_close(&participant_guard);
+        host_daemon_claim_close(&daemon_claim);
         host_cohort_close(&cohort_lease, &cohort_manager);
         return -1;
     }
@@ -870,8 +871,8 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         }
         host_state_free(&host);
         host_log_close();
-        host_daemon_claim_close(&daemon_claim);
         host_participant_guard_close(&participant_guard);
+        host_daemon_claim_close(&daemon_claim);
         host_cohort_close(&cohort_lease, &cohort_manager);
         return -1;
     }
@@ -914,11 +915,11 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     host_log_close();
     /* Keep the exact-build lifetime lease through listener/lifetime teardown,
      * application destruction, diagnostics shutdown, the durable stop record,
-     * daemon-claim release, and participant release. An activation transaction
+     * participant release, and daemon-claim release. An activation transaction
      * may treat exclusive acquisition as proof that coordinated cleanup for
      * this generation has completed. */
-    host_daemon_claim_close(&daemon_claim);
     host_participant_guard_close(&participant_guard);
+    host_daemon_claim_close(&daemon_claim);
     host_cohort_close(&cohort_lease, &cohort_manager);
     return 0;
 }

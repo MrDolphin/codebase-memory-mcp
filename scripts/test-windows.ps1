@@ -142,6 +142,27 @@ try {
     if (-not $userProfile) { throw "could not resolve the current user's profile directory" }
     $guardRoot = Join-Path $userProfile ("cbm-windows-guards-root-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $guardRoot | Out-Null
+
+    # GitHub-hosted runner profile children can inherit mutation-capable ACEs
+    # even though the profile ancestry itself passes the launcher's bounded
+    # trust policy. Replace that inheritance before creating any executable or
+    # Python temporary descendant. Use SIDs rather than localized account names.
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if (-not $currentSid) { throw "could not resolve the current user's SID" }
+    $guardAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $guardAcl.SetOwner($currentSid)
+    $guardAcl.SetAccessRuleProtection($true, $false)
+    $guardRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $currentSid,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $guardAcl.AddAccessRule($guardRule) | Out-Null
+    Set-Acl -LiteralPath $guardRoot -AclObject $guardAcl
+
     $guardBundle = Join-Path $guardRoot ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $guardBundle | Out-Null
     $guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"

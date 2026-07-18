@@ -307,12 +307,42 @@ static int spawn_ignoring_tree(const char *pid_path, int quiet_timeout_ms, int c
     return cbm_subprocess_spawn(&opts, out);
 }
 
-static void slow_log_callback(const char *line, void *opaque) {
-    (void)line;
-    int *count = opaque;
-    (*count)++;
-    const struct timespec delay = {0, 2000000L}; /* 2 ms per delivered line */
-    (void)cbm_nanosleep(&delay, NULL);
+typedef struct {
+    cbm_subprocess_t *process;
+    int count;
+    bool ordered;
+    bool late_cancel_attempted;
+    bool late_cancel_accepted;
+} subprocess_log_capture_t;
+
+static void ordered_log_callback(const char *line, void *opaque) {
+    subprocess_log_capture_t *capture = opaque;
+    int index = -1;
+    char trailing = '\0';
+    bool parsed = sscanf(line, "line-%d%c", &index, &trailing) == 1;
+    capture->ordered = capture->ordered && parsed && index == capture->count;
+    capture->count++;
+    if (index == 399) {
+        capture->late_cancel_attempted = true;
+        capture->late_cancel_accepted = cbm_subprocess_request_cancel(capture->process);
+    }
+}
+
+static bool wait_for_log_marker(const char *path, const char *marker, uint64_t deadline_ms) {
+    char contents[8192];
+    do {
+        FILE *file = fopen(path, "rb");
+        if (file) {
+            size_t used = fread(contents, 1, sizeof(contents) - 1, file);
+            contents[used] = '\0';
+            (void)fclose(file);
+            if (strstr(contents, marker)) {
+                return true;
+            }
+        }
+        subprocess_test_pause();
+    } while (cbm_now_ms() < deadline_ms);
+    return false;
 }
 
 #endif /* !_WIN32 */
@@ -521,7 +551,7 @@ TEST(subprocess_cancel_grace_is_hard_capped) {
 #endif
 }
 
-TEST(subprocess_poll_has_a_strict_log_delivery_budget) {
+TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX shell log budget probe; native Windows coverage pending");
 #else
@@ -530,38 +560,141 @@ TEST(subprocess_poll_has_a_strict_log_delivery_budget) {
     ASSERT_TRUE(log_fd >= 0);
     (void)close(log_fd);
 
-    const char *script = "i=0; while [ $i -lt 400 ]; do echo line-$i; i=$((i+1)); done; sleep 4";
+    const char *script =
+        "i=0; while [ $i -lt 399 ]; do echo line-$i; i=$((i+1)); done; printf line-399";
     const char *argv[] = {"/bin/sh", "-c", script, NULL};
-    int delivered = 0;
+    subprocess_log_capture_t capture = {.ordered = true};
     cbm_proc_opts_t opts = {0};
     opts.bin = "/bin/sh";
     opts.argv = argv;
     opts.log_file = log_path;
-    opts.on_log_line = slow_log_callback;
-    opts.log_ud = &delivered;
+    opts.on_log_line = ordered_log_callback;
+    opts.log_ud = &capture;
     opts.cancel_grace_ms = 100;
+    opts.delete_log_on_exit = true;
     cbm_subprocess_t *process = NULL;
     ASSERT_EQ(cbm_subprocess_spawn(&opts, &process), 0);
     ASSERT_NOT_NULL(process);
+    capture.process = process;
 
-    const struct timespec fill_delay = {0, 150000000L};
-    (void)cbm_nanosleep(&fill_delay, NULL);
+    bool backlog_ready = wait_for_log_marker(log_path, "line-399", cbm_now_ms() + 2000U);
     cbm_proc_result_t result = {0};
-    uint64_t before = cbm_now_ms();
-    cbm_proc_poll_t first = cbm_subprocess_poll(process, &result);
-    uint64_t elapsed = cbm_now_ms() - before;
-    bool cancel_accepted = cbm_subprocess_request_cancel(process);
-    bool terminal = poll_until_terminal(process, 3000, &result);
+    bool terminal = false;
+    int max_poll_delivery = 0;
+    uint64_t deadline = cbm_now_ms() + 5000U;
+    while (backlog_ready && cbm_now_ms() < deadline) {
+        int before = capture.count;
+        cbm_proc_poll_t state = cbm_subprocess_poll(process, &result);
+        int delivered = capture.count - before;
+        if (delivered > max_poll_delivery) {
+            max_poll_delivery = delivered;
+        }
+        if (state == CBM_PROC_POLL_TERMINAL) {
+            terminal = true;
+            break;
+        }
+        if (state == CBM_PROC_POLL_ERROR) {
+            break;
+        }
+        subprocess_test_pause();
+    }
+    bool log_deleted = access(log_path, F_OK) != 0 && errno == ENOENT;
     if (terminal) {
         cbm_subprocess_destroy(process);
+    } else {
+        (void)cbm_subprocess_request_cancel(process);
+        cbm_proc_result_t cleanup_result;
+        if (poll_until_terminal(process, 1000, &cleanup_result)) {
+            cbm_subprocess_destroy(process);
+        }
     }
     (void)unlink(log_path);
 
-    ASSERT_EQ(first, CBM_PROC_POLL_RUNNING);
-    ASSERT_LT(elapsed, 500);
-    ASSERT_LT(delivered, 400);
-    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(backlog_ready);
     ASSERT_TRUE(terminal);
+    ASSERT_EQ(max_poll_delivery, 64);
+    ASSERT_EQ(capture.count, 400);
+    ASSERT_TRUE(capture.ordered);
+    ASSERT_TRUE(capture.late_cancel_attempted);
+    ASSERT_FALSE(capture.late_cancel_accepted);
+    ASSERT_FALSE(result.cancellation_requested);
+    ASSERT_TRUE(log_deleted);
+    PASS();
+#endif
+}
+
+TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX log-rename final-drain probe; UTF-8 Windows open uses cbm_fopen");
+#else
+    char log_path[] = "/tmp/cbm-subprocess-log-drain-XXXXXX";
+    int log_fd = cbm_mkstemp(log_path);
+    ASSERT_TRUE(log_fd >= 0);
+    (void)close(log_fd);
+    char saved_path[sizeof(log_path) + 16];
+    int saved_written = snprintf(saved_path, sizeof(saved_path), "%s.saved", log_path);
+    ASSERT_TRUE(saved_written > 0 && (size_t)saved_written < sizeof(saved_path));
+
+    const char *script = "i=0; while [ $i -lt 130 ]; do echo line-$i; i=$((i+1)); done";
+    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    subprocess_log_capture_t capture = {.ordered = true};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    opts.log_file = log_path;
+    opts.on_log_line = ordered_log_callback;
+    opts.log_ud = &capture;
+    opts.cancel_grace_ms = 100;
+    opts.delete_log_on_exit = true;
+    cbm_subprocess_t *process = NULL;
+    ASSERT_EQ(cbm_subprocess_spawn(&opts, &process), 0);
+    ASSERT_NOT_NULL(process);
+    capture.process = process;
+
+    bool backlog_ready = wait_for_log_marker(log_path, "line-129", cbm_now_ms() + 2000U);
+    cbm_proc_result_t result = {0};
+    cbm_proc_poll_t first =
+        backlog_ready ? cbm_subprocess_poll(process, &result) : CBM_PROC_POLL_ERROR;
+    int first_delivery = capture.count;
+    bool moved = first == CBM_PROC_POLL_RUNNING && rename(log_path, saved_path) == 0;
+    bool terminal = moved && poll_until_terminal(process, 2000, &result);
+    int callbacks_at_terminal = capture.count;
+    cbm_proc_result_t cached = {0};
+    cbm_proc_poll_t cached_state =
+        terminal ? cbm_subprocess_poll(process, &cached) : CBM_PROC_POLL_ERROR;
+    bool callbacks_stable = capture.count == callbacks_at_terminal;
+    bool saved_preserved = access(saved_path, F_OK) == 0;
+    bool original_absent = access(log_path, F_OK) != 0 && errno == ENOENT;
+    if (terminal) {
+        cbm_subprocess_destroy(process);
+    } else {
+        (void)cbm_subprocess_request_cancel(process);
+        cbm_proc_result_t cleanup_result;
+        if (poll_until_terminal(process, 1000, &cleanup_result)) {
+            cbm_subprocess_destroy(process);
+        }
+    }
+    (void)unlink(log_path);
+    (void)unlink(saved_path);
+
+    ASSERT_TRUE(backlog_ready);
+    ASSERT_EQ(first, CBM_PROC_POLL_RUNNING);
+    ASSERT_EQ(first_delivery, 64);
+    ASSERT_TRUE(moved);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(capture.ordered);
+    ASSERT_EQ(callbacks_at_terminal, 64);
+    ASSERT_EQ(cached_state, CBM_PROC_POLL_TERMINAL);
+    ASSERT_TRUE(callbacks_stable);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(result.exit_code, 0);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    ASSERT_EQ(cached.outcome, result.outcome);
+    ASSERT_EQ(cached.exit_code, result.exit_code);
+    ASSERT_EQ(cached.tree_quiesced, result.tree_quiesced);
+    ASSERT_TRUE(saved_preserved);
+    ASSERT_TRUE(original_absent);
     PASS();
 #endif
 }
@@ -823,7 +956,8 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
-    RUN_TEST(subprocess_poll_has_a_strict_log_delivery_budget);
+    RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
+    RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
     RUN_TEST(win_cmdline_index_worker_json);

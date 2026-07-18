@@ -44,6 +44,7 @@ typedef struct {
     atomic_int terminal_probes_remaining;
     atomic_bool available;
     atomic_bool connect_after_reserved;
+    atomic_bool connect_requires_unlocked;
     cbm_daemon_bootstrap_probe_status_t forced_probe;
     cbm_version_cohort_status_t forced_cohort;
     char diagnostic[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
@@ -139,6 +140,10 @@ static cbm_daemon_bootstrap_probe_status_t bootstrap_fake_probe(
     }
     if (fake->forced_probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
         return fake->forced_probe;
+    }
+    if (atomic_load(&fake->available) && atomic_load(&fake->connect_requires_unlocked) &&
+        atomic_load(&fake->lock_held) != 0) {
+        return CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
     }
     if (atomic_load(&fake->available)) {
         result_out->status = CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
@@ -584,6 +589,37 @@ TEST(daemon_bootstrap_reserved_then_absent_spawns_replacement) {
     PASS();
 }
 
+/* RED for the native Windows lock order: after spawn, the generation claim or
+ * lifetime reservation becomes visible before the client can connect. Daemon
+ * participant teardown needs startup ownership, so bootstrap must release its
+ * handoff once that generation is observable. */
+TEST(daemon_bootstrap_releases_handoff_when_spawned_generation_is_reserved) {
+    bootstrap_endpoint_fixture_t fixture;
+    ASSERT_TRUE(bootstrap_endpoint_fixture_start(&fixture, "spawn-admission"));
+    bootstrap_fake_ops_t fake = {0};
+    atomic_store(&fake.connect_requires_unlocked, true);
+    cbm_daemon_bootstrap_ops_t ops = bootstrap_fake_callbacks(&fake);
+    cbm_daemon_build_identity_t identity = bootstrap_identity("2.4.0", BOOTSTRAP_BUILD_A);
+    cbm_daemon_bootstrap_config_t config = {
+        .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+        .endpoint = fixture.endpoint,
+        .identity = &identity,
+        .executable_path = "/tmp/cbm",
+        .connect_timeout_ms = 1,
+        .startup_timeout_ms = BOOTSTRAP_TEST_TIMEOUT_MS,
+    };
+    cbm_daemon_bootstrap_result_t result;
+    ASSERT_EQ(cbm_daemon_bootstrap_execute_with_ops(&config, &ops, &result),
+              CBM_DAEMON_BOOTSTRAP_CONNECTED);
+    ASSERT_EQ(result.status, CBM_DAEMON_BOOTSTRAP_CONNECTED);
+    ASSERT_TRUE(result.daemon_spawned);
+    ASSERT_NOT_NULL(result.client);
+    ASSERT_EQ(atomic_load(&fake.spawn_count), 1);
+    ASSERT_EQ(atomic_load(&fake.lock_held), 0);
+    bootstrap_endpoint_fixture_finish(&fixture);
+    PASS();
+}
+
 TEST(daemon_bootstrap_rejected_connect_is_reserved_and_never_unavailable) {
     cbm_daemon_runtime_connect_result_t capacity = {0};
     capacity.status = CBM_DAEMON_RUNTIME_CONNECT_REJECTED;
@@ -697,6 +733,7 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_terminal_then_absent_spawns_replacement);
     RUN_TEST(daemon_bootstrap_reserved_generation_becomes_connectable_without_spawn);
     RUN_TEST(daemon_bootstrap_reserved_then_absent_spawns_replacement);
+    RUN_TEST(daemon_bootstrap_releases_handoff_when_spawned_generation_is_reserved);
     RUN_TEST(daemon_bootstrap_rejected_connect_is_reserved_and_never_unavailable);
     RUN_TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon);
 #ifdef __APPLE__

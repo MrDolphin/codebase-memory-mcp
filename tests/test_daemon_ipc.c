@@ -821,10 +821,15 @@ TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime) {
                               ? cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &lifetime)
                               : -1;
     int visible_during_lifetime = lifetime ? cbm_daemon_ipc_legacy_generation_probe(endpoint) : -1;
-    cbm_daemon_ipc_startup_lock_release(&startup);
-    startup = NULL;
     cbm_daemon_ipc_lifetime_reservation_release(lifetime);
     lifetime = NULL;
+    /* Native Windows teardown is deliberately ordered through startup-v2.
+     * A participant must remain retryable while a bootstrap handoff owner
+     * retains that transition; releasing the bootstrap then unblocks it. */
+    bool participant_blocked_by_startup =
+        participant && !cbm_daemon_ipc_participant_guard_release(&participant);
+    bool participant_retained = participant != NULL;
+    bool startup_released = cbm_daemon_ipc_startup_lock_release(&startup);
     bool participant_released = cbm_daemon_ipc_participant_guard_release(&participant);
     int absent_after_lifetime = endpoint ? cbm_daemon_ipc_legacy_generation_probe(endpoint) : -1;
 
@@ -894,6 +899,10 @@ TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime) {
     ASSERT_EQ(participant_status, 1);
     ASSERT_EQ(lifetime_status, 1);
     ASSERT_EQ(visible_during_lifetime, 1);
+    ASSERT_TRUE(participant_blocked_by_startup);
+    ASSERT_TRUE(participant_retained);
+    ASSERT_TRUE(startup_released);
+    ASSERT_NULL(startup);
     ASSERT_EQ(absent_after_lifetime, 0);
     ASSERT_TRUE(participant_released);
     ASSERT_NULL(participant);

@@ -6306,10 +6306,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
      * attached so data_flow args resolve for boundary nodes whose incoming
      * edge originated on an earlier page. */
     cbm_traverse_result_t view_out = tr_out;
-    view_out.visited += out_start;
+    view_out.visited = tr_out.visited ? tr_out.visited + out_start : NULL;
     view_out.visited_count = out_len;
     cbm_traverse_result_t view_in = tr_in;
-    view_in.visited += in_start;
+    view_in.visited = tr_in.visited ? tr_in.visited + in_start : NULL;
     view_in.visited_count = in_len;
 
     /* Totals must count what the caller can actually enumerate: when

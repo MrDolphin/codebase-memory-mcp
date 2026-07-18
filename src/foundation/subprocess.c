@@ -5,7 +5,9 @@
  */
 #include "subprocess.h"
 
-#include "compat.h"   /* cbm_nanosleep */
+#include "compat.h" /* cbm_nanosleep */
+#include "compat_fs.h"
+#include "log.h"
 #include "platform.h" /* cbm_now_ms */
 
 #include <stdio.h>
@@ -94,16 +96,28 @@ const char *cbm_proc_outcome_str(cbm_proc_outcome_t o) {
     }
 }
 
-/* Tail newly-appended complete lines from the child log, starting at *tail_pos.
- * A partial (non-newline-terminated) final line is left buffered: *tail_pos is
- * not advanced past it, so it is re-read once completed. Returns true if any
- * complete line was consumed (i.e. there was progress). */
-static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb cb, void *ud) {
-    if (!log_file) {
-        return false;
+typedef enum {
+    CBM_TAIL_MORE = 0,
+    CBM_TAIL_CAUGHT_UP,
+    CBM_TAIL_ERROR,
+} cbm_tail_status_t;
+
+typedef struct {
+    cbm_tail_status_t status;
+    bool progressed;
+} cbm_tail_result_t;
+
+/* Tail one bounded batch from the child log. While the owned tree can still
+ * write, a partial final line remains buffered. Once the tree is quiescent,
+ * final=true delivers that last fragment exactly once. */
+static cbm_tail_result_t cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb cb,
+                                      void *ud, bool final) {
+    cbm_tail_result_t result = {.status = CBM_TAIL_ERROR, .progressed = false};
+    if (!log_file || !tail_pos) {
+        return result;
     }
 #ifdef _WIN32
-    FILE *lf = fopen(log_file, "r");
+    FILE *lf = cbm_fopen(log_file, "r");
 #else
     int open_flags = O_RDONLY | O_NONBLOCK;
 #ifdef O_CLOEXEC
@@ -114,12 +128,12 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
 #endif
     int log_fd = open(log_file, open_flags);
     if (log_fd < 0) {
-        return false;
+        return result;
     }
     struct stat log_status;
     if (fstat(log_fd, &log_status) != 0 || !S_ISREG(log_status.st_mode)) {
         (void)close(log_fd);
-        return false;
+        return result;
     }
     FILE *lf = fdopen(log_fd, "r");
 #endif
@@ -127,9 +141,8 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
 #ifndef _WIN32
         (void)close(log_fd);
 #endif
-        return false;
+        return result;
     }
-    bool progressed = false;
     if (fseek(lf, *tail_pos, SEEK_SET) == 0) {
         char line[1024];
         size_t delivered_lines = 0;
@@ -142,6 +155,7 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
                delivered_bytes < CBM_TAIL_MAX_BYTES_PER_POLL) {
             long before = ftell(lf);
             if (!fgets(line, sizeof(line), lf)) {
+                result.status = ferror(lf) ? CBM_TAIL_ERROR : CBM_TAIL_CAUGHT_UP;
                 break;
             }
             size_t l = strlen(line);
@@ -150,7 +164,7 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
             if (complete) {
                 line[l - 1] = '\0';
                 *tail_pos = ftell(lf);
-                progressed = true;
+                result.progressed = true;
                 delivered_lines++;
                 if (line[0] && cb) {
                     cb(line, ud);
@@ -159,20 +173,37 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
                 /* Oversized line filled the buffer without a newline — consume it
                  * anyway (counts as progress) so we never stall on one long line. */
                 *tail_pos = ftell(lf);
-                progressed = true;
+                result.progressed = true;
                 delivered_lines++;
                 if (cb) {
                     cb(line, ud);
                 }
-            } else {
+            } else if (!final) {
                 /* Genuine partial final line — keep it buffered for next poll. */
                 *tail_pos = before;
+                result.status = CBM_TAIL_MORE;
+                break;
+            } else {
+                /* No writer remains: deliver the final unterminated fragment. */
+                *tail_pos = ftell(lf);
+                result.progressed = true;
+                if (line[0] && cb) {
+                    cb(line, ud);
+                }
+                result.status = CBM_TAIL_CAUGHT_UP;
                 break;
             }
         }
+        if (result.status == CBM_TAIL_ERROR && !ferror(lf)) {
+            /* Reaching either work cap is conservatively MORE. An exact batch
+             * boundary needs one empty follow-up poll to prove EOF. */
+            result.status = CBM_TAIL_MORE;
+        }
     }
-    fclose(lf);
-    return progressed;
+    if (fclose(lf) != 0) {
+        result.status = CBM_TAIL_ERROR;
+    }
+    return result;
 }
 
 /* ── Windows command-line quoting (pure; unit-tested on every platform) ─────── */
@@ -268,6 +299,13 @@ bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv) {
 
 enum { CBM_SUBPROCESS_ARGV_LIMIT = 4096 };
 
+typedef enum {
+    CBM_SUBPROCESS_ACTIVE = 0,
+    CBM_SUBPROCESS_CANCEL_REQUESTED,
+    CBM_SUBPROCESS_DRAINING,
+    CBM_SUBPROCESS_TERMINAL,
+} cbm_subprocess_lifecycle_t;
+
 struct cbm_subprocess {
     char *bin;
     char **argv;
@@ -282,12 +320,11 @@ struct cbm_subprocess {
     long tail_pos;
     uint64_t last_activity_ms;
     uint64_t termination_started_ms;
-    atomic_bool cancellation_requested;
+    atomic_int lifecycle;
     bool timed_out;
     bool termination_started;
     bool force_sent;
     bool root_reaped;
-    atomic_bool terminal;
     uint64_t force_started_ms;
     bool containment_failed;
     cbm_proc_result_t result;
@@ -379,17 +416,23 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
         process->cancel_grace_ms = CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS;
     }
     process->delete_log_on_exit = opts->delete_log_on_exit;
-    atomic_init(&process->cancellation_requested, false);
-    atomic_init(&process->terminal, false);
+    atomic_init(&process->lifecycle, CBM_SUBPROCESS_ACTIVE);
     cbm_subprocess_result_init(&process->result);
     return process;
 }
 
-static void cbm_subprocess_poll_log(cbm_subprocess_t *process) {
-    if (cbm_tail_log(process->log_file, &process->tail_pos, process->on_log_line,
-                     process->log_ud)) {
+static cbm_tail_result_t cbm_subprocess_poll_log(cbm_subprocess_t *process, bool final) {
+    cbm_tail_result_t result = cbm_tail_log(process->log_file, &process->tail_pos,
+                                            process->on_log_line, process->log_ud, final);
+    if (result.progressed) {
         process->last_activity_ms = cbm_now_ms();
     }
+    return result;
+}
+
+static bool cbm_subprocess_cancellation_requested(const cbm_subprocess_t *process) {
+    return atomic_load_explicit(&process->lifecycle, memory_order_acquire) ==
+           CBM_SUBPROCESS_CANCEL_REQUESTED;
 }
 
 static void cbm_subprocess_delete_log(cbm_subprocess_t *process) {
@@ -407,26 +450,53 @@ static void cbm_subprocess_delete_log(cbm_subprocess_t *process) {
 #endif
 }
 
-static cbm_proc_poll_t cbm_subprocess_finish(cbm_subprocess_t *process, cbm_proc_result_t *out) {
-    /* Capture lines written between the first tail in this poll and process exit. */
-    cbm_subprocess_poll_log(process);
-    process->result.cancellation_requested =
-        atomic_load_explicit(&process->cancellation_requested, memory_order_acquire);
-    process->result.tree_quiesced = true;
-    process->result.supervision_failed = false;
-    atomic_store_explicit(&process->terminal, true, memory_order_release);
-    cbm_subprocess_delete_log(process);
+static bool cbm_subprocess_begin_terminal_transition(cbm_subprocess_t *process) {
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    for (;;) {
+        if (lifecycle == CBM_SUBPROCESS_DRAINING) {
+            return true;
+        }
+        if (lifecycle == CBM_SUBPROCESS_TERMINAL) {
+            return false;
+        }
+        int desired = CBM_SUBPROCESS_DRAINING;
+        if (atomic_compare_exchange_weak_explicit(&process->lifecycle, &lifecycle, desired,
+                                                  memory_order_acq_rel, memory_order_acquire)) {
+            process->result.cancellation_requested = lifecycle == CBM_SUBPROCESS_CANCEL_REQUESTED;
+            return true;
+        }
+    }
+}
+
+static cbm_proc_poll_t cbm_subprocess_publish_terminal(cbm_subprocess_t *process,
+                                                       cbm_proc_result_t *out, bool delete_log) {
+    if (delete_log) {
+        cbm_subprocess_delete_log(process);
+    }
+    atomic_store_explicit(&process->lifecycle, CBM_SUBPROCESS_TERMINAL, memory_order_release);
     if (out) {
         *out = process->result;
     }
     return CBM_PROC_POLL_TERMINAL;
 }
 
+static cbm_proc_poll_t cbm_subprocess_finish(cbm_subprocess_t *process, cbm_proc_result_t *out) {
+    if (!cbm_subprocess_begin_terminal_transition(process)) {
+        return CBM_PROC_POLL_ERROR;
+    }
+    process->result.tree_quiesced = true;
+    process->result.supervision_failed = false;
+    if (process->log_file && process->on_log_line) {
+        return CBM_PROC_POLL_RUNNING;
+    }
+    return cbm_subprocess_publish_terminal(process, out, true);
+}
+
 static cbm_proc_poll_t cbm_subprocess_finish_failed(cbm_subprocess_t *process,
                                                     cbm_proc_result_t *out) {
-    cbm_subprocess_poll_log(process);
-    process->result.cancellation_requested =
-        atomic_load_explicit(&process->cancellation_requested, memory_order_acquire);
+    if (!cbm_subprocess_begin_terminal_transition(process)) {
+        return CBM_PROC_POLL_ERROR;
+    }
     process->result.tree_quiesced = false;
     process->result.supervision_failed = true;
     process->result.forced = true;
@@ -436,11 +506,7 @@ static cbm_proc_poll_t cbm_subprocess_finish_failed(cbm_subprocess_t *process,
         process->result.outcome = CBM_PROC_KILLED;
     }
     process->containment_failed = true;
-    atomic_store_explicit(&process->terminal, true, memory_order_release);
-    if (out) {
-        *out = process->result;
-    }
-    return CBM_PROC_POLL_TERMINAL;
+    return cbm_subprocess_publish_terminal(process, out, false);
 }
 
 #ifdef _WIN32
@@ -634,8 +700,7 @@ static void cbm_win_capture_root(cbm_subprocess_t *process, DWORD code) {
     if (process->timed_out) {
         process->result.outcome = CBM_PROC_HANG;
     } else if (process->root_forced ||
-               (atomic_load_explicit(&process->cancellation_requested, memory_order_acquire) &&
-                code == CBM_WIN_CONTROL_C_EXIT)) {
+               (cbm_subprocess_cancellation_requested(process) && code == CBM_WIN_CONTROL_C_EXIT)) {
         process->result.outcome = CBM_PROC_KILLED;
     } else {
         process->result.outcome = cbm_proc_classify(true, (int)code, 0, false);
@@ -643,7 +708,6 @@ static void cbm_win_capture_root(cbm_subprocess_t *process, DWORD code) {
 }
 
 static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_proc_result_t *out) {
-    cbm_subprocess_poll_log(process);
     uint64_t now = cbm_now_ms();
 
     if (!process->root_reaped) {
@@ -652,7 +716,6 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
             DWORD code = 1;
             (void)GetExitCodeProcess(process->process, &code);
             cbm_win_capture_root(process, code);
-            cbm_subprocess_poll_log(process);
         } else if (waited == WAIT_FAILED) {
             DWORD code = STILL_ACTIVE;
             if (GetExitCodeProcess(process->process, &code) && code != STILL_ACTIVE) {
@@ -667,7 +730,7 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
     bool job_known = false;
     bool job_active = cbm_win_job_active(process, &job_known);
     if (!process->termination_started) {
-        if (atomic_load_explicit(&process->cancellation_requested, memory_order_acquire)) {
+        if (cbm_subprocess_cancellation_requested(process)) {
             cbm_win_begin_termination(process, now);
         } else if (!process->root_reaped && process->quiet_timeout_ms > 0 &&
                    now - process->last_activity_ms >= (uint64_t)process->quiet_timeout_ms) {
@@ -888,7 +951,6 @@ static void cbm_posix_capture_root(cbm_subprocess_t *process, int status) {
 
 static cbm_proc_poll_t cbm_subprocess_poll_posix(cbm_subprocess_t *process,
                                                  cbm_proc_result_t *out) {
-    cbm_subprocess_poll_log(process);
     uint64_t now = cbm_now_ms();
 
     if (!process->root_reaped) {
@@ -896,7 +958,6 @@ static cbm_proc_poll_t cbm_subprocess_poll_posix(cbm_subprocess_t *process,
         pid_t waited = waitpid(process->pid, &status, WNOHANG);
         if (waited == process->pid) {
             cbm_posix_capture_root(process, status);
-            cbm_subprocess_poll_log(process);
         } else if (waited < 0 && errno != EINTR) {
             /* ECHILD means another reaper consumed the status. Other permanent
              * wait failures are treated the same: retain containment, stop the
@@ -911,7 +972,7 @@ static cbm_proc_poll_t cbm_subprocess_poll_posix(cbm_subprocess_t *process,
 
     bool group_active = cbm_posix_group_active(process);
     if (!process->termination_started) {
-        if (atomic_load_explicit(&process->cancellation_requested, memory_order_acquire)) {
+        if (cbm_subprocess_cancellation_requested(process)) {
             cbm_posix_begin_termination(process, now);
         } else if (!process->root_reaped && process->quiet_timeout_ms > 0 &&
                    now - process->last_activity_ms >= (uint64_t)process->quiet_timeout_ms) {
@@ -967,12 +1028,27 @@ cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t
     if (!process) {
         return CBM_PROC_POLL_ERROR;
     }
-    if (atomic_load_explicit(&process->terminal, memory_order_acquire)) {
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    if (lifecycle == CBM_SUBPROCESS_TERMINAL) {
         if (out) {
             *out = process->result;
         }
         return CBM_PROC_POLL_TERMINAL;
     }
+    if (lifecycle == CBM_SUBPROCESS_DRAINING) {
+        cbm_tail_result_t tail = cbm_subprocess_poll_log(process, true);
+        if (tail.status == CBM_TAIL_MORE) {
+            return CBM_PROC_POLL_RUNNING;
+        }
+        if (tail.status == CBM_TAIL_ERROR) {
+            cbm_log_error("subprocess.log_drain_failed", "reason", "io_error");
+            return cbm_subprocess_publish_terminal(process, out, false);
+        }
+        return cbm_subprocess_publish_terminal(process, out, true);
+    }
+    /* The one owner-thread tail batch for this public poll. Platform-specific
+     * reap paths never tail again, preserving the exact per-poll work cap. */
+    (void)cbm_subprocess_poll_log(process, false);
 #ifdef _WIN32
     return cbm_subprocess_poll_win(process, out);
 #else
@@ -981,15 +1057,28 @@ cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t
 }
 
 bool cbm_subprocess_request_cancel(cbm_subprocess_t *process) {
-    if (!process || atomic_load_explicit(&process->terminal, memory_order_acquire)) {
+    if (!process) {
         return false;
     }
-    atomic_store_explicit(&process->cancellation_requested, true, memory_order_release);
-    return true;
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    for (;;) {
+        if (lifecycle == CBM_SUBPROCESS_CANCEL_REQUESTED) {
+            return true;
+        }
+        if (lifecycle != CBM_SUBPROCESS_ACTIVE) {
+            return false;
+        }
+        int desired = CBM_SUBPROCESS_CANCEL_REQUESTED;
+        if (atomic_compare_exchange_weak_explicit(&process->lifecycle, &lifecycle, desired,
+                                                  memory_order_acq_rel, memory_order_acquire)) {
+            return true;
+        }
+    }
 }
 
 void cbm_subprocess_destroy(cbm_subprocess_t *process) {
-    if (!process || !atomic_load_explicit(&process->terminal, memory_order_acquire)) {
+    if (!process || atomic_load_explicit(&process->lifecycle, memory_order_acquire) !=
+                        CBM_SUBPROCESS_TERMINAL) {
         return;
     }
 #ifdef _WIN32

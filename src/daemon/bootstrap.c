@@ -445,16 +445,27 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
         result_out->daemon_spawned = true;
 
-        /* Keep startup ownership until the child becomes observable. A
-         * RESERVED response here belongs to the generation we just launched,
-         * so it remains a wait state rather than a reason to release/spawn. */
+        /* Keep startup ownership only until the child becomes observable.
+         * Windows participant teardown reacquires the startup transition;
+         * retaining it while probing an observable generation can deadlock the
+         * bootstrap against a daemon that is trying to cleanly stand down. */
         do {
             bootstrap_pause(deadline);
             probe = bootstrap_probe(config, ops, &client, &connect_result);
+            if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
+                probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
+                generation_observed = true;
+                bootstrap_startup_lock_release_complete(ops, &startup_lock);
+                lock_acquired = false;
+                break;
+            }
             if (!bootstrap_probe_is_waitable(probe)) {
                 break;
             }
         } while (cbm_now_ms() < deadline);
+        if (!lock_acquired) {
+            continue;
+        }
         break;
     }
 

@@ -66,8 +66,7 @@ static const char FRONTEND_TEST_CACHE[] =
 
 enum {
     FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS = 2000,
-    FRONTEND_EOF_TEST_OVERFLOW_TIMEOUT_S = 4,
-    FRONTEND_EOF_TEST_DRAIN_TIMEOUT_S = 10,
+    FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S = 30,
     FRONTEND_BACKPRESSURE_MESSAGE_BYTES = 2 * 1024 * 1024,
     FRONTEND_BACKPRESSURE_FRONTEND_TIMEOUT_S = 12,
     FRONTEND_BACKPRESSURE_DAEMON_TIMEOUT_S = 20,
@@ -427,8 +426,10 @@ static bool frontend_eof_run_isolated(const char *tag, bool overflow) {
     pid_t child = fork();
     if (child == 0) {
         (void)signal(SIGALRM, SIG_DFL);
-        (void)alarm(overflow ? FRONTEND_EOF_TEST_OVERFLOW_TIMEOUT_S
-                             : FRONTEND_EOF_TEST_DRAIN_TIMEOUT_S);
+        /* This alarm bounds a broken isolated harness, not product behavior.
+         * Valid startup, drain/watchdog, close, and fixture teardown can exceed
+         * ten seconds under sanitizers while remaining within their own bounds. */
+        (void)alarm(FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S);
         _exit(frontend_eof_child_run(parent, overflow));
     }
     int status = 0;
@@ -437,7 +438,26 @@ static bool frontend_eof_run_isolated(const char *tag, bool overflow) {
         waited = child > 0 ? waitpid(child, &status, 0) : -1;
     } while (waited < 0 && errno == EINTR);
     bool cleaned = th_rmtree(parent) == 0;
-    return child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 && cleaned;
+    bool child_ok = child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!child_ok) {
+        if (child <= 0) {
+            (void)fprintf(stderr, "frontend EOF fixture %s: fork failed\n", tag);
+        } else if (waited != child) {
+            (void)fprintf(stderr, "frontend EOF fixture %s: waitpid failed errno=%d\n", tag, errno);
+        } else if (WIFSIGNALED(status)) {
+            (void)fprintf(stderr, "frontend EOF fixture %s: child signal=%d\n", tag,
+                          WTERMSIG(status));
+        } else if (WIFEXITED(status)) {
+            (void)fprintf(stderr, "frontend EOF fixture %s: child exit=%d\n", tag,
+                          WEXITSTATUS(status));
+        } else {
+            (void)fprintf(stderr, "frontend EOF fixture %s: unexpected child status\n", tag);
+        }
+    }
+    if (!cleaned) {
+        (void)fprintf(stderr, "frontend EOF fixture %s: cleanup failed\n", tag);
+    }
+    return child_ok && cleaned;
 }
 
 static void frontend_test_release_lease(cbm_version_cohort_lease_t **lease) {
