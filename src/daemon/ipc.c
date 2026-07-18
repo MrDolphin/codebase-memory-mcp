@@ -3932,9 +3932,16 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
         return false;
     }
     HANDLE directory =
-        CreateFileW(runtime_dir, READ_CONTROL | WRITE_DAC,
+        CreateFileW(runtime_dir, READ_CONTROL | WRITE_DAC | WRITE_OWNER,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    bool can_write_owner = directory != INVALID_HANDLE_VALUE;
+    if (!can_write_owner) {
+        directory =
+            CreateFileW(runtime_dir, READ_CONTROL | WRITE_DAC,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    }
     if (directory == INVALID_HANDLE_VALUE) {
         win_security_destroy(&security);
         return false;
@@ -3943,13 +3950,24 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
     bool valid_handle = GetFileInformationByHandle(directory, &file_info) != 0 &&
                         (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                         (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
-    bool owner_ok = valid_handle && win_file_owner_secure(&security, directory, true);
+    bool owner_exact = valid_handle && win_file_owner_secure(&security, directory, true);
+    /* One-time normalization of the admin-group default-owner artifact: a
+     * directory created by plain mkdir under an Administrators-default-owner
+     * token (standard policy on Windows Server) is born owned by BUILTIN\
+     * Administrators even though it is this account's own private dir. A
+     * TRUSTED owner (the launcher's directory policy: SYSTEM, Administrators,
+     * TrustedInstaller) is re-stamped to the exact token user inside the same
+     * repair that already re-protects the DACL; any other owner remains
+     * refused, and the final validation below still demands the exact user. */
+    bool owner_ok = owner_exact || (valid_handle && can_write_owner &&
+                                    win_file_owner_secure(&security, directory, false));
     DWORD secure_result = ERROR_ACCESS_DENIED;
     if (valid_handle && owner_ok) {
-        secure_result = security.set_security_info(directory, SE_FILE_OBJECT,
-                                                   DACL_SECURITY_INFORMATION |
-                                                       PROTECTED_DACL_SECURITY_INFORMATION,
-                                                   NULL, NULL, security.acl, NULL);
+        secure_result = security.set_security_info(
+            directory, SE_FILE_OBJECT,
+            (owner_exact ? 0U : (DWORD)OWNER_SECURITY_INFORMATION) | DACL_SECURITY_INFORMATION |
+                PROTECTED_DACL_SECURITY_INFORMATION,
+            owner_exact ? NULL : security.user_sid, NULL, security.acl, NULL);
     }
     bool final_private =
         secure_result == ERROR_SUCCESS &&
