@@ -18,7 +18,8 @@ One-time setup (~15 min interactive):
    (fetched directly from Microsoft). Windows runs unactivated for testing
    (cosmetic watermark); add a license if you want it clean.
 3. Open **UTM** → New VM → Virtualize → Windows → select the ISO →
-   4+ CPUs / 8 GB. Click through Windows setup (local account, e.g. `dev`).
+   8-12 CPUs / 16 GB (vCPUs are scheduled, not pinned — size generously;
+   speed first). Click through Windows setup (local account, e.g. `dev`).
 4. Inside Windows, run `vm/windows-bootstrap.ps1` (elevated PowerShell):
    installs msys2 + CLANG64 toolchain + git, enables OpenSSH server, and
    mirrors the GitHub-runner security policy
