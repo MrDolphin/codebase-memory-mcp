@@ -169,6 +169,16 @@ try {
     $guardPayload = Join-Path $guardBundle "codebase-memory-mcp.payload.exe"
     Copy-Item -LiteralPath $launcherBin -Destination $guardBin
     Copy-Item -LiteralPath $bin -Destination $guardPayload
+
+    # Ownership is never inherited on Windows: descendants created under the
+    # hardened root by an admin-group token can default to the Administrators
+    # SID, and the launcher's exe policy demands the exact current user as
+    # owner. Stamp the current SID explicitly on everything staged here.
+    foreach ($staged in @($guardBundle, $guardBin, $guardPayload)) {
+        $stagedAcl = Get-Acl -LiteralPath $staged
+        $stagedAcl.SetOwner($currentSid)
+        Set-Acl -LiteralPath $staged -AclObject $stagedAcl
+    }
     Write-Host "Guard bundle: $guardBin" -ForegroundColor Green
 
     # The launcher deliberately rejects GitHub's shared D:\a ancestry and the
