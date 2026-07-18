@@ -3575,8 +3575,7 @@ static bool win_security_init(win_security_t *security) {
          * and every private-namespace validation demands the exact token-user
          * SID as owner. Relying on the token default makes the daemon reject
          * objects it created itself. */
-        !security->set_security_descriptor_owner(security->descriptor, security->user_sid,
-                                                 FALSE)) {
+        !security->set_security_descriptor_owner(security->descriptor, security->user_sid, FALSE)) {
         win_security_destroy(security);
         return false;
     }
@@ -5156,7 +5155,27 @@ static bool win_pipe_server_is_current_user(HANDLE pipe) {
     bool initialized = win_security_init(&security);
     HANDLE token = NULL;
     bool opened = initialized && security.open_process_token(process, TOKEN_QUERY, &token) != 0;
-    bool same_user = opened && win_token_is_current_user(&security, token);
+    PSID token_sid = NULL;
+    void *token_user = opened ? win_token_user_query(&security, token, &token_sid) : NULL;
+    bool same_user =
+        token_user && token_sid && security.equal_sid(token_sid, security.user_sid) != 0;
+    if (!same_user) {
+        /* Name the failing step and the peer: a rejected server can be a dead
+         * PID that Windows already reused (often for a SYSTEM service), which
+         * looks identical to a hostile pipe without this classification. */
+        const char *step = !initialized ? "security_init"
+                           : !opened    ? "token_open"
+                           : !token_sid ? "token_query"
+                           : security.is_well_known_sid(token_sid, WinLocalSystemSid)
+                               ? "server_is_system"
+                           : security.is_well_known_sid(token_sid, WinBuiltinAdministratorsSid)
+                               ? "server_is_admins"
+                               : "server_other_account";
+        char pid_text[16];
+        (void)snprintf(pid_text, sizeof(pid_text), "%lu", (unsigned long)process_id);
+        cbm_log_warn("daemon.client.server_identity", "step", step, "pid", pid_text);
+    }
+    free(token_user);
     if (token) {
         (void)CloseHandle(token);
     }

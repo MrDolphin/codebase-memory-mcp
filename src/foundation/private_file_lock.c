@@ -823,8 +823,7 @@ static bool private_win_security_init(private_win_security_t *security) {
          * on Windows Server), and private_win_owner_only_dacl demands the
          * exact user SID — without this every lock file the process creates
          * fails its own validation. */
-        !security->set_security_descriptor_owner(security->descriptor, security->user_sid,
-                                                 FALSE) ||
+        !security->set_security_descriptor_owner(security->descriptor, security->user_sid, FALSE) ||
         !security->set_security_descriptor_control(security->descriptor, SE_DACL_PROTECTED,
                                                    SE_DACL_PROTECTED)) {
         private_win_security_destroy(security);
