@@ -79,6 +79,29 @@ test_payload() {
     fi
 }
 
+# Mutating operations are session-owned and intentionally cancel on EOF. Keep
+# stdin open until the invalid-path response and a subsequent ping arrive so
+# this case tests robustness without racing the disconnect contract.
+test_invalid_index_interactive() {
+    local name="index nonexistent path"
+    TOTAL=$((TOTAL + 1))
+    local tmpoutput="$FUZZ_TMPDIR/output_${TOTAL}.jsonl"
+    local ec=0
+
+    HOME="$FUZZ_HOME" CBM_CACHE_DIR="$FUZZ_CACHE" \
+        python3 "$(dirname "$0")/test_mcp_interactive.py" "$BINARY" \
+        --scenario invalid-index --repo-path /nonexistent/path/abc123 \
+        --response-timeout 30 --exit-timeout 15 > "$tmpoutput" 2>&1 || ec=$?
+
+    if [[ $ec -eq 0 ]]; then
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: $name — interactive session failed"
+        sed -n '1,20p' "$tmpoutput"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 echo ""
 echo "--- Malformed JSON ---"
 
@@ -124,7 +147,7 @@ test_payload "path traversal in qualified_name" '{"jsonrpc":"2.0","id":2,"method
 test_payload "shell injection in file_pattern" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_code","arguments":{"pattern":"test","file_pattern":"*.py'\'' ; cat /etc/passwd #"}}}'
 
 # index_repository with non-existent path (should return error, not crash)
-test_payload "index nonexistent path" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_repository","arguments":{"repo_path":"/nonexistent/path/abc123"}}}'
+test_invalid_index_interactive
 
 # Negative/zero values for numeric params
 test_payload "negative limit" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":{"name_pattern":"test","limit":-1}}}'

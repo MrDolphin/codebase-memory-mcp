@@ -65,6 +65,7 @@ def wait_response(
     responses: "queue.Queue[dict[str, Any]]",
     request_id: int,
     timeout: float,
+    accept_tool_error: bool = False,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while True:
@@ -81,14 +82,23 @@ def wait_response(
             raise SmokeFailure(f"timed out waiting for MCP response id={request_id}") from error
         if message.get("id") != request_id:
             continue
+        if "result" not in message and "error" not in message:
+            # An echoed request is not a JSON-RPC response and must never count
+            # as proof that the server dispatched the request.
+            continue
         if "error" in message:
             raise SmokeFailure(
                 f"MCP response id={request_id} returned JSON-RPC error: {message['error']!r}"
             )
         result = message.get("result")
-        if isinstance(result, dict) and result.get("isError") is True:
+        if (
+            isinstance(result, dict)
+            and result.get("isError") is True
+            and not accept_tool_error
+        ):
+            rendered = json.dumps(message, separators=(",", ":"), ensure_ascii=False)
             raise SmokeFailure(
-                f"MCP tool response id={request_id} reported isError=true"
+                f"MCP tool response id={request_id} reported isError=true: {rendered}"
             )
         return message
 
@@ -100,6 +110,7 @@ def request(
     method: str,
     params: dict[str, Any],
     timeout: float,
+    accept_tool_error: bool = False,
 ) -> dict[str, Any]:
     send(
         process,
@@ -110,7 +121,7 @@ def request(
             "params": params,
         },
     )
-    return wait_response(process, responses, request_id, timeout)
+    return wait_response(process, responses, request_id, timeout, accept_tool_error)
 
 
 def run_scenario(
@@ -125,7 +136,30 @@ def run_scenario(
         process,
         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
     )
-    request(
+    if scenario == "initialize":
+        return
+    if scenario == "invalid-index":
+        invalid_index_response = request(
+            process,
+            responses,
+            2,
+            "tools/call",
+            {
+                "name": "index_repository",
+                "arguments": {"repo_path": repo_path, "mode": "fast"},
+            },
+            timeout,
+            accept_tool_error=True,
+        )
+        invalid_index_result = invalid_index_response.get("result")
+        if (
+            not isinstance(invalid_index_result, dict)
+            or invalid_index_result.get("isError") is not True
+        ):
+            raise SmokeFailure("index_repository unexpectedly accepted a nonexistent path")
+        request(process, responses, 3, "ping", {}, timeout)
+        return
+    index_response = request(
         process,
         responses,
         2,
@@ -136,13 +170,21 @@ def run_scenario(
         },
         timeout,
     )
+    index_result = index_response.get("result")
+    structured = index_result.get("structuredContent") if isinstance(index_result, dict) else None
+    project = structured.get("project") if isinstance(structured, dict) else None
+    if not isinstance(project, str) or not project:
+        raise SmokeFailure("index_repository response did not identify the indexed project")
     if scenario == "roundtrip":
         request(
             process,
             responses,
             3,
             "tools/call",
-            {"name": "search_graph", "arguments": {"name_pattern": "compute"}},
+            {
+                "name": "search_graph",
+                "arguments": {"project": project, "name_pattern": "compute"},
+            },
             timeout,
         )
         return
@@ -153,18 +195,57 @@ def run_scenario(
         "tools/call",
         {
             "name": "search_code",
-            "arguments": {"pattern": "compute", "mode": "compact", "limit": 3},
+            "arguments": {
+                "project": project,
+                "pattern": "compute",
+                "mode": "compact",
+                "limit": 3,
+            },
         },
         timeout,
     )
-    request(
+    discovery_response = request(
         process,
         responses,
         4,
         "tools/call",
         {
+            "name": "search_graph",
+            "arguments": {
+                "project": project,
+                "name_pattern": "compute",
+                "format": "json",
+                "limit": 1,
+            },
+        },
+        timeout,
+    )
+    discovery_result = discovery_response.get("result")
+    discovery_structured = (
+        discovery_result.get("structuredContent")
+        if isinstance(discovery_result, dict)
+        else None
+    )
+    matches = (
+        discovery_structured.get("results")
+        if isinstance(discovery_structured, dict)
+        else None
+    )
+    qualified_name = (
+        matches[0].get("qualified_name")
+        if isinstance(matches, list) and matches and isinstance(matches[0], dict)
+        else None
+    )
+    if not isinstance(qualified_name, str) or not qualified_name:
+        raise SmokeFailure("search_graph did not discover compute's qualified name")
+    request(
+        process,
+        responses,
+        5,
+        "tools/call",
+        {
             "name": "get_code_snippet",
-            "arguments": {"qualified_name": "compute"},
+            "arguments": {"project": project, "qualified_name": qualified_name},
         },
         timeout,
     )
@@ -184,7 +265,11 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary")
-    parser.add_argument("--scenario", choices=("roundtrip", "advanced"), required=True)
+    parser.add_argument(
+        "--scenario",
+        choices=("initialize", "invalid-index", "roundtrip", "advanced"),
+        required=True,
+    )
     parser.add_argument("--repo-path", required=True)
     parser.add_argument("--response-timeout", type=float, default=30.0)
     parser.add_argument("--exit-timeout", type=float, default=15.0)

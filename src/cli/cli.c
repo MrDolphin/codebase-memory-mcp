@@ -1264,6 +1264,7 @@ static int cli_activation_transaction_finalize_close(
     return cli_activation_transaction_abort(transaction_io);
 }
 
+#ifndef _WIN32
 static void cli_activation_transaction_finalize_committed_or_fail_stop(
     cbm_activation_transaction_t **transaction_io, const char *component) {
     if (!transaction_io || !*transaction_io) {
@@ -1296,6 +1297,7 @@ static int cli_activation_transaction_commit_removal(cbm_activation_transaction_
                ? CLI_OK
                : CLI_ERR;
 }
+#endif
 
 static bool cli_activation_transaction_expected_build(cbm_activation_transaction_t *transaction,
                                                       cli_binary_validator_t *validator) {

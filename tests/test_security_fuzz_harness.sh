@@ -52,7 +52,11 @@ printf '%s\t%s\n' "${HOME-}" "${CBM_CACHE_DIR-}" >> "$CBM_FUZZ_ENV_PROBE"
 while IFS= read -r line; do
     id=$(printf '%s\n' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
     if [[ -n "$id" ]]; then
-        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+        if [[ "$line" == *'"name":"index_repository"'* ]]; then
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"isError":true}}\n' "$id"
+        else
+            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+        fi
     fi
 done
 EOF

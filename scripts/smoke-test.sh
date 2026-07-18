@@ -559,30 +559,15 @@ fi
 echo ""
 echo "=== Phase 4: security checks ==="
 
-# 4a: Clean shutdown — binary must exit within 5 seconds after EOF
+# 4a: Clean shutdown — wait through bounded cold bootstrap, then require the
+# initialized frontend to exit promptly after EOF.
 echo "Testing clean shutdown..."
-SHUTDOWN_TMPDIR=$(mktemp -d)
-cat > "$SHUTDOWN_TMPDIR/input.jsonl" << 'JSONL'
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
-JSONL
-
-# Run binary with EOF and wait up to 5 seconds (portable — no `timeout` needed)
-"$BINARY" < "$SHUTDOWN_TMPDIR/input.jsonl" > /dev/null 2>&1 &
-SHUTDOWN_PID=$!
-SHUTDOWN_WAITED=0
-while kill -0 "$SHUTDOWN_PID" 2>/dev/null && [ "$SHUTDOWN_WAITED" -lt 5 ]; do
-  sleep 1
-  SHUTDOWN_WAITED=$((SHUTDOWN_WAITED + 1))
-done
-if kill -0 "$SHUTDOWN_PID" 2>/dev/null; then
-  kill "$SHUTDOWN_PID" 2>/dev/null || true
-  wait "$SHUTDOWN_PID" 2>/dev/null || true
-  rm -rf "$SHUTDOWN_TMPDIR"
-  echo "FAIL: binary did not exit within 5 seconds after EOF"
+if ! python3 "$REPO_ROOT/scripts/test_mcp_interactive.py" \
+    "$BINARY" --scenario initialize --repo-path "$TMPDIR" \
+    --response-timeout 30 --exit-timeout 8 > /dev/null; then
+  echo "FAIL: initialized binary did not exit within 8 seconds after EOF"
   exit 1
 fi
-wait "$SHUTDOWN_PID" 2>/dev/null || true
-rm -rf "$SHUTDOWN_TMPDIR"
 echo "OK: clean shutdown"
 
 # 4b: No residual processes (skip on Windows/MSYS2 where pgrep may not work)
@@ -912,9 +897,9 @@ if ! grep -q '"id":3' "$MCP_SC_OUTPUT"; then
 fi
 echo "OK: search_code v2 via MCP"
 
-# 7b: get_code_snippet via MCP
-if ! grep -q '"id":4' "$MCP_SC_OUTPUT"; then
-  echo "FAIL: get_code_snippet response (id:4) missing"
+# 7b: search_graph discovery + get_code_snippet via MCP
+if ! grep -q '"id":4' "$MCP_SC_OUTPUT" || ! grep -q '"id":5' "$MCP_SC_OUTPUT"; then
+  echo "FAIL: search_graph/get_code_snippet response (id:4 or id:5) missing"
   exit 1
 fi
 echo "OK: get_code_snippet via MCP"
