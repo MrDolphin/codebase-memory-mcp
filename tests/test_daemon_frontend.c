@@ -786,8 +786,15 @@ static bool frontend_backpressure_run_isolated(bool maintenance) {
         (void)close(control_pipe[0]);
     }
     char announced_marker = '\0';
+    /* The daemon child runs cbm_daemon_runtime_service_start before it can
+     * announce, and that includes the cohort-claim path whose own internal
+     * budget is HOST_DAEMON_CLAIM_TIMEOUT_MS (12s). An announce deadline
+     * below that budget SIGKILLs a slow-but-legitimate startup — on
+     * oversubscribed CI runners this fired every round (announced=0,
+     * daemon_signal=9) while fast local machines never saw it. Keep the
+     * deadline comfortably above the daemon's own worst-case budget. */
     bool announced_read = daemon > 0 && frontend_test_read_byte(ready_pipe[0], &announced_marker,
-                                                                cbm_now_ms() + 10000U);
+                                                                cbm_now_ms() + 30000U);
     bool announced = announced_read && announced_marker == 'R';
 
     /* This raw runtime client intentionally owns no cohort lease. It is a
