@@ -53,18 +53,22 @@ typedef struct {
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
 typedef struct {
-    const char *bin;             /* executable path or literal PATH name;
-                                  * also argv[0] when argv is NULL */
-    const char *const *argv;     /* NULL-terminated argv; NULL => { bin, NULL } */
-    const char *log_file;        /* child stdout+stderr are redirected here and tailed;
-                                  * NULL => discard child output, no tailing */
-    cbm_proc_log_cb on_log_line; /* optional per-line callback */
-    void *log_ud;                /* user data for on_log_line */
-    int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
-                                  * ms with no new completed log line */
-    int cancel_grace_ms;         /* graceful tree-termination window; <= 0 uses the finite
-                                  * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
-    bool delete_log_on_exit;     /* unlink log_file after reaping */
+    const char *bin;                 /* executable path or literal PATH name;
+                                      * also argv[0] when argv is NULL */
+    const char *const *argv;         /* NULL-terminated argv; NULL => { bin, NULL } */
+    const char *windows_cmd_payload; /* Windows-only cmd.exe command text. When set, bin must
+                                      * be an absolute path ending in cmd.exe and argv must be
+                                      * NULL. The fixed /D /S /V:OFF /C prefix is added while
+                                      * this payload is copied verbatim for cmd.exe to parse. */
+    const char *log_file;            /* child stdout+stderr are redirected here and tailed;
+                                      * NULL => discard child output, no tailing */
+    cbm_proc_log_cb on_log_line;     /* optional per-line callback */
+    void *log_ud;                    /* user data for on_log_line */
+    int quiet_timeout_ms;            /* <= 0 => no timeout; else kill+HANG after this many
+                                      * ms with no new completed log line */
+    int cancel_grace_ms;             /* graceful tree-termination window; <= 0 uses the finite
+                                      * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
+    bool delete_log_on_exit;         /* unlink log_file after reaping */
 } cbm_proc_opts_t;
 
 #define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000
@@ -158,5 +162,19 @@ const char *cbm_proc_outcome_str(cbm_proc_outcome_t o);
  * is unit-tested on Linux/macOS CI, and so both spawn sites (cbm_subprocess_run and
  * the UI http_server index spawn) escape through one shared, tested implementation. */
 bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv);
+
+/* Build the special CreateProcess command line needed to invoke cmd.exe with a
+ * command-language payload. Unlike cbm_build_win_cmdline(), payload is not a C
+ * runtime argv element: cmd.exe must receive its embedded quotes and backslashes
+ * unchanged. cmd_executable must be an absolute Windows path whose basename is
+ * cmd.exe. The result is:
+ *
+ *   "<absolute-cmd.exe>" /D /S /V:OFF /C <payload-verbatim>
+ *
+ * Returns false for invalid input or overflow and leaves a valid empty string
+ * whenever buf/cap permit one. Pure string logic, available on every platform
+ * so the Windows serialization contract is unit-testable everywhere. */
+bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable,
+                               const char *payload);
 
 #endif /* CBM_SUBPROCESS_H */

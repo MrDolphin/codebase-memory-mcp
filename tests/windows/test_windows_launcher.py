@@ -227,11 +227,104 @@ def find_and_validate_current(managed_dir):
         / digest
         / "codebase-memory-mcp.payload.exe"
     )
+    backing = payload.parent / "codebase-memory-mcp.exe"
+    canonical = managed_dir / "codebase-memory-mcp.exe"
     require(payload.is_file(), "current-v1 generation payload is missing: %s" % payload)
+    require(backing.is_file(), "current-v1 generation launcher backing is missing: %s" % backing)
+    require(canonical.is_file(), "managed canonical launcher is missing: %s" % canonical)
+    require(
+        {path.name for path in payload.parent.iterdir()}
+        == {"codebase-memory-mcp.payload.exe", "codebase-memory-mcp.exe"},
+        "managed generation must contain exactly payload plus launcher backing",
+    )
     require(payload.stat().st_size == payload_size, "current-v1 payload size does not match")
     observed = hashlib.sha256(payload.read_bytes()).hexdigest()
     require(observed == digest, "installed generation name/digest does not match payload bytes")
+    require(canonical.samefile(backing), "canonical launcher is not its generation hardlink")
+    require(
+        canonical.stat().st_nlink == 2 and backing.stat().st_nlink == 2,
+        "canonical launcher/backing must report exactly two links",
+    )
+    require(payload.stat().st_nlink == 1, "generation payload must remain an exact one-link file")
     return current, data, payload
+
+
+def current_v1_record(payload, abi_min=1, abi_max=1):
+    digest = sha256_file(payload)
+    record = bytearray(CURRENT_RECORD_SIZE)
+    record[: len(CURRENT_MAGIC)] = CURRENT_MAGIC
+    struct.pack_into("<I", record, CURRENT_FORMAT_OFFSET, 1)
+    struct.pack_into("<I", record, CURRENT_SIZE_OFFSET, CURRENT_RECORD_SIZE)
+    struct.pack_into("<I", record, CURRENT_ABI_MIN_OFFSET, abi_min)
+    struct.pack_into("<I", record, CURRENT_ABI_MAX_OFFSET, abi_max)
+    struct.pack_into("<Q", record, CURRENT_PAYLOAD_SIZE_OFFSET, payload.stat().st_size)
+    record[
+        CURRENT_SHA256_OFFSET : CURRENT_SHA256_OFFSET + CURRENT_SHA256_SIZE
+    ] = digest.encode("ascii")
+    return bytes(record)
+
+
+def generation_paths(managed_dir, payload):
+    digest = sha256_file(payload)
+    generation = managed_dir / ".cbm" / "generations" / digest
+    return (
+        generation,
+        generation / "codebase-memory-mcp.payload.exe",
+        generation / "codebase-memory-mcp.exe",
+    )
+
+
+def wait_for_path_absent(path, timeout=30):
+    deadline = time.monotonic() + timeout
+    while path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return not path.exists()
+
+
+# The retired-state directory embeds the first 16 hex chars (64 bits) of the
+# payload digest — enough to identify the generation while keeping the retired
+# path within the managed uninstall's directory-rename length limit.
+RETIRED_TAG_HEX = 16
+
+
+def retired_state_siblings(managed_dir, digest=None):
+    tag = digest[:RETIRED_TAG_HEX] if digest else "*"
+    pattern = ".cbm-retired-v1-%s-*" % tag
+    return sorted(path for path in managed_dir.glob(pattern) if path.is_dir())
+
+
+def run_uninstall_observing_retirement(launcher, managed_dir, env, timeout=180):
+    _, current_bytes, _ = find_and_validate_current(managed_dir)
+    digest = current_bytes[
+        CURRENT_SHA256_OFFSET : CURRENT_SHA256_OFFSET + CURRENT_SHA256_SIZE
+    ].decode("ascii")
+    process = subprocess.Popen(
+        [str(launcher), "uninstall", "--yes"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    if process.stdin:
+        process.stdin.close()
+        process.stdin = None
+    observed = set()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        observed.update(retired_state_siblings(managed_dir, digest))
+        if process.poll() is not None:
+            break
+        time.sleep(0.001)
+    if process.poll() is None:
+        process.kill()
+        process.wait(timeout=5)
+        raise GuardFailure("managed uninstall exceeded %ss" % timeout)
+    stdout, stderr = process.communicate(timeout=5)
+    observed.update(retired_state_siblings(managed_dir, digest))
+    result = subprocess.CompletedProcess(
+        [str(launcher), "uninstall", "--yes"], process.returncode, stdout, stderr
+    )
+    return result, observed, digest
 
 
 def parse_release_descriptor(data):
@@ -303,6 +396,12 @@ def assert_portable_mutations_refuse(source_payload, env, cache, work):
             # deterministic and fast.  A correct implementation refuses before
             # it consults this URL or asks the daemon to drain.
             command_env["CBM_DOWNLOAD_URL"] = "https://127.0.0.1:1"
+            # Warm the freshly-copied cold binary first: first-touch antivirus
+            # scanning of the just-written image inflates process load time, and
+            # the refusal itself is a fast STATELESS local check (no daemon IPC,
+            # no download) whose timing is what this guard actually measures. The
+            # warm-up refuses identically and is discarded.
+            run([command_payload, action] + options, command_env, timeout=10)
             started = time.monotonic()
             result = run([command_payload, action] + options, command_env, timeout=10)
             elapsed = time.monotonic() - started
@@ -407,6 +506,15 @@ def assert_add_only_ancestor_acl_allowed(source_launcher, source_payload, env, w
     launcher, portable_payload = copy_portable_pair(
         source_launcher, source_payload, ancestor / "bundle"
     )
+    # The VM's hosted-runner policy can make this fresh copy
+    # BUILTIN\Administrators-owned. Prove the trusted launcher context works
+    # before the add-only ACE changes the ancestor's security descriptor.
+    before_ace = run([launcher, "--version"], env)
+    require(
+        before_ace.returncode == 0,
+        "launcher context failed before the add-only ACE was installed: %s"
+        % output_text(before_ace)[-600:],
+    )
     grant = run(["icacls", ancestor, "/grant", "*S-1-1-0:(AD)"], env)
     require(
         grant.returncode == 0,
@@ -446,7 +554,7 @@ def assert_add_only_ancestor_acl_allowed(source_launcher, source_payload, env, w
         )
         managed_launcher = managed_dir / "codebase-memory-mcp.exe"
         require(managed_launcher.is_file(), "add-only managed install produced no launcher")
-        uninstall = run([managed_launcher, "uninstall", "--yes"], env, timeout=60)
+        uninstall = run([managed_launcher, "uninstall", "--yes"], env, timeout=180)
         require(
             uninstall.returncode == 0,
             "add-only managed install could not be uninstalled: %s"
@@ -714,6 +822,11 @@ def assert_launcher_relay(launcher, payload, env, cache):
 
 
 def assert_current_fail_closed(launcher, current, original, env):
+    # cbm writes current-v1 with FILE_ATTRIBUTE_HIDDEN; Python's write_bytes
+    # (CREATE_ALWAYS) cannot overwrite a hidden file (WinError 5 -> Errno 13),
+    # so clear the attribute before corrupting it. The launcher reads current-v1
+    # regardless of the attribute, so this does not affect the behavior tested.
+    ctypes.windll.kernel32.SetFileAttributesW(ctypes.c_wchar_p(str(current)), 0x80)
     incompatible = bytearray(original)
     struct.pack_into("<II", incompatible, CURRENT_ABI_MIN_OFFSET, 0xFFFFFFFF, 0xFFFFFFFF)
     current.write_bytes(incompatible)
@@ -742,13 +855,21 @@ def assert_managed_update(
 ):
     release = work / "release"
     release.mkdir()
+    updated_payload = release / "updated-payload.exe"
+    updated_payload.write_bytes(
+        source_payload.read_bytes() + b"\0CBM runnable update generation fixture\n"
+    )
+    require(
+        run([updated_payload, "--version"], env).returncode == 0,
+        "PE-overlay update payload fixture is not runnable",
+    )
     machine = platform.machine().lower()
     arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
     asset_name = "codebase-memory-mcp-windows-%s.zip" % arch
     asset = release / asset_name
     with zipfile.ZipFile(asset, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.write(source_launcher, "codebase-memory-mcp.exe")
-        archive.write(source_payload, "codebase-memory-mcp.payload.exe")
+        archive.write(updated_payload, "codebase-memory-mcp.payload.exe")
         archive.writestr("LICENSE", "test license\n")
         archive.writestr("install.ps1", "# test installer\n")
         archive.writestr("THIRD_PARTY_NOTICES.md", "test notices\n")
@@ -759,11 +880,19 @@ def assert_managed_update(
 
     update_env = dict(env)
     update_env["CBM_DOWNLOAD_URL"] = release.resolve().as_uri()
+    _, _, old_payload = find_and_validate_current(managed_dir)
+    old_generation = old_payload.parent
     orphan_bytes = source_payload.read_bytes() + b"\0CBM generation prune fixture\n"
     orphan_digest = hashlib.sha256(orphan_bytes).hexdigest()
     orphan_directory = managed_dir / ".cbm" / "generations" / orphan_digest
     orphan_directory.mkdir()
     (orphan_directory / "codebase-memory-mcp.payload.exe").write_bytes(orphan_bytes)
+    shutil.copy2(source_launcher, orphan_directory / "codebase-memory-mcp.exe")
+    # A genuine orphan generation is cbm-created and current-user-owned; this
+    # hand-built one defaults to the Administrators group on runner images, so
+    # the update's owner-strict generation pruning (correctly) refuses it. Stamp
+    # it so the prune reaches the same not-referenced verdict it would in reality.
+    stamp_fixture_owner_current(orphan_directory, env)
     result = run(
         [launcher, "update", "--force", "--standard", "--yes"],
         update_env,
@@ -783,7 +912,33 @@ def assert_managed_update(
         run([generation_payload, "--version"], env).returncode == 0,
         "managed update returned with a non-runnable generation payload",
     )
-    require(not orphan_directory.exists(), "successful update did not prune old generation")
+    require(not orphan_directory.exists(), "successful update did not prune orphan generation")
+    require(
+        old_generation.exists(),
+        "update deleted the old generation while its supervising launcher was still mapped",
+    )
+    require(
+        {path.name for path in old_generation.iterdir()}
+        == {"codebase-memory-mcp.payload.exe", "codebase-memory-mcp.exe"}
+        and (old_generation / "codebase-memory-mcp.exe").stat().st_nlink == 1,
+        "deferred mapped old generation was not retained as an exact safe pair",
+    )
+
+    # The first updater has now exited, so a same-release activation can
+    # prune the no-longer-mapped old backing without publishing another
+    # generation.
+    second = run(
+        [launcher, "update", "--force", "--standard", "--yes"],
+        update_env,
+        timeout=90,
+    )
+    require(
+        second.returncode == 0,
+        "second managed update failed to prune deferred generation: %s"
+        % output_text(second)[-1200:],
+    )
+    _, _, generation_payload = find_and_validate_current(managed_dir)
+    require(not old_generation.exists(), "later activation did not prune unmapped old generation")
     generation_directories = [
         path
         for path in (managed_dir / ".cbm" / "generations").iterdir()
@@ -794,7 +949,9 @@ def assert_managed_update(
         and generation_directories[0].name == generation_payload.parent.name,
         "successful update did not leave exactly the current generation",
     )
-    print("PASS: managed update committed a runnable pair and pruned non-current generations")
+    print(
+        "PASS: managed update retained mapped old backing, then pruned it on the next activation"
+    )
 
 
 def assert_managed_update_rejects_unrunnable_launcher_before_drain(
@@ -1040,14 +1197,244 @@ def assert_capability_probe_fail_hard(
     print("PASS: unsupported launcher capability failed hard before session drain")
 
 
+def install_managed(portable_payload, managed_dir, env, timeout=180):
+    return run(
+        [
+            portable_payload,
+            "install",
+            "--yes",
+            "--force",
+            "--skip-config",
+            "--dir",
+            managed_dir,
+        ],
+        env,
+        timeout=timeout,
+    )
+
+
+def stamp_fixture_owner_current(managed_dir, env):
+    """Give a hand-built managed fixture the current-user ownership a genuine
+    cbm install would stamp (windows_stamp_current_owner_private).  Runner images
+    default newly created files to the Administrators group, but the launcher's
+    exact-owner validators — the recovery-install path and the capability
+    probe's secure open of the target directory — (correctly) require the
+    current user, so an Administrators-owned fixture is an unfaithful simulation
+    of a real interrupted/partial install and must be re-owned."""
+    result = run(
+        ["icacls", str(managed_dir), "/setowner", os.environ.get("USERNAME", ""),
+         "/T", "/C", "/Q"],
+        env,
+    )
+    require(
+        result.returncode == 0,
+        "could not stamp current-user ownership on the managed fixture: %s"
+        % output_text(result)[-400:],
+    )
+
+
+def assert_partial_generation_recovery(
+    source_launcher, source_payload, portable_payload, env, work
+):
+    # A current-v1 record is the commit point. Once it references a generation,
+    # either missing half is corruption and install must fail without rewriting
+    # or deleting the valid half.
+    referenced = work / "referenced partial generation"
+    _, referenced_payload, referenced_backing = generation_paths(
+        referenced, source_payload
+    )
+    referenced_payload.parent.mkdir(parents=True)
+    shutil.copy2(source_payload, referenced_payload)
+    current = referenced / ".cbm" / "current-v1"
+    current_bytes = current_v1_record(source_payload)
+    current.write_bytes(current_bytes)
+    payload_bytes = referenced_payload.read_bytes()
+    rejected = install_managed(portable_payload, referenced, env, timeout=30)
+    require(rejected.returncode != 0, "install repaired a current-referenced partial generation")
+    require(current.read_bytes() == current_bytes, "failed partial repair changed current-v1")
+    require(
+        referenced_payload.read_bytes() == payload_bytes and not referenced_backing.exists(),
+        "failed current-referenced repair modified or deleted the valid half",
+    )
+
+    # A failed unreferenced repair owns only the leaf it successfully creates.
+    # A conflicting non-file at the missing leaf forces failure and the valid
+    # payload half must remain byte-identical.
+    blocked = work / "blocked partial generation repair"
+    _, blocked_payload, blocked_backing = generation_paths(blocked, source_payload)
+    blocked_payload.parent.mkdir(parents=True)
+    shutil.copy2(source_payload, blocked_payload)
+    blocked_bytes = blocked_payload.read_bytes()
+    blocked_backing.mkdir()
+    failed = install_managed(portable_payload, blocked, env, timeout=30)
+    require(failed.returncode != 0, "conflicting partial generation repair succeeded")
+    require(
+        blocked_payload.read_bytes() == blocked_bytes and blocked_backing.is_dir(),
+        "failed repair removed a pre-existing valid generation half",
+    )
+
+    # A launcher-first crash can leave the authenticated complete generation
+    # published at canonical before current-v1 is committed.  The exact-two
+    # hardlink is intentionally not runnable as a portable launcher; install
+    # must recognize and finish this one candidate without replacing either
+    # immutable half.
+    interrupted = work / "interrupted launcher-first initial install"
+    _, interrupted_payload, interrupted_backing = generation_paths(
+        interrupted, source_payload
+    )
+    interrupted_backing.parent.mkdir(parents=True)
+    shutil.copy2(source_payload, interrupted_payload)
+    shutil.copy2(source_launcher, interrupted_backing)
+    interrupted_launcher = interrupted / "codebase-memory-mcp.exe"
+    os.link(interrupted_backing, interrupted_launcher)
+    payload_bytes = interrupted_payload.read_bytes()
+    backing_bytes = interrupted_backing.read_bytes()
+    require(
+        interrupted_launcher.stat().st_nlink == 2
+        and not (interrupted / ".cbm" / "current-v1").exists(),
+        "interrupted launcher-first fixture is not exact pre-current state",
+    )
+    stamp_fixture_owner_current(interrupted, env)
+    recovered = install_managed(portable_payload, interrupted, env)
+    require(
+        recovered.returncode == 0,
+        "interrupted initial install recovery failed: %s"
+        % output_text(recovered)[-800:],
+    )
+    require(
+        interrupted_payload.read_bytes() == payload_bytes
+        and interrupted_backing.read_bytes() == backing_bytes,
+        "interrupted install recovery replaced an authenticated generation half",
+    )
+    find_and_validate_current(interrupted)
+    assert_managed_uninstall(interrupted_launcher, interrupted, env)
+
+    # The inverse safe partial (correct launcher backing, missing payload) is
+    # repaired in place, then canonical is published as its second hardlink.
+    launcher_only = work / "launcher-only partial generation"
+    _, launcher_only_payload, launcher_only_backing = generation_paths(
+        launcher_only, source_payload
+    )
+    launcher_only_backing.parent.mkdir(parents=True)
+    shutil.copy2(source_launcher, launcher_only_backing)
+    backing_bytes = launcher_only_backing.read_bytes()
+    stamp_fixture_owner_current(launcher_only, env)
+    repaired = install_managed(portable_payload, launcher_only, env)
+    require(
+        repaired.returncode == 0,
+        "launcher-only generation repair failed: %s" % output_text(repaired)[-800:],
+    )
+    require(
+        launcher_only_backing.read_bytes() == backing_bytes
+        and launcher_only_payload.is_file(),
+        "launcher-only repair replaced its valid half instead of adding the missing payload",
+    )
+    find_and_validate_current(launcher_only)
+    assert_managed_uninstall(
+        launcher_only / "codebase-memory-mcp.exe", launcher_only, env
+    )
+    print(
+        "PASS: generation repair is additive, launcher-first recovery completes, "
+        "and current-v1 corruption fails closed"
+    )
+
+
 def assert_managed_uninstall(launcher, managed_dir, env):
-    result = run([launcher, "uninstall", "--yes"], env, timeout=60)
+    result, observed, digest = run_uninstall_observing_retirement(
+        launcher, managed_dir, env
+    )
     require(result.returncode == 0, "managed uninstall failed: %s" % output_text(result)[-800:])
     require(not launcher.exists(), "managed uninstall returned before launcher removal")
-    state = managed_dir / ".cbm"
-    leftovers = [p for p in state.rglob("*") if p.is_file()] if state.exists() else []
-    require(not leftovers, "managed uninstall left generation/current files behind: %s" % leftovers)
-    print("PASS: managed uninstall synchronously removed launcher and generation state")
+    require(
+        observed,
+        "uninstall never exposed the authenticated SHA/PID retired-state commit",
+    )
+    deadline = time.monotonic() + 30
+    while retired_state_siblings(managed_dir, digest) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    require(
+        not retired_state_siblings(managed_dir, digest),
+        "launcher-owned detached cleanup did not remove the retired state after launcher exit",
+    )
+    require(
+        not (managed_dir / ".cbm").exists(),
+        "uninstall unexpectedly recreated the active .cbm state",
+    )
+    print("PASS: uninstall committed canonical unlink and cleaned only its retired SHA/PID state")
+
+
+def assert_failed_uninstall_restores_state(launcher, managed_dir, env):
+    current, current_before, _ = find_and_validate_current(managed_dir)
+    retired_before = set(retired_state_siblings(managed_dir))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    held_launcher = kernel32.CreateFileW(
+        str(launcher), 0x80000000, 0x00000001, None, 3, 0x80, None
+    )
+    require(held_launcher != INVALID_HANDLE_VALUE, "could not lock uninstall launcher fixture")
+    try:
+        result = run([launcher, "uninstall", "--yes"], env, timeout=60)
+    finally:
+        kernel32.CloseHandle(held_launcher)
+    require(result.returncode != 0, "share-blocked uninstall unexpectedly succeeded")
+    require(current.read_bytes() == current_before, "failed uninstall changed current-v1")
+    find_and_validate_current(managed_dir)
+    require(
+        set(retired_state_siblings(managed_dir)) == retired_before,
+        "failed canonical unlink did not restore its retired state directory",
+    )
+    require(
+        run([launcher, "--version"], env).returncode == 0,
+        "failed uninstall did not leave a runnable launcher/current pair",
+    )
+    print("PASS: failed final unlink restored active state only for the original launcher identity")
+
+
+def assert_uninstall_immediate_reinstall_safe(
+    launcher, managed_dir, portable_payload, env
+):
+    result, observed, digest = run_uninstall_observing_retirement(
+        launcher, managed_dir, env
+    )
+    require(result.returncode == 0, "pre-reinstall uninstall failed: %s" % output_text(result)[-800:])
+    require(observed, "immediate-reinstall test never observed retired state")
+    require(not launcher.exists(), "uninstall returned before canonical unlink")
+
+    reinstall = install_managed(portable_payload, managed_dir, env)
+    require(
+        reinstall.returncode == 0,
+        "immediate managed reinstall failed: %s" % output_text(reinstall)[-800:],
+    )
+    new_current, new_current_bytes, _ = find_and_validate_current(managed_dir)
+    deadline = time.monotonic() + 30
+    while retired_state_siblings(managed_dir, digest) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    require(
+        not retired_state_siblings(managed_dir, digest),
+        "detached cleanup did not remove its old retired state",
+    )
+    current_after, current_after_bytes, _ = find_and_validate_current(managed_dir)
+    require(
+        current_after == new_current and current_after_bytes == new_current_bytes,
+        "old detached cleanup deleted or replaced the immediate reinstall's new .cbm",
+    )
+    require(
+        run([launcher, "--version"], env).returncode == 0,
+        "old detached cleanup broke the immediately reinstalled launcher",
+    )
+    print("PASS: retired cleanup preserved an immediate concurrent-generation reinstall")
+    assert_managed_uninstall(launcher, managed_dir, env)
 
 
 def launcher_parent_probe_role():
@@ -1112,58 +1499,30 @@ def main():
         _, portable_payload = copy_portable_pair(
             source_launcher, source_payload, work / "portable-install"
         )
+        assert_partial_generation_recovery(
+            source_launcher, source_payload, portable_payload, env, work
+        )
         managed_dir = work / "managed café_日本語 with spaces"
-        # Reproduce the only durable partial state in a fresh launcher-first
-        # publication: the canonical launcher rename completed, then the
-        # process died before current-v1 was published. A retry must repair an
-        # exact private candidate, while the native preflight still rejects an
-        # unrelated conflicting launcher.
-        managed_dir.mkdir(parents=True)
-        interrupted_launcher = managed_dir / "codebase-memory-mcp.exe"
-        shutil.copy2(abi_mismatch_launcher, interrupted_launcher)
-        conflict = run(
-            [
-                portable_payload,
-                "install",
-                "--yes",
-                "--force",
-                "--skip-config",
-                "--dir",
-                managed_dir,
-            ],
-            env,
-            timeout=30,
-        )
-        require(
-            conflict.returncode != 0,
-            "fresh install accepted an unrelated launcher-only conflict",
-        )
-        require(
-            sha256_file(interrupted_launcher) == sha256_file(abi_mismatch_launcher),
-            "rejected launcher-only conflict was modified",
-        )
-        shutil.copy2(source_launcher, interrupted_launcher)
-        install = run(
-            [
-                portable_payload,
-                "install",
-                "--yes",
-                "--force",
-                "--skip-config",
-                "--dir",
-                managed_dir,
-            ],
-            env,
-            timeout=60,
-        )
+        # The other safe partial (correct payload, missing launcher backing) is
+        # the main managed fixture. Install must add only the missing half and
+        # publish canonical as its second link.
+        _, payload_half, backing_half = generation_paths(managed_dir, source_payload)
+        payload_half.parent.mkdir(parents=True)
+        shutil.copy2(source_payload, payload_half)
+        payload_half_bytes = payload_half.read_bytes()
+        stamp_fixture_owner_current(managed_dir, env)
+        install = install_managed(portable_payload, managed_dir, env)
         require(install.returncode == 0, "managed install failed: %s" % output_text(install)[-800:])
+        require(
+            payload_half.read_bytes() == payload_half_bytes and backing_half.is_file(),
+            "payload-only repair replaced its valid half instead of adding the launcher",
+        )
 
         launcher = managed_dir / "codebase-memory-mcp.exe"
         require(launcher.is_file(), "managed custom path has no canonical launcher")
         current, current_bytes, generation_payload = find_and_validate_current(managed_dir)
         print(
-            "PASS: interrupted fresh install recovered into a strict current-v1 "
-            "generation layout"
+            "PASS: payload-only generation recovered into strict hardlink/current-v1 layout"
         )
 
         assert_launcher_relay(launcher, generation_payload, env, cache)
@@ -1206,7 +1565,10 @@ def main():
         assert_capability_probe_fail_hard(
             source_launcher, source_payload, launcher, env, cache, work
         )
-        assert_managed_uninstall(launcher, managed_dir, env)
+        assert_failed_uninstall_restores_state(launcher, managed_dir, env)
+        assert_uninstall_immediate_reinstall_safe(
+            launcher, managed_dir, portable_payload, env
+        )
         print("\nGREEN: permanent Windows launcher contract honored.")
         return 0
     except (GuardFailure, McpError, OSError, subprocess.SubprocessError) as exc:

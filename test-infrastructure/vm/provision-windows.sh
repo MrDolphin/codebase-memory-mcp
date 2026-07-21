@@ -86,6 +86,19 @@ if [ "${1:-}" != "--update" ]; then
         mingw-w64-clang-aarch64-python mingw-w64-clang-aarch64-ccache \
         mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-compiler-rt \
         mingw-w64-clang-x86_64-zlib mingw-w64-clang-x86_64-ccache"
+
+    step "3b/6 official Node.js + VC++ runtime (guards UI build)"
+    # MSVC-built npm native modules (rollup) cannot resolve Node-API symbols
+    # against MSYS2's mingw node, and they need the VC++ runtime. Pinned
+    # official builds, hash/signature-verified.
+    NODE_VERSION="v22.23.1"
+    NODE_SHA256="b470fdfe3502c05151656e06d495e3f47544f2ee8b1d9c8705090f2dd5996bd0"
+    if ! vm_cmd "if exist C:\\node\\node.exe echo NODE_PRESENT" | grep -q NODE_PRESENT; then
+        vm_cmd "powershell -NoProfile -Command \"\$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-win-arm64.zip' -OutFile C:\\node.zip; \$actual=(Get-FileHash -LiteralPath C:\\node.zip -Algorithm SHA256).Hash.ToLowerInvariant(); if (\$actual -ne '${NODE_SHA256}') { Remove-Item C:\\node.zip; throw 'node SHA-256 mismatch' }; Expand-Archive -LiteralPath C:\\node.zip -DestinationPath C:\\; Move-Item C:\\node-${NODE_VERSION}-win-arm64 C:\\node; Remove-Item C:\\node.zip\""
+    fi
+    if ! vm_cmd "if exist C:\\Windows\\System32\\vcruntime140.dll echo VCR_PRESENT" | grep -q VCR_PRESENT; then
+        vm_cmd "powershell -NoProfile -Command \"\$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.arm64.exe' -OutFile C:\\vc_redist.arm64.exe; \$sig = Get-AuthenticodeSignature C:\\vc_redist.arm64.exe; if (\$sig.Status -ne 'Valid') { throw 'vc_redist unsigned' }; Start-Process C:\\vc_redist.arm64.exe -ArgumentList '/install','/quiet','/norestart' -Wait; Remove-Item C:\\vc_redist.arm64.exe\""
+    fi
 fi
 
 step "4/6 repo clone/update -> /c/cbm @ ${BRANCH}"

@@ -21,6 +21,7 @@ int tf_skip_count = 0;
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
 #include <sqlite3.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,8 +47,37 @@ int tf_skip_count = 0;
  * unwind after either production containment or the test's verified backstop. */
 #define TF_BLOCKING_GIT_MARKER_ENV "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE"
 
+#ifdef _WIN32
+static bool tf_invoked_as_windows_git_module(void) {
+    /* CreateProcessW authenticates the executable with lpApplicationName, but
+     * the child CRT derives argv[0] from the separately supplied command line.
+     * Inspect the actual loaded module so the copied git.exe probe cannot fall
+     * through into the ordinary test runner when argv[0] is merely "git". */
+    wchar_t image[32768];
+    DWORD image_length =
+        GetModuleFileNameW(NULL, image, (DWORD)(sizeof(image) / sizeof(image[0])));
+    if (image_length == 0 || image_length >= (DWORD)(sizeof(image) / sizeof(image[0]))) {
+        return false;
+    }
+    const wchar_t *base = image;
+    for (const wchar_t *cursor = image; *cursor; cursor++) {
+        if (*cursor == L'/' || *cursor == L'\\') {
+            base = cursor + 1;
+        }
+    }
+    return CompareStringOrdinal(base, -1, L"git.exe", -1, TRUE) == CSTR_EQUAL;
+}
+#endif
+
 static bool tf_invoked_as_blocking_git(const char *argv0) {
-    if (!argv0 || !argv0[0] || !getenv(TF_BLOCKING_GIT_MARKER_ENV)) {
+    if (!getenv(TF_BLOCKING_GIT_MARKER_ENV)) {
+        return false;
+    }
+#ifdef _WIN32
+    (void)argv0;
+    return tf_invoked_as_windows_git_module();
+#else
+    if (!argv0 || !argv0[0]) {
         return false;
     }
     const char *base = argv0;
@@ -56,7 +86,9 @@ static bool tf_invoked_as_blocking_git(const char *argv0) {
             base = cursor + 1;
         }
     }
-    return strcmp(base, "git") == 0 || strcmp(base, "git.exe") == 0 || strcmp(base, "GIT.EXE") == 0;
+    return strcmp(base, "git") == 0 || strcmp(base, "git.exe") == 0 ||
+           strcmp(base, "GIT.EXE") == 0;
+#endif
 }
 
 #ifdef _WIN32
@@ -67,15 +99,38 @@ static BOOL WINAPI tf_blocking_git_control_handler(DWORD event) {
 
 static int tf_maybe_run_blocking_git_probe(int argc, char **argv) {
     (void)argc;
+#ifdef _WIN32
+    bool windows_git_module = tf_invoked_as_windows_git_module();
+    if (windows_git_module && !getenv(TF_BLOCKING_GIT_MARKER_ENV)) {
+        (void)puts("TF_BLOCKING_GIT_DIAGNOSTIC marker_environment_missing");
+        (void)fflush(stdout);
+        return 32;
+    }
+#endif
     if (!argv || !tf_invoked_as_blocking_git(argv[0])) {
         return -1;
     }
     const char *marker_path = getenv(TF_BLOCKING_GIT_MARKER_ENV);
+    errno = 0;
+#ifdef _WIN32
+    SetLastError(ERROR_SUCCESS);
+#endif
     FILE *marker = cbm_fopen(marker_path, "wbx");
     if (!marker) {
         /* The first invocation already owns the blocking role. detect_changes
          * runs two more git commands after it terminates; those must not block. */
+#ifdef _WIN32
+        int marker_errno = errno;
+        DWORD marker_error = GetLastError();
+        bool marker_exists = cbm_file_exists(marker_path);
+        (void)printf("TF_BLOCKING_GIT_DIAGNOSTIC marker_open_failed errno=%d win_error=%lu "
+                     "exists=%d\n",
+                     marker_errno, (unsigned long)marker_error, marker_exists ? 1 : 0);
+        (void)fflush(stdout);
+        return marker_exists ? 0 : 30;
+#else
         return cbm_file_exists(marker_path) ? 0 : 30;
+#endif
     }
 #ifdef _WIN32
     unsigned long long process_id = (unsigned long long)GetCurrentProcessId();
@@ -511,8 +566,29 @@ static bool suite_requested(const char *name) {
  * guard compares against it. */
 static bool g_list_only = false;
 
+/* CBM_SKIP_PERF=1 excludes throughput/scale/perf-metric suites from the run.
+ * The fidelity pass (CBM_LOCAL_CI_CPUS=4) and CI PRs set it: those suites
+ * measure performance, which is meaningless under artificial CPU starvation,
+ * and they dominate wall-clock. Correctness coverage is unaffected — the perf
+ * suites run at full power in the perf/release legs (CBM_SKIP_PERF unset). The
+ * skip applies to BOTH --list-suites and the run through the same macro, so
+ * the shard union guard stays consistent. */
+static bool g_skip_perf = false;
+
 #define RUN_SELECTED_SUITE(name)             \
     do {                                     \
+        if (g_list_only) {                   \
+            printf("%s\n", #name);           \
+        } else if (suite_requested(#name)) { \
+            RUN_SUITE(name);                 \
+        }                                    \
+    } while (0)
+
+#define RUN_SELECTED_SUITE_PERF(name)        \
+    do {                                     \
+        if (g_skip_perf) {                   \
+            break;                           \
+        }                                    \
         if (g_list_only) {                   \
             printf("%s\n", #name);           \
         } else if (suite_requested(#name)) { \
@@ -528,6 +604,7 @@ extern void suite_str_intern(void);
 extern void suite_log(void);
 extern void suite_str_util(void);
 extern void suite_platform(void);
+extern void suite_diagnostics(void);
 extern void suite_subprocess(void);
 extern void suite_private_file_lock(void);
 extern void suite_lock_registry(void);
@@ -728,6 +805,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    const char *skip_perf_env = getenv("CBM_SKIP_PERF");
+    g_skip_perf = skip_perf_env != NULL && strcmp(skip_perf_env, "1") == 0;
     if (argc == 2 && strcmp(argv[1], "--list-suites") == 0) {
         g_list_only = true;
         g_suite_argc = 1; /* no suite-name args to match */
@@ -754,6 +833,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(log);
     RUN_SELECTED_SUITE(str_util);
     RUN_SELECTED_SUITE(platform);
+    RUN_SELECTED_SUITE(diagnostics);
     RUN_SELECTED_SUITE(subprocess);
     RUN_SELECTED_SUITE(private_file_lock);
     RUN_SELECTED_SUITE(lock_registry);
@@ -834,14 +914,14 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(c_lsp);
     RUN_SELECTED_SUITE(php_lsp);
     RUN_SELECTED_SUITE(cs_lsp);
-    RUN_SELECTED_SUITE(cs_lsp_bench);
+    RUN_SELECTED_SUITE_PERF(cs_lsp_bench);
     RUN_SELECTED_SUITE(perl_lsp);
     RUN_SELECTED_SUITE(py_lsp);
     RUN_SELECTED_SUITE(kotlin_lsp);
     RUN_SELECTED_SUITE(rust_lsp);
-    RUN_SELECTED_SUITE(py_lsp_bench);
+    RUN_SELECTED_SUITE_PERF(py_lsp_bench);
     RUN_SELECTED_SUITE(py_lsp_stress);
-    RUN_SELECTED_SUITE(py_lsp_scale);
+    RUN_SELECTED_SUITE_PERF(py_lsp_scale);
     RUN_SELECTED_SUITE(ts_lsp);
     RUN_SELECTED_SUITE(java_lsp);
     RUN_SELECTED_SUITE(java_lsp_coverage);
@@ -926,7 +1006,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(grammar_probe_f);
     RUN_SELECTED_SUITE(grammar_probe_g);
 
-    RUN_SELECTED_SUITE(incremental);
+    RUN_SELECTED_SUITE_PERF(incremental);
 
     if (g_list_only) {
         fflush(stdout);

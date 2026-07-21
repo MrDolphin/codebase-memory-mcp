@@ -117,9 +117,18 @@ char *cbm_mkdtemp(char *tmpl);
 /* ── mkstemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl);
+
 #else
 #define cbm_mkstemp mkstemp
 #endif
+
+/* Rewrite an absolute path into the form the platform's file APIs accept at
+ * any length. On Windows, absolute drive paths beyond the legacy 260-char
+ * limit are canonicalized and given the extended-length \\?\ prefix
+ * (SQLite passes such UTF-8 paths through to CreateFileW unchanged). On
+ * POSIX, the path is copied verbatim. Returns false if the buffer is too
+ * small or the path cannot be canonicalized. */
+bool cbm_path_for_file_api(const char *path, char *out, size_t out_size);
 
 /* ── setenv / unsetenv (Windows lacks them) ──────────────────── */
 #ifdef _WIN32

@@ -150,9 +150,18 @@ static bool launcher_file_information(HANDLE file, BY_HANDLE_FILE_INFORMATION *i
                              (unsigned long)information->dwFileAttributes);
         return false;
     }
-    if (information->nNumberOfLinks != 1U) {
-        launcher_refusal_set(L"hard-link count %lu, expected 1",
-                             (unsigned long)information->nNumberOfLinks);
+    return true;
+}
+
+static bool launcher_file_information_links(HANDLE file, BY_HANDLE_FILE_INFORMATION *information,
+                                            DWORD expected_links) {
+    if (!launcher_file_information(file, information)) {
+        return false;
+    }
+    if (information->nNumberOfLinks != expected_links) {
+        launcher_refusal_set(L"hard-link count %lu, expected %lu",
+                             (unsigned long)information->nNumberOfLinks,
+                             (unsigned long)expected_links);
         return false;
     }
     return true;
@@ -333,19 +342,30 @@ static bool launcher_security_is_trusted(HANDLE file) {
     return launcher_security_is_safe(file, false, launcher_private_mutation_rights());
 }
 
-static HANDLE launcher_open_regular(const wchar_t *path, DWORD access, bool require_private) {
+static HANDLE launcher_open_regular_links(const wchar_t *path, DWORD access, bool require_private,
+                                          DWORD expected_links) {
     HANDLE file =
         CreateFileW(path, access | FILE_READ_ATTRIBUTES | (require_private ? READ_CONTROL : 0U),
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     BY_HANDLE_FILE_INFORMATION information;
-    if (!launcher_file_information(file, &information) ||
-        (require_private && !launcher_security_is_trusted(file))) {
+    bool valid = launcher_file_information(file, &information);
+    if (valid && expected_links != 0U && information.nNumberOfLinks != expected_links) {
+        launcher_refusal_set(L"hard-link count %lu, expected %lu",
+                             (unsigned long)information.nNumberOfLinks,
+                             (unsigned long)expected_links);
+        valid = false;
+    }
+    if (!valid || (require_private && !launcher_security_is_trusted(file))) {
         if (file != INVALID_HANDLE_VALUE)
             (void)CloseHandle(file);
         return INVALID_HANDLE_VALUE;
     }
     return file;
+}
+
+static HANDLE launcher_open_regular(const wchar_t *path, DWORD access, bool require_private) {
+    return launcher_open_regular_links(path, access, require_private, 1U);
 }
 
 static HANDLE launcher_open_directory_private(const wchar_t *path) {
@@ -445,10 +465,37 @@ static bool launcher_path_tree_plain(const wchar_t *file_path) {
     return valid;
 }
 
+/* Canonical, file-API-safe self path: drive-absolute module paths always get
+ * the extended-length prefix. A managed install can live past MAX_PATH, and
+ * every derived path (generations, current-v1, payload spawn) plus the
+ * ancestry walk inherits this form, exactly like the CLI side. */
+static bool launcher_self_path_canonicalize(wchar_t path[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
+    wchar_t resolved[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    DWORD length = GetFullPathNameW(path, CBM_WINDOWS_LAUNCHER_PATH_CAP, resolved, NULL);
+    if (length == 0 || length >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+        return false;
+    }
+    bool already_prefixed = wcsncmp(resolved, L"\\\\?\\", 4) == 0;
+    bool drive_absolute = !already_prefixed &&
+                          ((resolved[0] >= L'A' && resolved[0] <= L'Z') ||
+                           (resolved[0] >= L'a' && resolved[0] <= L'z')) &&
+                          resolved[1] == L':' && resolved[2] == L'\\';
+    if (drive_absolute) {
+        if (length + 5U >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+            return false;
+        }
+        wmemcpy(path, L"\\\\?\\", 4);
+        wmemcpy(path + 4, resolved, length + 1U);
+    } else {
+        wmemcpy(path, resolved, length + 1U);
+    }
+    return true;
+}
+
 static bool launcher_self_path(wchar_t output[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
     DWORD length = GetModuleFileNameW(NULL, output, CBM_WINDOWS_LAUNCHER_PATH_CAP);
     return length > 3U && length < CBM_WINDOWS_LAUNCHER_PATH_CAP &&
-           launcher_path_tree_plain(output);
+           launcher_self_path_canonicalize(output) && launcher_path_tree_plain(output);
 }
 
 static bool launcher_parent_path(const wchar_t *path, wchar_t *output, size_t capacity) {
@@ -464,6 +511,133 @@ static bool launcher_parent_path(const wchar_t *path, wchar_t *output, size_t ca
         return false;
     *separator = L'\0';
     return true;
+}
+
+/* The uninstall payload atomically retires .cbm to one authenticated
+ * SHA/PID-qualified sibling before unlinking canonical.  Delete only that
+ * immutable basename after the payload and this mapped launcher have exited;
+ * a concurrent reinstall's new .cbm is never named by this command. */
+static bool launcher_schedule_managed_cleanup(const wchar_t *canonical_launcher,
+                                              const cbm_windows_current_v1_t *state,
+                                              DWORD payload_pid) {
+    wchar_t install_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t retired_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t retired_parent[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    if (!state || payload_pid == 0U ||
+        !launcher_parent_path(canonical_launcher, install_directory,
+                              CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !cbm_windows_retired_state_path(canonical_launcher, state->payload_sha256,
+                                        (uint32_t)payload_pid, retired_directory,
+                                        CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !launcher_parent_path(retired_directory, retired_parent, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        _wcsicmp(install_directory, retired_parent) != 0) {
+        launcher_refusal_set(L"could not resolve the install directory for cleanup");
+        return false;
+    }
+    const wchar_t *retired_basename = wcsrchr(retired_directory, L'\\');
+    const wchar_t *retired_slash = wcsrchr(retired_directory, L'/');
+    if (!retired_basename || (retired_slash && retired_slash > retired_basename))
+        retired_basename = retired_slash;
+    retired_basename = retired_basename ? retired_basename + 1 : NULL;
+    DWORD canonical_attributes = GetFileAttributesW(canonical_launcher);
+    DWORD canonical_error =
+        canonical_attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    bool canonical_absent =
+        canonical_attributes == INVALID_FILE_ATTRIBUTES &&
+        (canonical_error == ERROR_FILE_NOT_FOUND || canonical_error == ERROR_PATH_NOT_FOUND);
+    wchar_t replacement_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    char replacement_error[128] = {0};
+    bool canonical_is_new_managed =
+        canonical_attributes != INVALID_FILE_ATTRIBUTES &&
+        cbm_windows_managed_launcher_backing(canonical_launcher, replacement_backing,
+                                             CBM_WINDOWS_LAUNCHER_PATH_CAP, replacement_error,
+                                             sizeof(replacement_error));
+    HANDLE install = launcher_open_directory_private(install_directory);
+    HANDLE retired = launcher_open_directory_private(retired_directory);
+    bool private_cwd =
+        retired_basename && retired_basename[0] && wcschr(retired_basename, L'\\') == NULL &&
+        wcschr(retired_basename, L'/') == NULL && (canonical_absent || canonical_is_new_managed) &&
+        install != INVALID_HANDLE_VALUE && retired != INVALID_HANDLE_VALUE;
+    if (install != INVALID_HANDLE_VALUE)
+        (void)CloseHandle(install);
+    if (retired != INVALID_HANDLE_VALUE)
+        (void)CloseHandle(retired);
+    if (!private_cwd) {
+        launcher_refusal_set(
+            L"retired cleanup tree or concurrent managed reinstall validation failed");
+        return false;
+    }
+
+    wchar_t system_directory[MAX_PATH + 1U];
+    UINT system_length = GetSystemDirectoryW(system_directory, MAX_PATH + 1U);
+    wchar_t command_path[MAX_PATH + 16U];
+    wchar_t delay_path[MAX_PATH + 16U];
+    int command_path_written =
+        system_length > 0U && system_length <= MAX_PATH
+            ? swprintf(command_path, sizeof(command_path) / sizeof(command_path[0]),
+                       L"%ls\\cmd.exe", system_directory)
+            : -1;
+    int delay_path_written = system_length > 0U && system_length <= MAX_PATH
+                                 ? swprintf(delay_path, sizeof(delay_path) / sizeof(delay_path[0]),
+                                            L"%ls\\ping.exe", system_directory)
+                                 : -1;
+    HANDLE command_file =
+        command_path_written > 0 &&
+                (size_t)command_path_written < sizeof(command_path) / sizeof(command_path[0])
+            ? launcher_open_regular_links(command_path, GENERIC_READ, true, 0U)
+            : INVALID_HANDLE_VALUE;
+    HANDLE delay_file = delay_path_written > 0 && (size_t)delay_path_written <
+                                                      sizeof(delay_path) / sizeof(delay_path[0])
+                            ? launcher_open_regular_links(delay_path, GENERIC_READ, true, 0U)
+                            : INVALID_HANDLE_VALUE;
+    if (command_file == INVALID_HANDLE_VALUE || delay_file == INVALID_HANDLE_VALUE) {
+        if (command_file != INVALID_HANDLE_VALUE)
+            (void)CloseHandle(command_file);
+        if (delay_file != INVALID_HANDLE_VALUE)
+            (void)CloseHandle(delay_file);
+        launcher_refusal_set(L"trusted absolute System32 cleanup utilities failed validation");
+        return false;
+    }
+    (void)CloseHandle(command_file);
+    (void)CloseHandle(delay_file);
+
+    wchar_t mutable_command[2048];
+    int cleanup_written =
+        swprintf(mutable_command, sizeof(mutable_command) / sizeof(mutable_command[0]),
+                 L"\"%ls\" /d /q /e:on /c \"for /l %%i in (1,1,120) do @(rd /s /q %ls "
+                 L"2>nul&if not exist %ls exit /b 0&\"%ls\" -n 2 -w 1000 127.0.0.1 "
+                 L">nul)&exit /b 1\"",
+                 command_path, retired_basename, retired_basename, delay_path);
+    if (cleanup_written <= 0 ||
+        (size_t)cleanup_written >= sizeof(mutable_command) / sizeof(mutable_command[0])) {
+        launcher_refusal_set(L"detached retired-state cleanup command is too long");
+        return false;
+    }
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION child;
+    memset(&startup, 0, sizeof(startup));
+    memset(&child, 0, sizeof(child));
+    startup.cb = sizeof(startup);
+    DWORD flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
+    /* CreateProcessW's lpCurrentDirectory is a Win32 path and does NOT accept the
+     * \\?\ extended-length prefix. install_directory is canonicalized with that
+     * prefix, so passing it verbatim leaves the detached process in an
+     * unintended working directory — the relative `rd <basename>` then deletes
+     * nothing while `if not exist <basename>` trivially succeeds. Strip it. */
+    const wchar_t *cleanup_cwd =
+        wcsncmp(install_directory, L"\\\\?\\", 4) == 0 ? install_directory + 4 : install_directory;
+    bool spawned = CreateProcessW(command_path, mutable_command, NULL, NULL, FALSE, flags, NULL,
+                                  cleanup_cwd, &startup, &child) != 0;
+    DWORD spawn_error = spawned ? ERROR_SUCCESS : GetLastError();
+    if (child.hThread)
+        (void)CloseHandle(child.hThread);
+    if (child.hProcess)
+        (void)CloseHandle(child.hProcess);
+    if (!spawned) {
+        launcher_refusal_set(L"detached System32 cleanup spawn failed (error %lu)",
+                             (unsigned long)spawn_error);
+    }
+    return spawned;
 }
 
 static bool launcher_read_all(HANDLE file, void *buffer, size_t size) {
@@ -809,6 +983,108 @@ static bool launcher_posix_remove(HANDLE file) {
                                       sizeof(disposition)) != 0;
 }
 
+typedef struct {
+    DWORD Flags;
+    HANDLE RootDirectory;
+    DWORD FileNameLength;
+    WCHAR FileName[1];
+} launcher_rename_info_ex_t;
+
+#define LAUNCHER_FILE_RENAME_INFO_EX ((FILE_INFO_BY_HANDLE_CLASS)22)
+#define LAUNCHER_FILE_RENAME_REPLACE 0x00000001U
+#define LAUNCHER_FILE_RENAME_POSIX 0x00000002U
+
+/* POSIX-semantics rename by handle. Renaming a MAPPED (executing) image is
+ * legal even though deleting one is not — the retirement path below relies on
+ * this to free the staged activation name while the payload still runs. */
+static bool launcher_posix_rename(HANDLE file, const wchar_t *target_path) {
+    /* The name travels verbatim to NtSetInformationFile, where the Win32
+     * \\?\\ prefix is not a valid name; a plain drive path is accepted at
+     * any length (no MAX_PATH at the NT layer). */
+    if (wcsncmp(target_path, L"\\\\?\\", 4) == 0) {
+        target_path += 4;
+    }
+    size_t chars = wcslen(target_path);
+    if (chars == 0U || chars > (size_t)UINT32_MAX / sizeof(wchar_t)) {
+        return false;
+    }
+
+    size_t bytes = chars * sizeof(wchar_t);
+    /* Allocate one extra WCHAR and NUL-terminate the name. FileNameLength
+     * governs per the contract, but antivirus/filter drivers on this kernel
+     * read the FileName as NUL-terminated: with an exactly-sized buffer they
+     * append adjacent heap bytes to the created name (a flaky, garbage-suffixed
+     * or ERROR_INVALID_NAME rename). The terminator bounds them to the name. */
+    size_t allocation = offsetof(launcher_rename_info_ex_t, FileName) + bytes + sizeof(wchar_t);
+    launcher_rename_info_ex_t *rename = calloc(1U, allocation);
+    if (!rename) {
+        return false;
+    }
+    rename->Flags = LAUNCHER_FILE_RENAME_POSIX | LAUNCHER_FILE_RENAME_REPLACE;
+    rename->RootDirectory = NULL;
+    rename->FileNameLength = (DWORD)bytes;
+    memcpy(rename->FileName, target_path, bytes);
+    rename->FileName[chars] = L'\0';
+    /* First-touch antivirus scanning (Defender filter drivers) transiently
+     * vetoes renames of trees holding a just-created executable — observed as
+     * ERROR_INVALID_NAME on a name that is provably valid moments later, and
+     * classically as ACCESS_DENIED/SHARING_VIOLATION. Freshly built or
+     * downloaded binaries are always cold, so first-run installs must absorb
+     * the scan window with a bounded backoff. */
+    bool renamed = false;
+    DWORD last_error = ERROR_SUCCESS;
+    for (DWORD wait_ms = 0U, waited_ms = 0U;; waited_ms += wait_ms) {
+        renamed = SetFileInformationByHandle(file, LAUNCHER_FILE_RENAME_INFO_EX, rename,
+                                             (DWORD)allocation) != 0;
+        if (renamed) {
+            break;
+        }
+        last_error = GetLastError();
+        bool transient = last_error == ERROR_INVALID_NAME || last_error == ERROR_ACCESS_DENIED ||
+                         last_error == ERROR_SHARING_VIOLATION;
+        if (!transient || waited_ms >= 2000U) {
+            break;
+        }
+        wait_ms = wait_ms == 0U ? 100U : (wait_ms < 1000U ? wait_ms * 2U : wait_ms);
+        Sleep(wait_ms);
+    }
+    free(rename);
+    if (!renamed) {
+        SetLastError(last_error);
+    }
+    return renamed;
+}
+
+/* Retire the running staged image: direct POSIX delete succeeds only for an
+ * unmapped file — Windows refuses a delete disposition on a mapped image. A
+ * mapped image is instead renamed OUT of the .cbm state tree to the install
+ * root: a mapped file blocks the rename of every ancestor directory, so a
+ * retired image left inside .cbm\runtime would wedge the uninstall's atomic
+ * state retirement. The install root stays on the same volume (rename-info
+ * cannot cross volumes) and later launcher runs sweep *.retired there. */
+static bool launcher_retire_running_image(HANDLE file, const wchar_t *image_path) {
+    if (launcher_posix_remove(file)) {
+        return true;
+    }
+    wchar_t runtime_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t state_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t install_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    if (!launcher_parent_path(image_path, runtime_directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !launcher_parent_path(runtime_directory, state_directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !launcher_parent_path(state_directory, install_directory, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+        return false;
+    }
+    wchar_t retired[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    int written =
+        swprintf(retired, CBM_WINDOWS_LAUNCHER_PATH_CAP, L"%ls\\activation-%lu-%llu.retired",
+                 install_directory, (unsigned long)GetCurrentProcessId(),
+                 (unsigned long long)GetTickCount64());
+    if (written <= 0 || (size_t)written >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+        return false;
+    }
+    return launcher_posix_rename(file, retired);
+}
+
 static int launcher_spawn_payload(const wchar_t *execution_path, const wchar_t *canonical_launcher,
                                   bool managed, bool private_activation,
                                   cbm_windows_launcher_action_t action,
@@ -876,6 +1152,7 @@ static int launcher_spawn_payload(const wchar_t *execution_path, const wchar_t *
                    environment_set &&
                    CreateProcessW(execution_path, command, NULL, NULL, TRUE, flags, NULL, NULL,
                                   &startup.StartupInfo, &child) != 0;
+    DWORD payload_pid = created ? child.dwProcessId : 0U;
     (void)SetEnvironmentVariableW(LAUNCHER_CONTEXT_ENV, NULL);
     if (attribute_initialized)
         DeleteProcThreadAttributeList(attributes);
@@ -899,10 +1176,27 @@ static int launcher_spawn_payload(const wchar_t *execution_path, const wchar_t *
     HANDLE private_file = INVALID_HANDLE_VALUE;
     bool private_removed = true;
     if (payload_ready && private_activation) {
-        private_file =
-            launcher_open_regular(execution_path, GENERIC_READ | GENERIC_WRITE | DELETE, true);
-        private_removed =
-            private_file != INVALID_HANDLE_VALUE && launcher_posix_remove(private_file);
+        /* DELETE only, never GENERIC_WRITE: the payload is RUNNING from this
+         * staged image, and the image section always denies write sharing
+         * (ERROR_SHARING_VIOLATION). */
+        private_file = launcher_open_regular(execution_path, GENERIC_READ | DELETE, true);
+        if (private_file == INVALID_HANDLE_VALUE) {
+            /* Surfaced on the inherited stderr: the payload's generic
+             * completion error cannot say WHICH launcher-side step refused. */
+            (void)fwprintf(stderr,
+                           L"codebase-memory-mcp-launcher: private staged copy failed secure "
+                           L"open (%ls; error %lu): %ls\n",
+                           launcher_refusal_detail[0] ? launcher_refusal_detail : L"no detail",
+                           (unsigned long)GetLastError(), execution_path);
+        }
+        private_removed = private_file != INVALID_HANDLE_VALUE &&
+                          launcher_retire_running_image(private_file, execution_path);
+        if (private_file != INVALID_HANDLE_VALUE && !private_removed) {
+            (void)fwprintf(stderr,
+                           L"codebase-memory-mcp-launcher: private staged copy retirement failed "
+                           L"(error %lu): %ls\n",
+                           (unsigned long)GetLastError(), execution_path);
+        }
     }
     uint8_t handshake_result = private_removed ? (uint8_t)'G' : (uint8_t)'F';
     bool authenticated = payload_ready &&
@@ -937,6 +1231,14 @@ static int launcher_spawn_payload(const wchar_t *execution_path, const wchar_t *
     if (job)
         (void)CloseHandle(job);
     launcher_context_pipe_close(&context_pipe);
+    if (exit_valid && exit_code == 0U && managed &&
+        action == CBM_WINDOWS_LAUNCHER_ACTION_UNINSTALL &&
+        !launcher_schedule_managed_cleanup(canonical_launcher, state, payload_pid)) {
+        return launcher_failure(
+            L"uninstall removed the canonical launcher, but detached retired-state cleanup could "
+            L"not be scheduled; after this process exits, remove the matching .cbm-retired-v1 "
+            L"directory manually");
+    }
     return exit_valid ? (int)exit_code : 1;
 }
 
@@ -1024,6 +1326,93 @@ static bool launcher_private_payload_path(const wchar_t *canonical_launcher, con
         (void)CloseHandle(state_handle);
     if (runtime_handle != INVALID_HANDLE_VALUE)
         (void)CloseHandle(runtime_handle);
+    if (directories_valid) {
+        /* Best-effort stale sweep: earlier activations' staged copies and
+         * .retired images become deletable once their payload exits. Entries
+         * whose embedded pid is still alive are skipped (a concurrent
+         * activation owns them); still-mapped leftovers fail the delete
+         * harmlessly and are retried on the next run. */
+        wchar_t sweep_pattern[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+        WIN32_FIND_DATAW stale;
+        int sweep_written =
+            swprintf(sweep_pattern, CBM_WINDOWS_LAUNCHER_PATH_CAP, L"%ls\\activation-*", runtime);
+        HANDLE search = sweep_written > 0 && (size_t)sweep_written < CBM_WINDOWS_LAUNCHER_PATH_CAP
+                            ? FindFirstFileW(sweep_pattern, &stale)
+                            : INVALID_HANDLE_VALUE;
+        if (search != INVALID_HANDLE_VALUE) {
+            do {
+                unsigned long stale_pid = 0U;
+                if ((stale.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+                    swscanf(stale.cFileName, L"activation-%lu-", &stale_pid) != 1 ||
+                    stale_pid == (unsigned long)GetCurrentProcessId()) {
+                    continue;
+                }
+                HANDLE owner =
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)stale_pid);
+                bool owner_alive = owner && WaitForSingleObject(owner, 0U) == WAIT_TIMEOUT;
+                if (owner)
+                    (void)CloseHandle(owner);
+                if (owner_alive) {
+                    continue;
+                }
+                wchar_t stale_path[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+                int stale_written = swprintf(stale_path, CBM_WINDOWS_LAUNCHER_PATH_CAP, L"%ls\\%ls",
+                                             runtime, stale.cFileName);
+                if (stale_written <= 0 || (size_t)stale_written >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+                    continue;
+                }
+                HANDLE stale_file =
+                    CreateFileW(stale_path, DELETE | FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+                if (stale_file != INVALID_HANDLE_VALUE) {
+                    (void)launcher_posix_remove(stale_file);
+                    (void)CloseHandle(stale_file);
+                }
+            } while (FindNextFileW(search, &stale));
+            (void)FindClose(search);
+        }
+        /* Second pass: retired mapped images live at the INSTALL root (see
+         * launcher_retire_running_image); same liveness-guarded delete. */
+        sweep_written = swprintf(sweep_pattern, CBM_WINDOWS_LAUNCHER_PATH_CAP,
+                                 L"%ls\\activation-*.retired", directory);
+        search = sweep_written > 0 && (size_t)sweep_written < CBM_WINDOWS_LAUNCHER_PATH_CAP
+                     ? FindFirstFileW(sweep_pattern, &stale)
+                     : INVALID_HANDLE_VALUE;
+        if (search != INVALID_HANDLE_VALUE) {
+            do {
+                unsigned long stale_pid = 0U;
+                if ((stale.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+                    swscanf(stale.cFileName, L"activation-%lu-", &stale_pid) != 1 ||
+                    stale_pid == (unsigned long)GetCurrentProcessId()) {
+                    continue;
+                }
+                HANDLE owner =
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)stale_pid);
+                bool owner_alive = owner && WaitForSingleObject(owner, 0U) == WAIT_TIMEOUT;
+                if (owner)
+                    (void)CloseHandle(owner);
+                if (owner_alive) {
+                    continue;
+                }
+                wchar_t stale_path[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+                int stale_written = swprintf(stale_path, CBM_WINDOWS_LAUNCHER_PATH_CAP, L"%ls\\%ls",
+                                             directory, stale.cFileName);
+                if (stale_written <= 0 || (size_t)stale_written >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+                    continue;
+                }
+                HANDLE stale_file =
+                    CreateFileW(stale_path, DELETE | FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+                if (stale_file != INVALID_HANDLE_VALUE) {
+                    (void)launcher_posix_remove(stale_file);
+                    (void)CloseHandle(stale_file);
+                }
+            } while (FindNextFileW(search, &stale));
+            (void)FindClose(search);
+        }
+    }
     if (!directories_valid || !CopyFileW(payload, output, TRUE)) {
         if (runtime_created)
             (void)RemoveDirectoryW(runtime);
@@ -1176,25 +1565,57 @@ int wmain(void) {
         (void)LocalFree(argv);
         return launcher_failure(L"could not securely resolve the launcher path");
     }
-    HANDLE canonical_file = launcher_open_regular(canonical, GENERIC_READ, true);
+    HANDLE canonical_file = launcher_open_regular_links(canonical, GENERIC_READ, true, 0U);
     if (canonical_file == INVALID_HANDLE_VALUE) {
         (void)LocalFree(argv);
         return launcher_failure(L"launcher ownership or access policy is unsafe");
     }
-    (void)CloseHandle(canonical_file);
+    BY_HANDLE_FILE_INFORMATION canonical_information;
+    if (!launcher_file_information(canonical_file, &canonical_information)) {
+        (void)CloseHandle(canonical_file);
+        (void)LocalFree(argv);
+        return launcher_failure(L"launcher file identity is unavailable");
+    }
 
     cbm_windows_current_v1_t state;
     memset(&state, 0, sizeof(state));
     int state_status = launcher_load_current(canonical, &state);
     if (state_status < 0) {
+        (void)CloseHandle(canonical_file);
         (void)LocalFree(argv);
         return launcher_failure(L"current-v1 launcher state is corrupt or unsafe");
     }
     bool managed = state_status == 1;
     if (managed &&
         !cbm_windows_current_v1_supports_launcher_abi(&state, CBM_WINDOWS_LAUNCHER_ABI_CURRENT)) {
+        (void)CloseHandle(canonical_file);
         (void)LocalFree(argv);
         return launcher_failure(L"current-v1 requires an incompatible launcher ABI");
+    }
+    bool launcher_layout_valid = canonical_information.nNumberOfLinks == 1U;
+    if (managed) {
+        wchar_t backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+        char backing_error[256] = {0};
+        bool backing_path_valid =
+            cbm_windows_managed_launcher_backing(canonical, backing, CBM_WINDOWS_LAUNCHER_PATH_CAP,
+                                                 backing_error, sizeof(backing_error));
+        HANDLE backing_file = backing_path_valid
+                                  ? launcher_open_regular_links(backing, GENERIC_READ, true, 2U)
+                                  : INVALID_HANDLE_VALUE;
+        BY_HANDLE_FILE_INFORMATION backing_information;
+        launcher_layout_valid =
+            canonical_information.nNumberOfLinks == 2U &&
+            launcher_file_information_links(backing_file, &backing_information, 2U) &&
+            launcher_same_identity(&canonical_information, &backing_information);
+        if (backing_file != INVALID_HANDLE_VALUE)
+            (void)CloseHandle(backing_file);
+    }
+    (void)CloseHandle(canonical_file);
+    if (!launcher_layout_valid) {
+        (void)LocalFree(argv);
+        return launcher_failure(managed
+                                    ? L"managed launcher hard-link backing is missing or unsafe"
+                                    : L"portable launcher must have exactly one file-system link");
     }
     cbm_windows_launcher_action_t action = launcher_wide_action(argc, argv);
     if (!cbm_windows_launcher_action_allowed(action, managed)) {

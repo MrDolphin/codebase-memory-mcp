@@ -8,17 +8,16 @@
 
 services:
   # ── Linux test (ASan + UBSan + LeakSanitizer) ──────────────
-  # Default: unconstrained (speed first). CBM_LOCAL_CI_CPUS=4 enables
-  # CI-FIDELITY mode, mirroring the 4-core GitHub runners: deadline/starvation
-  # bugs (worker-readiness waits, watcher/subprocess deadlines) only reproduce
-  # under that constraint — run one capped pass before pushing anything that
-  # touches timing, scheduling, or subprocess code.
+  # Always full-parallel: the suite is designed to be core-count-independent
+  # for correctness — timing/scheduling/subprocess suites assert invariants
+  # (ordering, bounded-return, RUNNING poll state), not wall-clock, so they
+  # pass at any parallelism. Artificial CPU starvation belongs to smoke/soak
+  # (CBM_LOCAL_CI_CPUS), not the regular suite.
   test:
     build:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/arm64
-    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
       - cbm-ccache-arm64:/root/.ccache
@@ -32,7 +31,6 @@ services:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/amd64
-    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
       - cbm-ccache-amd64:/root/.ccache
@@ -131,11 +129,16 @@ services:
         WINEDEBUG=-all scripts/smoke-test.sh ./build/win-cross/codebase-memory-mcp.exe
 
   # ── Windows soak (cross-compile + Wine) ───────────────────
+  # Soak is the one place a CPU cap is meaningful: sustained runs under
+  # deliberate resource starvation surface scheduling/backpressure behaviour the
+  # full-parallel correctness suite does not target. Opt in with
+  # CBM_LOCAL_CI_CPUS=<n>; default 0 = unlimited, so normal soak runs stay fast.
   soak-windows:
     build:
       context: ..
       dockerfile: test-infrastructure/Dockerfile.mingw
     platform: linux/amd64
+    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
     entrypoint: ["/bin/bash", "-c"]

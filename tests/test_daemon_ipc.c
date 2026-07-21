@@ -6,6 +6,7 @@
  * domain sockets on POSIX and current-user named pipes on Windows.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 
 #include "daemon/daemon.h"
 #include "daemon/ipc.h"
@@ -63,8 +64,12 @@ static bool ipc_test_write_byte(const char *path, unsigned char byte);
 #endif
 
 static bool ipc_test_parent_new(char out[TEST_PATH_CAP], const char *tag) {
-    int n = snprintf(out, TEST_PATH_CAP, "%s/cbm-ipc-%s-XXXXXX", cbm_tmpdir(), tag);
-    return n > 0 && n < TEST_PATH_CAP && cbm_mkdtemp(out) != NULL;
+    /* Endpoint parents must carry production-shaped ancestry: the runtime
+     * ancestry validation (correctly) refuses temp roots whose ancestors
+     * grant mutation rights to Authenticated Users, e.g. C:/msys64/tmp and
+     * GitHub-runner work directories. th_secure_runtime_parent_new anchors
+     * under LocalAppData on Windows, like the production default parent. */
+    return th_secure_runtime_parent_new(out, TEST_PATH_CAP, tag);
 }
 
 static void ipc_test_copy_path(char out[TEST_PATH_CAP], const char *path) {
@@ -655,6 +660,11 @@ TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment) {
     }
     if (endpoint_a) {
         int startup_status = cbm_daemon_ipc_startup_lock_try_acquire(endpoint_a, &startup);
+        /* Publish the generation record: the address under test exists only
+         * after a startup owner prepares the handoff. */
+        if (startup_status == 1 && !cbm_daemon_ipc_startup_lock_prepare_handoff(startup)) {
+            startup_status = -1;
+        }
         cbm_daemon_ipc_startup_lock_release(&startup);
         startup = NULL;
         if (startup_status != 1) {
@@ -1519,6 +1529,15 @@ TEST(daemon_ipc_endpoint_is_namespaced_by_instance_key) {
     int a_startup_status = a ? cbm_daemon_ipc_startup_lock_try_acquire(a, &a_startup) : -1;
     int other_startup_status =
         other ? cbm_daemon_ipc_startup_lock_try_acquire(other, &other_startup) : -1;
+    /* Windows addresses are generation-bound and exist only once a startup
+     * owner publishes the rendezvous record; drive the documented flow. */
+    if (a_startup_status == 1 && !cbm_daemon_ipc_startup_lock_prepare_handoff(a_startup)) {
+        a_startup_status = -1;
+    }
+    if (other_startup_status == 1 &&
+        !cbm_daemon_ipc_startup_lock_prepare_handoff(other_startup)) {
+        other_startup_status = -1;
+    }
     cbm_daemon_ipc_startup_lock_release(&a_startup);
     cbm_daemon_ipc_startup_lock_release(&other_startup);
     a_startup = NULL;

@@ -16,6 +16,7 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h"
 #include "../src/cli/cli.h"
+#include "../src/daemon/host_internal.h"
 #include "../src/git/git_context.h" /* #798 follow-up: live-socket git-resolve repro */
 #include "../src/ui/http_server.h"
 #include "test_framework.h"
@@ -39,6 +40,7 @@
 #include <windows.h> /* #798 follow-up: CreateThread/WaitForSingleObject watchdog */
 typedef SOCKET th_sock_t;
 #define th_sock_close closesocket
+#define th_sock_shutdown(s) shutdown((s), SD_BOTH)
 #define TH_SOCK_BAD INVALID_SOCKET
 #else
 #include <arpa/inet.h>
@@ -49,6 +51,7 @@ typedef SOCKET th_sock_t;
 #include <unistd.h>
 typedef int th_sock_t;
 #define th_sock_close close
+#define th_sock_shutdown(s) shutdown((s), SHUT_RDWR)
 #define TH_SOCK_BAD (-1)
 #endif
 
@@ -66,7 +69,7 @@ static void httpd_capture_log(const char *line) {
 
 /* ── Raw-socket test client ───────────────────────────────────── */
 
-static th_sock_t th_connect(int port) {
+static th_sock_t th_connect_with_recv_buffer(int port, int recv_buffer) {
 #ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa); /* refcounted; cleanup not needed in tests */
@@ -74,6 +77,11 @@ static th_sock_t th_connect(int port) {
     th_sock_t s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == TH_SOCK_BAD)
         return TH_SOCK_BAD;
+    if (recv_buffer > 0 && setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&recv_buffer,
+                                      sizeof(recv_buffer)) != 0) {
+        th_sock_close(s);
+        return TH_SOCK_BAD;
+    }
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -84,6 +92,10 @@ static th_sock_t th_connect(int port) {
         return TH_SOCK_BAD;
     }
     return s;
+}
+
+static th_sock_t th_connect(int port) {
+    return th_connect_with_recv_buffer(port, 0);
 }
 
 static int th_send_all(th_sock_t s, const char *data, size_t len) {
@@ -120,8 +132,8 @@ static int th_recv_until_close(th_sock_t s, char *buf, size_t bufsz) {
     return (int)off;
 }
 
-/* One-shot HTTP exchange. Returns response length, 0 on connect failure. */
-static int th_http(int port, const char *request, char *resp, size_t respsz) {
+/* One-shot raw HTTP exchange. Returns response length, 0 on connect failure. */
+static int th_http_raw(int port, const char *request, char *resp, size_t respsz) {
     th_sock_t s = th_connect(port);
     if (s == TH_SOCK_BAD)
         return 0;
@@ -132,6 +144,50 @@ static int th_http(int port, const char *request, char *resp, size_t respsz) {
     int n = th_recv_until_close(s, resp, respsz);
     th_sock_close(s);
     return n;
+}
+
+/* Existing route tests focus on endpoint behavior. Add the loopback Host and
+ * JSON mutation header the browser supplies. Security tests use th_http_raw()
+ * to exercise missing/hostile headers without this convenience layer. */
+static char *th_request_with_ui_headers(int port, const char *request) {
+    const char *head_end = strstr(request, "\r\n\r\n");
+    if (!head_end)
+        return strdup(request);
+
+    const char *target = strchr(request, ' ');
+    target = target ? target + 1 : NULL;
+    bool protected_route =
+        target && (strncmp(target, "/api/", 5) == 0 || strncmp(target, "/rpc ", 5) == 0 ||
+                   strncmp(target, "/rpc?", 5) == 0);
+    bool mutation = strncmp(request, "POST ", 5) == 0;
+    bool have_host = strstr(request, "\r\nHost:") != NULL;
+    bool have_content_type = strstr(request, "\r\nContent-Type:") != NULL;
+
+    size_t request_len = strlen(request);
+    size_t capacity = request_len + 256;
+    char *result = malloc(capacity);
+    if (!result)
+        return NULL;
+
+    size_t head_len = (size_t)(head_end - request);
+    memcpy(result, request, head_len);
+    size_t pos = head_len;
+    if (!have_host)
+        pos += (size_t)snprintf(result + pos, capacity - pos, "\r\nHost: 127.0.0.1:%d", port);
+    if (protected_route && mutation && !have_content_type) {
+        pos += (size_t)snprintf(result + pos, capacity - pos, "\r\nContent-Type: application/json");
+    }
+    (void)snprintf(result + pos, capacity - pos, "\r\n\r\n%s", head_end + 4);
+    return result;
+}
+
+static int th_http(int port, const char *request, char *resp, size_t respsz) {
+    char *prepared = th_request_with_ui_headers(port, request);
+    if (!prepared)
+        return 0;
+    int result = th_http_raw(port, prepared, resp, respsz);
+    free(prepared);
+    return result;
 }
 
 /* HTTP status code from a raw response ("HTTP/1.1 404 ..."), or -1. */
@@ -155,9 +211,36 @@ TEST(httpd_parse_simple_get) {
     ASSERT_STR_EQ(req.method, "GET");
     ASSERT_STR_EQ(req.path, "/api/logs");
     ASSERT_STR_EQ(req.query, "lines=5");
+    ASSERT_EQ(req.http_minor, 1);
     ASSERT_STR_EQ(req.origin, "http://localhost:5173");
     ASSERT_EQ((int)clen, 0);
     ASSERT_EQ((int)body_off, (int)strlen(raw));
+    PASS();
+}
+
+TEST(httpd_parse_security_headers_and_rejects_duplicates) {
+    const char *raw = "POST /rpc HTTP/1.1\r\n"
+                      "Host: 127.0.0.1:9749\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Origin: http://127.0.0.1:9749\r\n"
+                      "Content-Length: 0\r\n\r\n";
+    cbm_http_req_t req;
+    size_t body_off = 0, content_length = 0;
+    ASSERT_EQ(cbm_http_parse_head(raw, strlen(raw), &req, &body_off, &content_length), 0);
+    ASSERT_STR_EQ(req.host, "127.0.0.1:9749");
+    ASSERT_STR_EQ(req.content_type, "application/json");
+
+    static const char *duplicates[] = {
+        "GET / HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\n\r\n",
+        "GET / HTTP/1.1\r\nOrigin: http://localhost\r\nOrigin: http://localhost\r\n\r\n",
+        ("POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Type: "
+         "application/json\r\n\r\n"),
+    };
+    for (size_t i = 0; i < sizeof(duplicates) / sizeof(duplicates[0]); i++) {
+        ASSERT_EQ(cbm_http_parse_head(duplicates[i], strlen(duplicates[i]), &req, &body_off,
+                                      &content_length),
+                  400);
+    }
     PASS();
 }
 
@@ -384,7 +467,7 @@ TEST(httpd_listen_ephemeral_port) {
     /* accept with a short timeout and no client → NULL, promptly */
     cbm_http_conn_t *c = cbm_httpd_accept(d, 50);
     ASSERT_NULL(c);
-    cbm_httpd_close(d);
+    ASSERT_TRUE(cbm_httpd_close(d));
     PASS();
 }
 
@@ -393,7 +476,22 @@ TEST(httpd_listen_port_collision_returns_null) {
     ASSERT_NOT_NULL(d1);
     cbm_httpd_t *d2 = cbm_httpd_listen(cbm_httpd_port(d1));
     ASSERT_NULL(d2);
-    cbm_httpd_close(d1);
+    ASSERT_TRUE(cbm_httpd_close(d1));
+    PASS();
+}
+
+TEST(httpd_close_refuses_while_connection_owns_listener) {
+    cbm_httpd_t *listener = cbm_httpd_listen(0);
+    ASSERT_NOT_NULL(listener);
+    th_sock_t client = th_connect(cbm_httpd_port(listener));
+    ASSERT_TRUE(client != TH_SOCK_BAD);
+    cbm_http_conn_t *connection = cbm_httpd_accept(listener, 1000);
+    ASSERT_NOT_NULL(connection);
+
+    ASSERT_FALSE(cbm_httpd_close(listener));
+    cbm_httpd_conn_close(connection);
+    th_sock_close(client);
+    ASSERT_TRUE(cbm_httpd_close(listener));
     PASS();
 }
 
@@ -409,12 +507,21 @@ static void *th_server_thread(void *arg) {
     return NULL;
 }
 
+static int th_server_thread_start(cbm_thread_t *thread, cbm_http_server_t *server) {
+    if (!cbm_http_server_schedule_run(server))
+        return -1;
+    int rc = cbm_thread_create(thread, 0, th_server_thread, server);
+    if (rc != 0 && !cbm_http_server_cancel_scheduled_run(server))
+        return -1;
+    return rc;
+}
+
 static int th_server_start(th_server_t *ts) {
     ts->srv = cbm_http_server_new(0);
     if (!ts->srv)
         return -1;
-    if (cbm_thread_create(&ts->tid, 0, th_server_thread, ts->srv) != 0) {
-        cbm_http_server_free(ts->srv);
+    if (th_server_thread_start(&ts->tid, ts->srv) != 0) {
+        (void)cbm_http_server_free(ts->srv);
         return -1;
     }
     return 0;
@@ -425,8 +532,8 @@ static int th_server_start_with_watcher(th_server_t *ts, cbm_watcher_t *watcher)
     if (!ts->srv)
         return -1;
     cbm_http_server_set_watcher(ts->srv, watcher);
-    if (cbm_thread_create(&ts->tid, 0, th_server_thread, ts->srv) != 0) {
-        cbm_http_server_free(ts->srv);
+    if (th_server_thread_start(&ts->tid, ts->srv) != 0) {
+        (void)cbm_http_server_free(ts->srv);
         return -1;
     }
     return 0;
@@ -438,12 +545,28 @@ typedef struct {
     char project_name[256];
 } th_ui_index_executor_t;
 
+typedef struct {
+    atomic_int calls;
+    atomic_int release;
+} th_ui_blocking_index_executor_t;
+
 static int th_ui_index_executor(void *opaque, const char *root_path, const char *project_name) {
     th_ui_index_executor_t *executor = opaque;
     snprintf(executor->root_path, sizeof(executor->root_path), "%s", root_path);
     snprintf(executor->project_name, sizeof(executor->project_name), "%s",
              project_name ? project_name : "");
     atomic_fetch_add(&executor->calls, 1);
+    return 0;
+}
+
+static int th_ui_blocking_index_executor(void *opaque, const char *root_path,
+                                         const char *project_name) {
+    (void)root_path;
+    (void)project_name;
+    th_ui_blocking_index_executor_t *executor = opaque;
+    atomic_fetch_add(&executor->calls, 1);
+    while (!atomic_load(&executor->release))
+        cbm_usleep(1000);
     return 0;
 }
 
@@ -456,6 +579,28 @@ static bool th_wait_atomic_int(atomic_int *value, int expected, uint32_t timeout
         cbm_usleep(1000);
     }
     return atomic_load(value) == expected;
+}
+
+static bool th_wait_http_server_activity(cbm_http_server_t *server, cbm_httpd_activity_t expected,
+                                         uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    while (cbm_now_ms() < deadline) {
+        if (cbm_http_server_activity_for_test(server) == expected)
+            return true;
+        cbm_usleep(1000);
+    }
+    return cbm_http_server_activity_for_test(server) == expected;
+}
+
+static bool th_wait_httpd_activity(cbm_httpd_t *listener, cbm_httpd_activity_t expected,
+                                   uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    while (cbm_now_ms() < deadline) {
+        if (cbm_httpd_activity_for_test(listener) == expected)
+            return true;
+        cbm_usleep(1000);
+    }
+    return cbm_httpd_activity_for_test(listener) == expected;
 }
 
 typedef struct {
@@ -495,8 +640,8 @@ static int th_server_start_with_mutation_guard(th_server_t *ts, cbm_watcher_t *w
         cbm_http_server_set_watcher(ts->srv, watcher);
     cbm_http_server_set_project_mutation_guard(ts->srv, th_ui_mutation_begin, th_ui_mutation_end,
                                                guard);
-    if (cbm_thread_create(&ts->tid, 0, th_server_thread, ts->srv) != 0) {
-        cbm_http_server_free(ts->srv);
+    if (th_server_thread_start(&ts->tid, ts->srv) != 0) {
+        (void)cbm_http_server_free(ts->srv);
         return -1;
     }
     return 0;
@@ -504,8 +649,8 @@ static int th_server_start_with_mutation_guard(th_server_t *ts, cbm_watcher_t *w
 
 static void th_server_stop(th_server_t *ts) {
     cbm_http_server_stop(ts->srv);
-    cbm_thread_join(&ts->tid);
-    cbm_http_server_free(ts->srv);
+    (void)cbm_thread_join(&ts->tid);
+    (void)cbm_http_server_free(ts->srv);
 }
 
 typedef struct {
@@ -686,7 +831,7 @@ TEST(ui_server_routes_indexing_through_joinable_daemon_executor) {
     ts.srv = cbm_http_server_new(0);
     ASSERT_NOT_NULL(ts.srv);
     cbm_http_server_set_index_executor(ts.srv, th_ui_index_executor, &executor);
-    ASSERT_EQ(cbm_thread_create(&ts.tid, 0, th_server_thread, ts.srv), 0);
+    ASSERT_EQ(th_server_thread_start(&ts.tid, ts.srv), 0);
 
     char body[1024];
     snprintf(body, sizeof(body), "{\"root_path\":\"%s\",\"project_name\":\"ui-project\"}", root);
@@ -710,6 +855,50 @@ TEST(ui_server_routes_indexing_through_joinable_daemon_executor) {
     PASS();
 }
 
+TEST(ui_server_free_never_joins_active_index_worker) {
+    char *root = th_mktempdir("cbm_httpd_active_index");
+    ASSERT_NOT_NULL(root);
+    th_ui_blocking_index_executor_t executor = {0};
+    atomic_init(&executor.calls, 0);
+    atomic_init(&executor.release, 0);
+
+    th_server_t ts;
+    ts.srv = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(ts.srv);
+    cbm_http_server_set_index_executor(ts.srv, th_ui_blocking_index_executor, &executor);
+    ASSERT_EQ(th_server_thread_start(&ts.tid, ts.srv), 0);
+
+    char body[1024];
+    snprintf(body, sizeof(body), "{\"root_path\":\"%s\",\"project_name\":\"blocked\"}", root);
+    char request[1400];
+    snprintf(request, sizeof(request),
+             "POST /api/index HTTP/1.1\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char response[4096];
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 202);
+    ASSERT_TRUE(th_wait_atomic_int(&executor.calls, 1, 2000));
+
+    cbm_http_server_stop(ts.srv);
+    ASSERT_EQ(cbm_thread_join(&ts.tid), 0);
+    uint64_t started = cbm_now_ms();
+    ASSERT_FALSE(cbm_http_server_free(ts.srv));
+    ASSERT_LT(cbm_now_ms() - started, 1000);
+
+    atomic_store(&executor.release, 1);
+    bool freed = false;
+    uint64_t deadline = cbm_now_ms() + 2000;
+    while (!freed && cbm_now_ms() < deadline) {
+        freed = cbm_http_server_free(ts.srv);
+        if (!freed)
+            cbm_usleep(1000);
+    }
+    ASSERT_TRUE(freed);
+    th_cleanup(root);
+    PASS();
+}
+
 TEST(ui_server_root_serves_stub_404) {
     /* Test binary links embedded_stub.c → no frontend → 404 with marker */
     th_server_t ts;
@@ -723,43 +912,114 @@ TEST(ui_server_root_serves_stub_404) {
     PASS();
 }
 
-TEST(ui_server_cors_localhost_reflected) {
+TEST(ui_server_same_origin_request_is_allowed) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char req[512];
+    snprintf(req, sizeof(req),
+             "OPTIONS /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1:%d\r\n"
+             "Origin: http://127.0.0.1:%d\r\n\r\n",
+             port, port);
     char resp[4096];
-    int n = th_http(cbm_http_server_port(ts.srv),
-                    "OPTIONS /rpc HTTP/1.1\r\n"
-                    "Origin: http://localhost:5173\r\n\r\n",
-                    resp, sizeof(resp));
+    int n = th_http_raw(port, req, resp, sizeof(resp));
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 204);
-    ASSERT_NOT_NULL(strstr(resp, "Access-Control-Allow-Origin: http://localhost:5173"));
+    char expected_origin[128];
+    snprintf(expected_origin, sizeof(expected_origin),
+             "Access-Control-Allow-Origin: http://127.0.0.1:%d", port);
+    ASSERT_NOT_NULL(strstr(resp, expected_origin));
     th_server_stop(&ts);
     PASS();
 }
 
-TEST(ui_server_cors_evil_origin_not_reflected) {
+TEST(ui_server_rejects_foreign_and_null_origins) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
     char resp[4096];
-    int n = th_http(cbm_http_server_port(ts.srv),
-                    "OPTIONS /rpc HTTP/1.1\r\n"
-                    "Origin: http://evil.example.com\r\n\r\n",
-                    resp, sizeof(resp));
+    char req[768];
+    snprintf(req, sizeof(req),
+             "OPTIONS /rpc HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Origin: http://evil.example.com\r\n\r\n",
+             port);
+    int n = th_http_raw(port, req, resp, sizeof(resp));
     ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 204);
+    ASSERT_EQ(th_status(resp), 403);
     ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
+
+    snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: localhost:%d\r\nOrigin: null\r\n\r\n",
+             port);
+    n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    snprintf(req, sizeof(req),
+             "GET / HTTP/1.1\r\nHost: localhost:%d\r\n"
+             "Origin: http://127.0.0.1:%d\r\n\r\n",
+             port, port);
+    n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    static const char body[] = "{\"project\":\"victim\",\"content\":\"poison\"}";
+    snprintf(req, sizeof(req),
+             "POST /api/adr HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Origin: http://evil.example.com\r\nContent-Type: text/plain\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             port, strlen(body), body);
+    n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
     th_server_stop(&ts);
     PASS();
 }
 
-TEST(ui_server_rpc_initialize) {
+TEST(ui_server_mutations_require_json_content_type) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
-    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
-                       "\"params\":{\"protocolVersion\":\"2024-11-05\","
-                       "\"capabilities\":{},"
-                       "\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+    int port = cbm_http_server_port(ts.srv);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
+    char req[1024];
+    char resp[8192];
+
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Content-Type: text/plain\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             port, strlen(body), body);
+    int n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 415);
+
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             port, strlen(body), body);
+    n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 415);
+
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Content-Type: application/json; charset=utf-8\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             port, strlen(body), body);
+    n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_rpc_allows_only_ui_read_tools) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
     char req[1024];
     snprintf(req, sizeof(req),
              "POST /rpc HTTP/1.1\r\n"
@@ -771,6 +1031,45 @@ TEST(ui_server_rpc_initialize) {
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 200);
     ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+
+    static const char *blocked_tools[] = {"delete_project", "manage_adr", "ingest_traces",
+                                          "index_repository"};
+    for (size_t i = 0; i < sizeof(blocked_tools) / sizeof(blocked_tools[0]); i++) {
+        char blocked_body[512];
+        snprintf(blocked_body, sizeof(blocked_body),
+                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"%s\",\"arguments\":{}}}",
+                 blocked_tools[i]);
+        snprintf(req, sizeof(req),
+                 "POST /rpc HTTP/1.1\r\nContent-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 strlen(blocked_body), blocked_body);
+        n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 403);
+    }
+
+    const char *initialize = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\","
+                             "\"params\":{}}";
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(initialize), initialize);
+    n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    const char *ambiguous = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+                            "\"params\":{\"name\":\"list_projects\",\"name\":\"delete_project\","
+                            "\"arguments\":{}}}";
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(ambiguous), ambiguous);
+    n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
     th_server_stop(&ts);
     PASS();
 }
@@ -1225,6 +1524,199 @@ TEST(ui_server_stop_joins_cleanly) {
     PASS();
 }
 
+TEST(ui_server_free_refuses_active_loop) {
+    cbm_http_server_t *server = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(server);
+
+    cbm_thread_t thread;
+    ASSERT_EQ(th_server_thread_start(&thread, server), 0);
+    char response[512];
+    ASSERT_GT(
+        th_http(cbm_http_server_port(server), "GET / HTTP/1.1\r\n\r\n", response, sizeof(response)),
+        0);
+    ASSERT_FALSE(cbm_http_server_free(server));
+    cbm_http_server_stop(server);
+    ASSERT_EQ(cbm_thread_join(&thread), 0);
+    ASSERT_TRUE(cbm_http_server_free(server));
+    PASS();
+}
+
+TEST(ui_server_free_refuses_scheduled_run_before_child_starts) {
+    cbm_http_server_t *server = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(server);
+
+    ASSERT_TRUE(cbm_http_server_schedule_run(server));
+    ASSERT_FALSE(cbm_http_server_free(server));
+    ASSERT_TRUE(cbm_http_server_cancel_scheduled_run(server));
+    ASSERT_TRUE(cbm_http_server_free(server));
+    PASS();
+}
+
+TEST(daemon_host_http_thread_create_failure_cancels_scheduled_run) {
+    ASSERT_TRUE(cbm_daemon_host_http_thread_create_failure_lifecycle_for_test());
+    PASS();
+}
+
+typedef struct {
+    th_sock_t socket;
+    atomic_int *operation_finished;
+    atomic_int stop_finished;
+    atomic_int watchdog_fired;
+} th_http_stop_watchdog_t;
+
+static void *th_http_stop_watchdog(void *opaque) {
+    th_http_stop_watchdog_t *watchdog = opaque;
+    for (int elapsed_ms = 0; elapsed_ms < 1500; elapsed_ms += 10) {
+        if (atomic_load(&watchdog->stop_finished) ||
+            (watchdog->operation_finished && atomic_load(watchdog->operation_finished)))
+            return NULL;
+        cbm_usleep(10 * 1000);
+    }
+    atomic_store(&watchdog->watchdog_fired, 1);
+    (void)th_sock_shutdown(watchdog->socket);
+    return NULL;
+}
+
+typedef struct {
+    cbm_httpd_t *listener;
+    atomic_int accepted;
+    atomic_int finished;
+} th_httpd_large_reply_t;
+
+static void *th_httpd_large_reply(void *opaque) {
+    th_httpd_large_reply_t *reply = opaque;
+    cbm_http_conn_t *connection = cbm_httpd_accept(reply->listener, 3000);
+    if (!connection) {
+        atomic_store(&reply->finished, 1);
+        return NULL;
+    }
+    atomic_store(&reply->accepted, 1);
+    size_t response_size = 8U * 1024U * 1024U;
+    char *response = malloc(response_size);
+    if (response) {
+        memset(response, 'R', response_size);
+        cbm_http_reply_buf(connection, 200, "Content-Type: application/octet-stream\r\n", response,
+                           response_size);
+        free(response);
+    }
+    cbm_httpd_conn_close(connection);
+    atomic_store(&reply->finished, 1);
+    return NULL;
+}
+
+TEST(httpd_interrupt_unblocks_nonreading_large_response_within_one_second) {
+    cbm_httpd_t *listener = cbm_httpd_listen(0);
+    ASSERT_NOT_NULL(listener);
+    cbm_httpd_set_send_buffer_for_test(listener, 64 * 1024);
+    th_httpd_large_reply_t reply = {.listener = listener};
+    atomic_init(&reply.accepted, 0);
+    atomic_init(&reply.finished, 0);
+
+    th_sock_t socket = th_connect_with_recv_buffer(cbm_httpd_port(listener), 1024);
+    ASSERT_TRUE(socket != TH_SOCK_BAD);
+    cbm_thread_t reply_thread;
+    ASSERT_EQ(cbm_thread_create(&reply_thread, 0, th_httpd_large_reply, &reply), 0);
+
+    ASSERT_TRUE(th_wait_httpd_activity(listener, CBM_HTTPD_ACTIVITY_RESPONDING, 1000));
+    ASSERT_EQ(atomic_load(&reply.accepted), 1);
+    ASSERT_EQ(atomic_load(&reply.finished), 0);
+
+    th_http_stop_watchdog_t watchdog = {
+        .socket = socket,
+        .operation_finished = &reply.finished,
+    };
+    atomic_init(&watchdog.stop_finished, 0);
+    atomic_init(&watchdog.watchdog_fired, 0);
+    cbm_thread_t watchdog_thread;
+    ASSERT_EQ(cbm_thread_create(&watchdog_thread, 0, th_http_stop_watchdog, &watchdog), 0);
+
+    uint64_t started = cbm_now_ms();
+    cbm_httpd_interrupt(listener);
+    ASSERT_EQ(cbm_thread_join(&reply_thread), 0);
+    uint64_t elapsed = cbm_now_ms() - started;
+    atomic_store(&watchdog.stop_finished, 1);
+    ASSERT_EQ(cbm_thread_join(&watchdog_thread), 0);
+    (void)th_sock_shutdown(socket);
+    th_sock_close(socket);
+    ASSERT_TRUE(cbm_httpd_close(listener));
+
+    ASSERT_LT(elapsed, 500);
+    ASSERT_EQ(atomic_load(&watchdog.watchdog_fired), 0);
+    PASS();
+}
+
+TEST(httpd_nonreading_large_response_hits_send_deadline_without_interrupt) {
+    cbm_httpd_t *listener = cbm_httpd_listen(0);
+    ASSERT_NOT_NULL(listener);
+    cbm_httpd_set_send_buffer_for_test(listener, 64 * 1024);
+    th_httpd_large_reply_t reply = {.listener = listener};
+    atomic_init(&reply.accepted, 0);
+    atomic_init(&reply.finished, 0);
+
+    th_sock_t socket = th_connect_with_recv_buffer(cbm_httpd_port(listener), 1024);
+    ASSERT_TRUE(socket != TH_SOCK_BAD);
+    cbm_thread_t reply_thread;
+    ASSERT_EQ(cbm_thread_create(&reply_thread, 0, th_httpd_large_reply, &reply), 0);
+    ASSERT_TRUE(th_wait_httpd_activity(listener, CBM_HTTPD_ACTIVITY_RESPONDING, 1000));
+    ASSERT_EQ(atomic_load(&reply.accepted), 1);
+    ASSERT_EQ(atomic_load(&reply.finished), 0);
+    uint64_t started = cbm_now_ms();
+
+    th_http_stop_watchdog_t watchdog = {
+        .socket = socket,
+        .operation_finished = &reply.finished,
+    };
+    atomic_init(&watchdog.stop_finished, 0);
+    atomic_init(&watchdog.watchdog_fired, 0);
+    cbm_thread_t watchdog_thread;
+    ASSERT_EQ(cbm_thread_create(&watchdog_thread, 0, th_http_stop_watchdog, &watchdog), 0);
+
+    ASSERT_EQ(cbm_thread_join(&reply_thread), 0);
+    uint64_t elapsed = cbm_now_ms() - started;
+    atomic_store(&watchdog.stop_finished, 1);
+    ASSERT_EQ(cbm_thread_join(&watchdog_thread), 0);
+    th_sock_close(socket);
+    ASSERT_TRUE(cbm_httpd_close(listener));
+
+    ASSERT_GTE(elapsed, 500);
+    ASSERT_EQ(atomic_load(&watchdog.watchdog_fired), 0);
+    PASS();
+}
+
+TEST(ui_server_stop_interrupts_partial_request_within_one_second) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    cbm_http_server_set_recv_deadline_ms(ts.srv, 3000);
+    int port = cbm_http_server_port(ts.srv);
+    th_sock_t socket = th_connect(port);
+    ASSERT_TRUE(socket != TH_SOCK_BAD);
+
+    char partial[256];
+    snprintf(partial, sizeof(partial), "GET /api/logs HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n", port);
+    ASSERT_EQ(th_send_all(socket, partial, strlen(partial)), 0);
+    ASSERT_TRUE(th_wait_http_server_activity(ts.srv, CBM_HTTPD_ACTIVITY_READING_REQUEST, 1000));
+
+    th_http_stop_watchdog_t watchdog = {.socket = socket};
+    atomic_init(&watchdog.stop_finished, 0);
+    atomic_init(&watchdog.watchdog_fired, 0);
+    cbm_thread_t watchdog_thread;
+    ASSERT_EQ(cbm_thread_create(&watchdog_thread, 0, th_http_stop_watchdog, &watchdog), 0);
+
+    uint64_t started = cbm_now_ms();
+    cbm_http_server_stop(ts.srv);
+    ASSERT_EQ(cbm_thread_join(&ts.tid), 0);
+    uint64_t elapsed = cbm_now_ms() - started;
+    atomic_store(&watchdog.stop_finished, 1);
+    ASSERT_EQ(cbm_thread_join(&watchdog_thread), 0);
+    (void)th_sock_shutdown(socket);
+    th_sock_close(socket);
+    ASSERT_TRUE(cbm_http_server_free(ts.srv));
+
+    ASSERT_LT(elapsed, 1000);
+    ASSERT_EQ(atomic_load(&watchdog.watchdog_fired), 0);
+    PASS();
+}
+
 /* ── /api/repo-info git-remote URL helpers (distilled from PR #789) ── */
 
 /* The web base must always be https (deep-links can't be downgraded) and must
@@ -1293,9 +1785,14 @@ TEST(repo_info_strips_credentials_from_remote) {
  * the test FAILs deterministically rather than hanging CI. 0 on connect/timeout. */
 static int th_http_deadline(int port, const char *request, char *resp, size_t respsz,
                             int timeout_ms) {
-    th_sock_t s = th_connect(port);
-    if (s == TH_SOCK_BAD)
+    char *prepared = th_request_with_ui_headers(port, request);
+    if (!prepared)
         return 0;
+    th_sock_t s = th_connect(port);
+    if (s == TH_SOCK_BAD) {
+        free(prepared);
+        return 0;
+    }
 #ifdef _WIN32
     DWORD tv = (DWORD)timeout_ms;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
@@ -1305,10 +1802,12 @@ static int th_http_deadline(int port, const char *request, char *resp, size_t re
     tv.tv_usec = (timeout_ms % 1000) * 1000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
-    if (th_send_all(s, request, strlen(request)) != 0) {
+    if (th_send_all(s, prepared, strlen(prepared)) != 0) {
+        free(prepared);
         th_sock_close(s);
         return 0;
     }
+    free(prepared);
     int n = th_recv_until_close(s, resp, respsz);
     th_sock_close(s);
     return n;
@@ -1406,10 +1905,10 @@ TEST(git_context_resolve_no_hang_under_live_ui_sockets) {
 #endif
 }
 
-/* The server binds to loopback only. A request carrying a non-loopback Host
- * header reached it under a foreign name — the DNS-rebinding / cross-site
- * vector against a localhost service — and must be refused before routing. A
- * loopback Host (or none) proceeds normally. */
+/* Host is part of the authority boundary: HTTP/1.1 requires exactly one, and
+ * the optional port must be the actual bound port. This blocks DNS rebinding
+ * and prevents a foreign localhost service from manufacturing same-origin
+ * requests for this daemon. */
 TEST(ui_server_rejects_non_loopback_host) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -1420,12 +1919,48 @@ TEST(ui_server_rejects_non_loopback_host) {
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 403);
 
-    /* A loopback Host is not rejected (routes on to the normal 404 stub). */
-    char req[128];
-    snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
-    n = th_http(port, req, resp, sizeof(resp));
+    n = th_http_raw(port, "GET / HTTP/1.1\r\n\r\n", resp, sizeof(resp));
     ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 400);
+
+    static const char *bare_loopback_authorities[] = {
+        "127.0.0.1",
+        "localhost",
+        "[::1]",
+    };
+    char req[256];
+    for (size_t i = 0; i < sizeof(bare_loopback_authorities) / sizeof(bare_loopback_authorities[0]);
+         i++) {
+        snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: %s\r\n\r\n",
+                 bare_loopback_authorities[i]);
+        n = th_http_raw(port, req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 403);
+    }
+
+    snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port + 1);
+    n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+    n = th_http_raw(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_NEQ(th_status(resp), 400);
     ASSERT_NEQ(th_status(resp), 403);
+
+    static const char *bare_origins[] = {
+        "http://127.0.0.1",
+        "http://localhost",
+        "http://[::1]",
+    };
+    for (size_t i = 0; i < sizeof(bare_origins) / sizeof(bare_origins[0]); i++) {
+        snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: %s\r\n\r\n",
+                 port, bare_origins[i]);
+        n = th_http_raw(port, req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 403);
+    }
 
     th_server_stop(&ts);
     PASS();
@@ -1461,10 +1996,11 @@ TEST(ui_server_browse_wide_dir_no_overflow) {
             _exit(2);
         }
         char req[512];
-        snprintf(req, sizeof(req), "GET /api/browse?path=%s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                 dir);
+        int port = cbm_http_server_port(ts.srv);
+        snprintf(req, sizeof(req), "GET /api/browse?path=%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+                 dir, port);
         char *resp = malloc(262144);
-        int n = resp ? th_http(cbm_http_server_port(ts.srv), req, resp, 262144) : 0;
+        int n = resp ? th_http(port, req, resp, 262144) : 0;
         int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
         free(resp);
         th_server_stop(&ts);
@@ -1494,6 +2030,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_browse_wide_dir_no_overflow);
     /* Parser / helpers */
     RUN_TEST(httpd_parse_simple_get);
+    RUN_TEST(httpd_parse_security_headers_and_rejects_duplicates);
     RUN_TEST(httpd_parse_post_with_body_offset);
     RUN_TEST(httpd_parse_origin_case_insensitive);
     RUN_TEST(httpd_parse_rejects_bare_lf);
@@ -1515,16 +2052,19 @@ SUITE(httpd) {
     /* Transport */
     RUN_TEST(httpd_listen_ephemeral_port);
     RUN_TEST(httpd_listen_port_collision_returns_null);
+    RUN_TEST(httpd_close_refuses_while_connection_owns_listener);
 
     /* Full UI server */
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
+    RUN_TEST(ui_server_free_never_joins_active_index_worker);
     RUN_TEST(ui_server_root_serves_stub_404);
-    RUN_TEST(ui_server_cors_localhost_reflected);
-    RUN_TEST(ui_server_cors_evil_origin_not_reflected);
-    RUN_TEST(ui_server_rpc_initialize);
+    RUN_TEST(ui_server_same_origin_request_is_allowed);
+    RUN_TEST(ui_server_rejects_foreign_and_null_origins);
+    RUN_TEST(ui_server_mutations_require_json_content_type);
+    RUN_TEST(ui_server_rpc_allows_only_ui_read_tools);
     RUN_TEST(ui_server_oversized_body_rejected);
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);
@@ -1544,6 +2084,12 @@ SUITE(httpd) {
     RUN_TEST(ui_server_slow_request_hits_deadline);
     RUN_TEST(ui_server_access_log_redacts_query);
     RUN_TEST(ui_server_stop_joins_cleanly);
+    RUN_TEST(ui_server_free_refuses_active_loop);
+    RUN_TEST(ui_server_free_refuses_scheduled_run_before_child_starts);
+    RUN_TEST(daemon_host_http_thread_create_failure_cancels_scheduled_run);
+    RUN_TEST(httpd_interrupt_unblocks_nonreading_large_response_within_one_second);
+    RUN_TEST(httpd_nonreading_large_response_hits_send_deadline_without_interrupt);
+    RUN_TEST(ui_server_stop_interrupts_partial_request_within_one_second);
     /* #798 follow-up: full UI-mode hang repro under live sockets */
     RUN_TEST(ui_server_list_projects_responds_under_watchdog);
     RUN_TEST(git_context_resolve_no_hang_under_live_ui_sockets);

@@ -20,6 +20,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+#include <aclapi.h>
 #include <direct.h> /* _wmkdir */
 #include <errno.h>  /* errno for spawn-failure logging */
 #include <fcntl.h>  /* _O_RDONLY */
@@ -41,7 +43,7 @@ cbm_dir_t *cbm_opendir(const char *path) {
     if (!path) {
         return NULL;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return NULL;
     }
@@ -377,7 +379,7 @@ int cbm_pclose(FILE *f) {
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return NULL;
     }
@@ -392,13 +394,66 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return f;
 }
 
+/* Stamp the exact current user as owner and apply an owner-only protected
+ * DACL on a directory cbm just created. Under the Administrators-default-owner
+ * policy (server/runner images), a plain _wmkdir yields an Administrators-owned
+ * directory that the launcher/activation exact-owner validators reject. Only
+ * freshly created directories are stamped; pre-existing ones keep their owner. */
+static void cbm_windows_stamp_dir_owner(const wchar_t *path) {
+    HANDLE token = NULL;
+    TOKEN_USER *user = NULL;
+    PACL acl = NULL;
+    DWORD needed = 0U;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+        !GetTokenInformation(token, TokenUser, NULL, 0U, &needed) &&
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER && (user = malloc(needed)) != NULL &&
+        GetTokenInformation(token, TokenUser, user, needed, &needed) && user->User.Sid &&
+        IsValidSid(user->User.Sid)) {
+        EXPLICIT_ACCESSW access;
+        memset(&access, 0, sizeof(access));
+        access.grfAccessPermissions = GENERIC_ALL;
+        access.grfAccessMode = SET_ACCESS;
+        access.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        access.Trustee.ptstrName = (LPWSTR)user->User.Sid;
+        HANDLE directory =
+            CreateFileW(path, WRITE_OWNER | WRITE_DAC | READ_CONTROL,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (directory != INVALID_HANDLE_VALUE) {
+            if (SetEntriesInAclW(1U, &access, NULL, &acl) == ERROR_SUCCESS) {
+                (void)SetSecurityInfo(directory, SE_FILE_OBJECT,
+                                      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                                          PROTECTED_DACL_SECURITY_INFORMATION,
+                                      user->User.Sid, NULL, acl, NULL);
+            }
+            (void)CloseHandle(directory);
+        }
+    }
+    if (acl) {
+        (void)LocalFree(acl);
+    }
+    free(user);
+    if (token) {
+        (void)CloseHandle(token);
+    }
+}
+
 static bool cbm_windows_mkdir_component(wchar_t *path) {
-    if (_wmkdir(path) != 0 && errno != EEXIST) {
+    bool created = _wmkdir(path) == 0;
+    if (!created && errno != EEXIST) {
         return false;
     }
     DWORD attributes = GetFileAttributesW(path);
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U &&
-           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U;
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+        return false;
+    }
+    if (created) {
+        cbm_windows_stamp_dir_owner(path);
+    }
+    return true;
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {
@@ -406,7 +461,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
     if (!path || path[0] == '\0') {
         return false;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return false;
     }
@@ -453,7 +508,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
 }
 
 int cbm_unlink(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -463,7 +518,7 @@ int cbm_unlink(const char *path) {
 }
 
 int cbm_rmdir(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -815,7 +870,7 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
         return 0;
     }
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return 0;
     }
@@ -882,8 +937,8 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
  * (wide paths — raw MoveFileExA would re-mangle non-ASCII cache paths). */
 int cbm_rename_replace(const char *src, const char *dst) {
 #ifdef _WIN32
-    wchar_t *wsrc = cbm_utf8_to_wide(src);
-    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    wchar_t *wsrc = cbm_path_to_wide(src);
+    wchar_t *wdst = cbm_path_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
         ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)

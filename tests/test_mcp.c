@@ -8838,7 +8838,25 @@ TEST(mcp_path_within_root_rejects_escape) {
     fputs("int outside;\n", fp);
     fclose(fp);
 
-    const char *junction_argv[] = {"cmd.exe", "/d", "/c", "mklink", "/J", junction, outside, NULL};
+    /* cbm_tmpdir() can expose the MSYS spelling C:/msys64/...; cmd's mklink
+     * builtin treats the slash before "msys64" as another option delimiter.
+     * Native backslashes are required only at this cmd.exe fixture boundary. */
+    char junction_native[sizeof(junction)];
+    char outside_native[sizeof(outside)];
+    snprintf(junction_native, sizeof(junction_native), "%s", junction);
+    snprintf(outside_native, sizeof(outside_native), "%s", outside);
+    for (char *cursor = junction_native; *cursor; cursor++) {
+        if (*cursor == '/') {
+            *cursor = '\\';
+        }
+    }
+    for (char *cursor = outside_native; *cursor; cursor++) {
+        if (*cursor == '/') {
+            *cursor = '\\';
+        }
+    }
+    const char *junction_argv[] = {"cmd.exe",       "/d",           "/c", "mklink", "/J",
+                                   junction_native, outside_native, NULL};
     bool linked = cbm_exec_no_shell(junction_argv) == 0;
 
     ASSERT_TRUE(linked);
@@ -8916,6 +8934,61 @@ TEST(detect_changes_rejects_option_like_base_branch) {
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
+}
+
+TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch) {
+#ifdef _WIN32
+    const char *const branches[] = {"topic%PATH%", "topic!name!", "topic^name"};
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    for (size_t i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
+        char request[512];
+        snprintf(request, sizeof(request),
+                 "{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"detect_changes\","
+                 "\"arguments\":{\"project\":\"p\",\"base_branch\":\"%s\"}}}",
+                 branches[i]);
+        char *response = cbm_mcp_server_handle(srv, request);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "base_branch contains invalid characters"));
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+#else
+    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
+#endif
+}
+
+TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root) {
+#ifdef _WIN32
+    const char *const roots[] = {"C:\\cbm-root-%PATH%", "C:\\cbm-root-!name!",
+                                 "C:\\cbm-root-^name"};
+    const char *project = "windows-cmd-root-validation";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, project);
+    mcp_command_hook_probe_t command_probe = {0};
+    cbm_mcp_server_set_command_test_hook(srv, mcp_command_hook_probe, &command_probe);
+
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        ASSERT_EQ(cbm_store_upsert_project(store, project, roots[i]), CBM_STORE_OK);
+        char *response = cbm_mcp_handle_tool(
+            srv, "detect_changes",
+            "{\"project\":\"windows-cmd-root-validation\",\"base_branch\":\"main\"}");
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "project path contains invalid characters"));
+        free(response);
+    }
+    ASSERT_EQ(command_probe.diff_calls, 0);
+    ASSERT_EQ(command_probe.merge_base_calls, 0);
+    cbm_mcp_server_free(srv);
+    PASS();
+#else
+    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
+#endif
 }
 
 /* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
@@ -9205,6 +9278,8 @@ TEST(index_repository_supervisor_uses_canonical_session_path) {
 SUITE(mcp) {
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
+    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
+    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
     RUN_TEST(index_repository_honors_allowed_root);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);

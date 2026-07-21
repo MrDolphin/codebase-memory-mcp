@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -188,11 +189,20 @@ static char *activation_unique_path(const char *directory, const char *tag) {
     if (!path) {
         return NULL;
     }
-    int written = snprintf(
-        path, needed, "%s%s.cbm-%s-%lu-%" PRIu64, directory,
-        directory[directory_length - 1U] == '/' || directory[directory_length - 1U] == '\\' ? ""
-                                                                                            : "/",
-        tag, process_id, sequence);
+    /* Windows joins use the backslash: extended-length (\\\\?\\) directories
+     * reach this composer and that namespace performs no forward-slash
+     * translation. POSIX keeps the slash. */
+#ifdef _WIN32
+    const char *separator = "\\";
+#else
+    const char *separator = "/";
+#endif
+    int written =
+        snprintf(path, needed, "%s%s.cbm-%s-%lu-%" PRIu64, directory,
+                 directory[directory_length - 1U] == '/' || directory[directory_length - 1U] == '\\'
+                     ? ""
+                     : separator,
+                 tag, process_id, sequence);
     if (written <= 0 || (size_t)written >= needed) {
         free(path);
         return NULL;
@@ -220,7 +230,7 @@ typedef struct {
     SECURITY_ATTRIBUTES attributes;
 } activation_windows_security_t;
 
-static wchar_t *activation_utf8_to_wide(const char *value) {
+static wchar_t *activation_utf8_to_wide_plain(const char *value) {
     if (!value) {
         return NULL;
     }
@@ -234,6 +244,41 @@ static wchar_t *activation_utf8_to_wide(const char *value) {
         return NULL;
     }
     return wide;
+}
+
+/* File-API path conversion: an absolute drive path beyond the legacy limit is
+ * canonicalized and given the extended-length \\?\ prefix so every Win32
+ * file call accepts it. Managed-install generation stores and CI-runner paths
+ * routinely exceed 260 chars; the prefix also disables the \.\..\ and
+ * MAX_PATH parsing that the ancestry validator separately enforces. Non-file
+ * strings must not use this. */
+static wchar_t *activation_utf8_to_wide(const char *value) {
+    wchar_t *wide = activation_utf8_to_wide_plain(value);
+    if (!wide) {
+        return NULL;
+    }
+    size_t length = wcslen(wide);
+    bool drive_absolute =
+        length >= 3 &&
+        ((wide[0] >= L'A' && wide[0] <= L'Z') || (wide[0] >= L'a' && wide[0] <= L'z')) &&
+        wide[1] == L':' && (wide[2] == L'\\' || wide[2] == L'/');
+    if (!drive_absolute || length < 240U) {
+        return wide;
+    }
+    DWORD needed = GetFullPathNameW(wide, 0, NULL, NULL);
+    wchar_t *prefixed = needed > 0 ? malloc(((size_t)needed + 5U) * sizeof(*prefixed)) : NULL;
+    if (!prefixed) {
+        free(wide);
+        return NULL;
+    }
+    wmemcpy(prefixed, L"\\\\?\\", 4);
+    DWORD copied = GetFullPathNameW(wide, needed, prefixed + 4, NULL);
+    free(wide);
+    if (copied == 0 || copied >= needed) {
+        free(prefixed);
+        return NULL;
+    }
+    return prefixed;
 }
 
 static bool activation_windows_user(void **information_out, PSID *sid_out) {
@@ -318,6 +363,32 @@ static void activation_windows_security_destroy(activation_windows_security_t *s
     memset(security, 0, sizeof(*security));
 }
 
+/* Trusted-owner acceptance for SOURCE-side objects: a downloaded release
+ * bundle is owned by whatever the machine's default-owner policy dictates
+ * (Administrators on GitHub-runner-class images). Its integrity is enforced
+ * by identity snapshot/recheck plus the caller's build-fingerprint check,
+ * not by exact ownership. Staging targets created by this transaction keep
+ * the exact-current-owner rule. */
+static bool activation_windows_owner_is_trusted(HANDLE handle) {
+    void *information = NULL;
+    PSID user_sid = NULL;
+    if (!activation_windows_user(&information, &user_sid)) {
+        return false;
+    }
+    PSID owner = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    DWORD result = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL,
+                                   NULL, NULL, &descriptor);
+    bool trusted = result == ERROR_SUCCESS && owner && IsValidSid(owner) &&
+                   (EqualSid(owner, user_sid) || IsWellKnownSid(owner, WinLocalSystemSid) ||
+                    IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
+    if (descriptor) {
+        (void)LocalFree(descriptor);
+    }
+    free(information);
+    return trusted;
+}
+
 static bool activation_windows_owner_is_current(HANDLE handle) {
     void *information = NULL;
     PSID user_sid = NULL;
@@ -336,7 +407,13 @@ static bool activation_windows_owner_is_current(HANDLE handle) {
     return same;
 }
 
+static bool activation_windows_acl_check(HANDLE handle, DWORD tolerated_untrusted_mask);
+
 static bool activation_windows_acl_secure(HANDLE handle) {
+    return activation_windows_acl_check(handle, 0U);
+}
+
+static bool activation_windows_acl_check(HANDLE handle, DWORD tolerated_untrusted_mask) {
     void *information = NULL;
     PSID user_sid = NULL;
     if (!activation_windows_user(&information, &user_sid)) {
@@ -389,7 +466,7 @@ static bool activation_windows_acl_secure(HANDLE handle) {
             break;
         }
         ACCESS_ALLOWED_ACE *ace = opaque_ace;
-        if ((ace->Mask & mutation_rights) == 0) {
+        if ((ace->Mask & mutation_rights & ~tolerated_untrusted_mask) == 0) {
             continue;
         }
         PSID sid = (PSID)&ace->SidStart;
@@ -398,7 +475,12 @@ static bool activation_windows_acl_secure(HANDLE handle) {
         bool trusted = sid_length <= sid_capacity && IsValidSid(sid) &&
                        GetLengthSid(sid) == sid_length &&
                        (EqualSid(sid, user_sid) || IsWellKnownSid(sid, WinLocalSystemSid) ||
-                        IsWellKnownSid(sid, WinBuiltinAdministratorsSid));
+                        IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+                        /* OWNER RIGHTS modulates whoever owns the object; the
+                         * owner is separately validated in every chain that
+                         * reaches here (same tolerance as the daemon IPC and
+                         * launcher ancestry validators). */
+                        IsWellKnownSid(sid, WinCreatorOwnerRightsSid));
         if (!trusted) {
             secure = false;
         }
@@ -429,13 +511,20 @@ static bool activation_windows_identity(HANDLE handle, activation_file_identity_
 }
 
 static HANDLE activation_windows_directory_open_no_reparse(const char *directory) {
-    wchar_t *input = activation_utf8_to_wide(directory);
+    /* Canonicalize on the PLAIN wide form so GetFullPathNameW resolves any
+     * \.\..\ and slash forms; each ancestor is then opened through the
+     * extended-length prefix so a deep component past MAX_PATH still opens. */
+    wchar_t *input = activation_utf8_to_wide_plain(directory);
     if (!input) {
         return INVALID_HANDLE_VALUE;
     }
-    DWORD needed = GetFullPathNameW(input, 0, NULL, NULL);
+    /* Managed-install callers hand in extended-length paths already; drop
+     * their prefix for canonicalization and the drive-shape check below —
+     * the component walk re-adds it for every open. */
+    wchar_t *shape = wcsncmp(input, L"\\\\?\\", 4) == 0 ? input + 4 : input;
+    DWORD needed = GetFullPathNameW(shape, 0, NULL, NULL);
     wchar_t *path = needed > 0 ? calloc((size_t)needed + 1U, sizeof(*path)) : NULL;
-    DWORD length = path ? GetFullPathNameW(input, needed + 1U, path, NULL) : 0;
+    DWORD length = path ? GetFullPathNameW(shape, needed + 1U, path, NULL) : 0;
     free(input);
     if (!path || length < 3 || length > needed || path[1] != L':' ||
         (path[2] != L'\\' && path[2] != L'/')) {
@@ -447,22 +536,31 @@ static HANDLE activation_windows_directory_open_no_reparse(const char *directory
             path[index] = L'\\';
         }
     }
+    /* prefixed = \\?\ + canonical path; each open truncates this buffer. */
+    wchar_t *prefixed = malloc(((size_t)length + 5U) * sizeof(*prefixed));
+    if (!prefixed) {
+        free(path);
+        return INVALID_HANDLE_VALUE;
+    }
+    wmemcpy(prefixed, L"\\\\?\\", 4);
+    wmemcpy(prefixed + 4, path, (size_t)length + 1U);
     HANDLE final_handle = INVALID_HANDLE_VALUE;
     for (DWORD boundary = 3; boundary <= length; boundary++) {
         if (boundary < length && path[boundary] != L'\\') {
             continue;
         }
         if (boundary < length && boundary > 0 && path[boundary - 1] == L'\\') {
+            free(prefixed);
             free(path);
             return INVALID_HANDLE_VALUE;
         }
-        wchar_t saved = path[boundary];
-        path[boundary] = L'\0';
+        wchar_t saved = prefixed[boundary + 4U];
+        prefixed[boundary + 4U] = L'\0';
         HANDLE handle =
-            CreateFileW(path, FILE_READ_ATTRIBUTES | READ_CONTROL,
+            CreateFileW(prefixed, FILE_READ_ATTRIBUTES | READ_CONTROL,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-        path[boundary] = saved;
+        prefixed[boundary + 4U] = saved;
         BY_HANDLE_FILE_INFORMATION information;
         bool valid = handle != INVALID_HANDLE_VALUE && GetFileType(handle) == FILE_TYPE_DISK &&
                      GetFileInformationByHandle(handle, &information) &&
@@ -472,6 +570,7 @@ static HANDLE activation_windows_directory_open_no_reparse(const char *directory
             if (handle != INVALID_HANDLE_VALUE) {
                 (void)CloseHandle(handle);
             }
+            free(prefixed);
             free(path);
             return INVALID_HANDLE_VALUE;
         }
@@ -481,8 +580,32 @@ static HANDLE activation_windows_directory_open_no_reparse(const char *directory
             (void)CloseHandle(handle);
         }
     }
+    free(prefixed);
     free(path);
     return final_handle;
+}
+
+/* SOURCE-side directory rule: trusted owner, and cross-account grants are
+ * tolerated only for pure add rights (FILE_ADD_FILE/FILE_ADD_SUBDIRECTORY,
+ * standard on Downloads-class locations) — they cannot modify the existing
+ * source file, whose bytes are pinned by identity recheck plus the staged
+ * copy's build-fingerprint validation. */
+static bool activation_source_directory_secure(const char *directory,
+                                               activation_file_identity_t *identity_out) {
+    HANDLE handle = activation_windows_directory_open_no_reparse(directory);
+    BY_HANDLE_FILE_INFORMATION information;
+    bool open_ok = handle != INVALID_HANDLE_VALUE &&
+                   GetFileInformationByHandle(handle, &information) &&
+                   (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                   (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+                   activation_windows_identity(handle, identity_out, false);
+    bool owner_ok = open_ok && activation_windows_owner_is_trusted(handle);
+    bool acl_ok = owner_ok && activation_windows_acl_check(
+                                  handle, FILE_ADD_FILE | (DWORD)FILE_ADD_SUBDIRECTORY);
+    if (handle != INVALID_HANDLE_VALUE) {
+        (void)CloseHandle(handle);
+    }
+    return acl_ok;
 }
 
 static bool activation_directory_secure(const char *directory, int *unused,
@@ -490,15 +613,17 @@ static bool activation_directory_secure(const char *directory, int *unused,
     (void)unused;
     HANDLE handle = activation_windows_directory_open_no_reparse(directory);
     BY_HANDLE_FILE_INFORMATION information;
-    bool ok = handle != INVALID_HANDLE_VALUE && GetFileInformationByHandle(handle, &information) &&
-              (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
-              (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-              activation_windows_identity(handle, identity_out, false) &&
-              activation_windows_owner_is_current(handle) && activation_windows_acl_secure(handle);
+    bool open_ok = handle != INVALID_HANDLE_VALUE &&
+                   GetFileInformationByHandle(handle, &information) &&
+                   (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                   (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+                   activation_windows_identity(handle, identity_out, false);
+    bool owner_ok = open_ok && activation_windows_owner_is_current(handle);
+    bool acl_ok = owner_ok && activation_windows_acl_secure(handle);
     if (handle != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(handle);
     }
-    return ok;
+    return acl_ok;
 }
 
 #else
@@ -807,8 +932,9 @@ static cbm_activation_transaction_status_t activation_create_unique(
 }
 
 #ifdef _WIN32
-static bool activation_external_snapshot(const char *path, bool *exists_out,
-                                         activation_file_identity_t *identity_out) {
+static bool activation_external_snapshot_with_owner(const char *path, bool require_current_owner,
+                                                    bool *exists_out,
+                                                    activation_file_identity_t *identity_out) {
     *exists_out = false;
     wchar_t *wide = activation_utf8_to_wide(path);
     if (!wide) {
@@ -828,9 +954,11 @@ static bool activation_external_snapshot(const char *path, bool *exists_out,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                                 OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     free(wide);
-    bool valid =
-        handle != INVALID_HANDLE_VALUE && activation_windows_identity(handle, identity_out, true) &&
-        activation_windows_owner_is_current(handle) && activation_windows_acl_secure(handle);
+    bool valid = handle != INVALID_HANDLE_VALUE &&
+                 activation_windows_identity(handle, identity_out, true) &&
+                 (require_current_owner ? activation_windows_owner_is_current(handle)
+                                        : activation_windows_owner_is_trusted(handle)) &&
+                 activation_windows_acl_secure(handle);
     if (handle != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(handle);
     }
@@ -889,7 +1017,7 @@ static bool activation_entry_snapshot(const cbm_activation_transaction_t *transa
                                       activation_file_identity_t *identity_out) {
 #ifdef _WIN32
     return activation_directory_still_valid(transaction) &&
-           activation_external_snapshot(path, exists_out, identity_out);
+           activation_external_snapshot_with_owner(path, true, exists_out, identity_out);
 #else
     (void)path;
     return activation_posix_entry_snapshot_with_links(transaction, name, (nlink_t)1, exists_out,
@@ -1075,6 +1203,8 @@ static cbm_activation_transaction_status_t activation_transaction_prepare(
     }
     if (!activation_entry_snapshot(transaction, transaction->target_path, transaction->target_name,
                                    &transaction->target_existed, &transaction->target_identity)) {
+#ifdef _WIN32
+#endif
         activation_transaction_destroy(transaction);
         return CBM_ACTIVATION_TRANSACTION_IO;
     }
@@ -1150,12 +1280,18 @@ static bool activation_source_open(const char *path, activation_native_file_t *f
         return false;
     }
 #ifdef _WIN32
-    int ignored = 0;
     activation_file_identity_t directory_identity;
     activation_file_identity_t expected;
     bool exists = false;
-    if (!activation_directory_secure(directory, &ignored, &directory_identity) ||
-        !activation_external_snapshot(path, &exists, &expected) || !exists) {
+    bool src_dir_ok = activation_source_directory_secure(directory, &directory_identity);
+    /* The source (a downloaded release bundle) follows the machine's
+     * default-owner policy; its bytes are pinned by identity recheck plus the
+     * staged copy's build-fingerprint validation, so a trusted owner
+     * (user/Administrators/SYSTEM) is sufficient here. Targets keep the
+     * exact-current-owner rule. */
+    bool snapshot_ok =
+        src_dir_ok && activation_external_snapshot_with_owner(path, false, &exists, &expected);
+    if (!src_dir_ok || !snapshot_ok || !exists) {
         free(directory);
         free(name);
         return false;
@@ -1174,9 +1310,9 @@ static bool activation_source_open(const char *path, activation_native_file_t *f
     activation_file_identity_t actual;
     activation_file_identity_t directory_now;
     bool valid = file != INVALID_HANDLE_VALUE && activation_windows_identity(file, &actual, true) &&
-                 activation_windows_owner_is_current(file) && activation_windows_acl_secure(file) &&
+                 activation_windows_owner_is_trusted(file) && activation_windows_acl_secure(file) &&
                  activation_identity_equal(&actual, &expected) &&
-                 activation_directory_secure(directory, &ignored, &directory_now) &&
+                 activation_source_directory_secure(directory, &directory_now) &&
                  activation_identity_equal(&directory_now, &directory_identity);
     if (!valid) {
         if (file != INVALID_HANDLE_VALUE) {

@@ -1808,7 +1808,7 @@ static bool reserve_unique_corrupt_pending(const char *path, char *pending, size
             continue;
         }
 #ifdef _WIN32
-        wchar_t *wide = cbm_utf8_to_wide(pending);
+        wchar_t *wide = cbm_path_to_wide(pending);
         HANDLE file = wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW,
                                          FILE_ATTRIBUTE_NORMAL, NULL)
                            : INVALID_HANDLE_VALUE;
@@ -1876,8 +1876,8 @@ static bool sync_parent_directory(const char *path) {
  * atomic no-clobber operations within the cache directory. */
 static bool publish_corrupt_backup(const char *pending, const char *backup) {
 #ifdef _WIN32
-    wchar_t *wide_pending = cbm_utf8_to_wide(pending);
-    wchar_t *wide_backup = cbm_utf8_to_wide(backup);
+    wchar_t *wide_pending = cbm_path_to_wide(pending);
+    wchar_t *wide_backup = cbm_path_to_wide(backup);
     bool published = wide_pending && wide_backup &&
                      MoveFileExW(wide_pending, wide_backup, MOVEFILE_WRITE_THROUGH) != 0;
     free(wide_pending);
@@ -9085,6 +9085,19 @@ static bool validate_search_path_arg(const char *s) {
     return true;
 }
 
+/* These characters retain command-language meaning inside quoted cmd.exe
+ * arguments: percent expands environment variables, exclamation can expand
+ * delayed variables, and caret changes parsing. Never interpolate them from a
+ * stored project root or request branch into the Windows detect_changes payload.
+ * /V:OFF is defense in depth for exclamation; validation remains the boundary. */
+static bool validate_windows_cmd_interpolation_arg(const char *s) {
+#ifdef _WIN32
+    return s && strpbrk(s, "%!^") == NULL;
+#else
+    return s != NULL;
+#endif
+}
+
 static bool validate_search_args(const char *root_path, const char *file_pattern) {
     if (!validate_search_path_arg(root_path)) {
         return false;
@@ -9421,6 +9434,34 @@ static bool mcp_command_output_path(char out[CBM_SZ_2K]) {
     return true;
 }
 
+#ifdef _WIN32
+/* Resolve the OS-owned command processor without consulting PATH or mutable
+ * COMSPEC. cbm_subprocess receives this as lpApplicationName and validates the
+ * same absolute cmd.exe path before using the dedicated payload serializer. */
+static bool mcp_resolve_windows_cmd(char out[CBM_SZ_4K]) {
+    if (!out) {
+        return false;
+    }
+    out[0] = '\0';
+    wchar_t system_directory[MAX_PATH + 1];
+    UINT directory_length = GetSystemDirectoryW(system_directory, MAX_PATH + 1);
+    static const wchar_t suffix[] = L"\\cmd.exe";
+    if (directory_length == 0 || directory_length > MAX_PATH ||
+        (size_t)directory_length + (sizeof(suffix) / sizeof(suffix[0])) >
+            sizeof(system_directory) / sizeof(system_directory[0])) {
+        return false;
+    }
+    memcpy(system_directory + directory_length, suffix, sizeof(suffix));
+    char *candidate = cbm_wide_to_utf8(system_directory);
+    if (!candidate) {
+        return false;
+    }
+    bool resolved = cbm_canonical_path(candidate, out, CBM_SZ_4K) != 0;
+    free(candidate);
+    return resolved;
+}
+#endif
+
 static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *command,
                                              char output_path[CBM_SZ_2K],
                                              cbm_proc_result_t *result_out) {
@@ -9433,18 +9474,23 @@ static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *
         return -1;
     }
 #ifdef _WIN32
-    const char *shell = getenv("COMSPEC");
-    if (!shell || !shell[0]) {
-        shell = "cmd.exe";
+    char shell[CBM_SZ_4K];
+    if (!mcp_resolve_windows_cmd(shell)) {
+        (void)cbm_unlink(output_path);
+        output_path[0] = '\0';
+        return -1;
     }
-    const char *argv[] = {shell, "/D", "/S", "/C", command, NULL};
 #else
     const char *shell = "/bin/sh";
     const char *argv[] = {"sh", "-c", command, NULL};
 #endif
     cbm_proc_opts_t options = {
         .bin = shell,
+#ifdef _WIN32
+        .windows_cmd_payload = command,
+#else
         .argv = argv,
+#endif
         .log_file = output_path,
         .quiet_timeout_ms = 0,
         .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
@@ -9634,7 +9680,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * "<base>"...HEAD`; a value starting with '-' would be read by git as an
      * option rather than a ref (e.g. `--output=<path>` writes the diff to an
      * arbitrary file). A real git ref never begins with '-'. */
-    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-') {
+    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-' ||
+        !validate_windows_cmd_interpolation_arg(base_branch)) {
         free(project);
         free(base_branch);
         free(scope);
@@ -9652,7 +9699,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return res;
     }
 
-    if (!validate_search_path_arg(root_path)) {
+    if (!validate_search_path_arg(root_path) ||
+        !validate_windows_cmd_interpolation_arg(root_path)) {
         free(root_path);
         free(project);
         free(base_branch);

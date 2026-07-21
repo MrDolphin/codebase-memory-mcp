@@ -320,6 +320,49 @@ TEST(windows_generation_path_is_launcher_relative_for_custom_unicode_directory) 
     PASS();
 }
 
+TEST(windows_generation_launcher_path_shares_the_payload_generation) {
+    const wchar_t launcher[] =
+        L"D:\\CBM Custom\\M\u00e4rtin\\\u5de5\u5177\\codebase-memory-mcp.exe";
+    const wchar_t expected[] = L"D:\\CBM Custom\\M\u00e4rtin\\\u5de5\u5177\\.cbm\\generations\\"
+                               L"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\"
+                               L"codebase-memory-mcp.exe";
+    wchar_t actual[512];
+    ASSERT_TRUE(cbm_windows_generation_launcher_path(launcher, launcher_sha256, actual,
+                                                     sizeof(actual) / sizeof(actual[0])));
+    ASSERT_EQ(wcscmp(actual, expected), 0);
+
+    const wchar_t root_launcher[] = L"C:\\codebase-memory-mcp.exe";
+    const wchar_t root_expected[] =
+        L"C:\\.cbm\\generations\\"
+        L"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\"
+        L"codebase-memory-mcp.exe";
+    ASSERT_TRUE(cbm_windows_generation_launcher_path(root_launcher, launcher_sha256, actual,
+                                                     sizeof(actual) / sizeof(actual[0])));
+    ASSERT_EQ(wcscmp(actual, root_expected), 0);
+    PASS();
+}
+
+TEST(windows_retired_state_path_is_unique_safe_and_launcher_relative) {
+    const wchar_t launcher[] =
+        L"D:\\CBM Custom\\M\u00e4rtin\\\u5de5\u5177\\codebase-memory-mcp.exe";
+    const wchar_t expected[] =
+        L"D:\\CBM Custom\\M\u00e4rtin\\\u5de5\u5177\\.cbm-retired-v1-"
+        L"0123456789abcdef-4242";
+    wchar_t actual[512];
+    ASSERT_TRUE(cbm_windows_retired_state_path(launcher, launcher_sha256, 4242U, actual,
+                                               sizeof(actual) / sizeof(actual[0])));
+    ASSERT_EQ(wcscmp(actual, expected), 0);
+    ASSERT_FALSE(cbm_windows_retired_state_path(launcher, launcher_sha256, 0U, actual,
+                                                sizeof(actual) / sizeof(actual[0])));
+    ASSERT_EQ(actual[0], L'\0');
+    ASSERT_FALSE(cbm_windows_retired_state_path(L"codebase-memory-mcp.exe", launcher_sha256, 4242U,
+                                                actual, sizeof(actual) / sizeof(actual[0])));
+    ASSERT_EQ(actual[0], L'\0');
+    ASSERT_FALSE(cbm_windows_retired_state_path(launcher, launcher_sha256, 4242U, actual, 32U));
+    ASSERT_EQ(actual[0], L'\0');
+    PASS();
+}
+
 TEST(windows_generation_path_rejects_ambiguous_or_truncated_inputs) {
     wchar_t output[512];
     memset(output, 0xa5, sizeof(output));
@@ -336,6 +379,16 @@ TEST(windows_generation_path_rejects_ambiguous_or_truncated_inputs) {
     uppercase[0] = 'A';
     ASSERT_FALSE(cbm_windows_generation_payload_path(L"C:\\codebase-memory-mcp.exe", uppercase,
                                                      output, sizeof(output) / sizeof(output[0])));
+    ASSERT_EQ(output[0], L'\0');
+
+    ASSERT_FALSE(cbm_windows_generation_launcher_path(L"codebase-memory-mcp.exe", launcher_sha256,
+                                                      output, sizeof(output) / sizeof(output[0])));
+    ASSERT_EQ(output[0], L'\0');
+    ASSERT_FALSE(cbm_windows_generation_launcher_path(L"C:\\codebase-memory-mcp.exe",
+                                                      launcher_sha256, output, 12));
+    ASSERT_EQ(output[0], L'\0');
+    ASSERT_FALSE(cbm_windows_generation_launcher_path(L"C:\\codebase-memory-mcp.exe", uppercase,
+                                                      output, sizeof(output) / sizeof(output[0])));
     ASSERT_EQ(output[0], L'\0');
     PASS();
 }
@@ -389,6 +442,8 @@ SUITE(windows_launcher_state) {
     RUN_TEST(windows_current_v1_encoder_rejects_noncanonical_state);
     RUN_TEST(windows_current_v1_decoder_rejects_every_noncanonical_field);
     RUN_TEST(windows_generation_path_is_launcher_relative_for_custom_unicode_directory);
+    RUN_TEST(windows_generation_launcher_path_shares_the_payload_generation);
+    RUN_TEST(windows_retired_state_path_is_unique_safe_and_launcher_relative);
     RUN_TEST(windows_generation_path_rejects_ambiguous_or_truncated_inputs);
     RUN_TEST(windows_launcher_action_classifier_matches_top_level_dispatch);
     RUN_TEST(windows_portable_payload_rejects_only_managed_mutations);

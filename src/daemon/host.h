@@ -14,6 +14,10 @@ typedef struct {
     cbm_daemon_build_identity_t identity;
     const char *executable_path;
     atomic_int *stop_requested;
+    /* Born via `daemon start`: the generation survives its last client
+     * disconnect and the no-client initial window; it stops only through the
+     * stop/drain ops or an explicit process kill. */
+    bool permanent;
 } cbm_daemon_host_config_t;
 
 /* Blocks for the complete daemon generation. The first admitted frontend owns

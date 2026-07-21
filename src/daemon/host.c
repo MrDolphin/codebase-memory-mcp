@@ -68,13 +68,15 @@ typedef struct {
     cbm_http_server_t *(*server_new)(void *context, int port);
     void (*server_configure)(void *context, cbm_http_server_t *server, host_state_t *host);
     void (*server_stop)(void *context, cbm_http_server_t *server);
-    void (*server_free)(void *context, cbm_http_server_t *server);
+    bool (*server_free)(void *context, cbm_http_server_t *server);
     int (*thread_start)(void *context, cbm_thread_t *thread, void *(*entry)(void *),
                         void *entry_context);
     int (*thread_join)(void *context, cbm_thread_t *thread);
 } host_http_ops_t;
 
 struct host_state {
+    /* Mirrors cbm_daemon_host_config_t.permanent for prepare-time consumers. */
+    bool permanent;
     cbm_daemon_application_t *application;
     cbm_watcher_t *watcher;
     cbm_store_t *watch_store;
@@ -85,6 +87,7 @@ struct host_state {
     cbm_thread_t http_thread;
     bool watcher_started;
     bool http_started;
+    bool http_retiring;
     bool http_config_loaded;
     bool http_config_enabled;
     bool http_assets_available;
@@ -337,15 +340,37 @@ static void host_http_server_stop_default(void *context, cbm_http_server_t *serv
     cbm_http_server_stop(server);
 }
 
-static void host_http_server_free_default(void *context, cbm_http_server_t *server) {
+static bool host_http_server_free_default(void *context, cbm_http_server_t *server) {
     (void)context;
-    cbm_http_server_free(server);
+    return cbm_http_server_free(server);
+}
+
+typedef int (*host_http_thread_create_fn)(void *context, cbm_thread_t *thread,
+                                          void *(*entry)(void *), void *entry_context);
+
+static int host_http_thread_create_default(void *context, cbm_thread_t *thread,
+                                           void *(*entry)(void *), void *entry_context) {
+    (void)context;
+    return cbm_thread_create(thread, 0, entry, entry_context);
+}
+
+static int host_http_thread_schedule_create(cbm_thread_t *thread, void *(*entry)(void *),
+                                            cbm_http_server_t *server,
+                                            host_http_thread_create_fn create,
+                                            void *create_context) {
+    if (!server || !create || !cbm_http_server_schedule_run(server))
+        return -1;
+    int rc = create(create_context, thread, entry, server);
+    if (rc != 0 && !cbm_http_server_cancel_scheduled_run(server))
+        return -1;
+    return rc;
 }
 
 static int host_http_thread_start_default(void *context, cbm_thread_t *thread,
                                           void *(*entry)(void *), void *entry_context) {
     (void)context;
-    return cbm_thread_create(thread, 0, entry, entry_context);
+    return host_http_thread_schedule_create(thread, entry, entry_context,
+                                            host_http_thread_create_default, NULL);
 }
 
 static int host_http_thread_join_default(void *context, cbm_thread_t *thread) {
@@ -364,17 +389,22 @@ static const host_http_ops_t g_host_http_default_ops = {
     .thread_join = host_http_thread_join_default,
 };
 
-static void host_http_stop_join_free(host_state_t *host) {
+static bool host_http_stop_join_free(host_state_t *host) {
     const host_http_ops_t *ops = host->http_ops;
-    if (host->http) {
+    if (host->http && host->http_started) {
         ops->server_stop(ops->context, host->http);
     }
     if (host->http_started) {
-        (void)ops->thread_join(ops->context, &host->http_thread);
+        if (ops->thread_join(ops->context, &host->http_thread) != 0) {
+            return false;
+        }
         host->http_started = false;
     }
-    ops->server_free(ops->context, host->http);
+    if (!ops->server_free(ops->context, host->http)) {
+        return false;
+    }
     host->http = NULL;
+    return true;
 }
 
 static uint64_t host_deadline_from(uint64_t now_ms, uint32_t delay_ms) {
@@ -409,8 +439,22 @@ static void host_http_reconcile_at(host_state_t *host, uint64_t now_ms, bool for
     bool config_changed = !host->http_config_loaded ||
                           desired.ui_enabled != host->http_config_enabled ||
                           desired.ui_port != host->http_config_port;
+    if (config_changed && !host->http_retiring) {
+        host->http_retiring = true;
+        host->http_retry_at_ms = now_ms;
+        host->http_retry_delay_ms = HOST_HTTP_RETRY_INITIAL_MS;
+    }
+    if (host->http_retiring) {
+        if (now_ms < host->http_retry_at_ms) {
+            return;
+        }
+        if (!host_http_stop_join_free(host)) {
+            host_http_schedule_retry(host, now_ms, "server_retire");
+            return;
+        }
+        host->http_retiring = false;
+    }
     if (config_changed) {
-        host_http_stop_join_free(host);
         host->http_config_loaded = true;
         host->http_config_enabled = desired.ui_enabled;
         host->http_config_port = desired.ui_port;
@@ -446,14 +490,16 @@ static void host_http_reconcile_at(host_state_t *host, uint64_t now_ms, bool for
         host->http_retry_at_ms = 0;
         host->http_retry_delay_ms = HOST_HTTP_RETRY_INITIAL_MS;
     } else {
-        ops->server_free(ops->context, host->http);
-        host->http = NULL;
+        host->http_retiring = true;
+        if (host_http_stop_join_free(host)) {
+            host->http_retiring = false;
+        }
         host_http_schedule_retry(host, now_ms, "thread_start");
     }
 }
 
 static void host_background_stop(host_state_t *host) {
-    if (host->http) {
+    if (host->http && host->http_started) {
         host->http_ops->server_stop(host->http_ops->context, host->http);
     }
     if (host->watcher) {
@@ -461,15 +507,20 @@ static void host_background_stop(host_state_t *host) {
     }
 }
 
-static void host_background_join(host_state_t *host) {
+static bool host_background_join(host_state_t *host) {
     if (host->http_started) {
-        (void)host->http_ops->thread_join(host->http_ops->context, &host->http_thread);
+        if (host->http_ops->thread_join(host->http_ops->context, &host->http_thread) != 0) {
+            return false;
+        }
         host->http_started = false;
     }
     if (host->watcher_started) {
-        (void)cbm_thread_join(&host->watcher_thread);
+        if (cbm_thread_join(&host->watcher_thread) != 0) {
+            return false;
+        }
         host->watcher_started = false;
     }
+    return true;
 }
 
 static bool host_project_lock_manager_free_once(void *context) {
@@ -482,7 +533,11 @@ static bool host_project_lock_manager_free_once(void *context) {
 }
 
 static void host_state_free(host_state_t *host) {
-    host_http_stop_join_free(host);
+    if (!host_http_stop_join_free(host)) {
+        /* The retained server or one of its callbacks can still borrow every
+         * dependency below. Process containment is the only safe teardown. */
+        host_force_terminate("http_cleanup");
+    }
     if (host->application) {
         if (!cbm_daemon_application_free(host->application)) {
             /* The application still owns work or a borrowed callback context.
@@ -528,6 +583,9 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
         .project_locks = host->project_locks,
     };
     host->application = cbm_daemon_application_new(&application_config);
+    if (host->application && host->permanent) {
+        cbm_daemon_application_set_permanent(host->application, true);
+    }
     if (!host->watch_store || !host->watcher || !host->project_locks || !host->application) {
         return false;
     }
@@ -547,6 +605,8 @@ bool cbm_daemon_host_state_prepare_for_test(const cbm_daemon_ipc_endpoint_t *end
 typedef struct {
     size_t create_failures;
     size_t thread_start_failures;
+    size_t server_free_failures;
+    size_t config_change_after_load;
     size_t config_loads;
     size_t server_create_attempts;
     size_t thread_start_attempts;
@@ -559,7 +619,9 @@ static void host_http_test_config_load(void *opaque, cbm_ui_config_t *config_out
     host_http_reconcile_test_context_t *context = opaque;
     context->config_loads++;
     config_out->ui_enabled = true;
-    config_out->ui_port = CBM_UI_DEFAULT_PORT;
+    bool change_port = context->config_change_after_load > 0 &&
+                       context->config_loads == context->config_change_after_load;
+    config_out->ui_port = change_port ? CBM_UI_DEFAULT_PORT + 1 : CBM_UI_DEFAULT_PORT;
 }
 
 static cbm_http_server_t *host_http_test_server_new(void *opaque, int port) {
@@ -591,10 +653,12 @@ static void host_http_test_server_stop(void *opaque, cbm_http_server_t *server) 
 /* WHY: See host_http_test_server_stop; changing only this implementation to a
  * pointer-to-const parameter would make it incompatible with host_http_ops_t. */
 // cppcheck-suppress constParameterCallback
-static void host_http_test_server_free(void *opaque, cbm_http_server_t *server) {
+static bool host_http_test_server_free(void *opaque, cbm_http_server_t *server) {
+    host_http_reconcile_test_context_t *context = opaque;
     if (server) {
-        ((host_http_reconcile_test_context_t *)opaque)->server_frees++;
+        context->server_frees++;
     }
+    return !server || context->server_frees > context->server_free_failures;
 }
 
 static int host_http_test_thread_start(void *opaque, cbm_thread_t *thread, void *(*entry)(void *),
@@ -650,7 +714,9 @@ bool cbm_daemon_host_http_reconcile_sequence_for_test(
     bool active = host.http_started;
     uint32_t largest_retry = host.http_largest_scheduled_retry_ms;
     uint64_t next_retry = host.http_retry_at_ms;
-    host_http_stop_join_free(&host);
+    if (!host_http_stop_join_free(&host)) {
+        return false;
+    }
 
     *result_out = (cbm_daemon_host_http_reconcile_test_result_t){
         .config_loads = context.config_loads,
@@ -666,6 +732,85 @@ bool cbm_daemon_host_http_reconcile_sequence_for_test(
     return true;
 }
 
+bool cbm_daemon_host_http_reconcile_free_refusal_for_test(
+    cbm_daemon_host_http_free_refusal_test_result_t *result_out) {
+    if (!result_out) {
+        return false;
+    }
+    host_http_reconcile_test_context_t context = {
+        .server_free_failures = 1,
+        .config_change_after_load = 2,
+    };
+    const host_http_ops_t ops = {
+        .context = &context,
+        .config_load = host_http_test_config_load,
+        .server_new = host_http_test_server_new,
+        .server_configure = host_http_test_server_configure,
+        .server_stop = host_http_test_server_stop,
+        .server_free = host_http_test_server_free,
+        .thread_start = host_http_test_thread_start,
+        .thread_join = host_http_test_thread_join,
+    };
+    host_state_t host = {
+        .http_assets_available = true,
+        .http_ops = &ops,
+    };
+
+    host_http_reconcile_at(&host, 0, true);
+    host_http_reconcile_at(&host, HOST_HTTP_CONFIG_POLL_MS, false);
+    bool retained_after_refusal =
+        host.http != NULL && !host.http_started && context.server_create_attempts == 1;
+    size_t creates_after_refusal = context.server_create_attempts;
+    host_http_reconcile_at(&host, HOST_HTTP_CONFIG_POLL_MS * 2U, false);
+    bool replacement_active = host.http != NULL && host.http_started;
+
+    *result_out = (cbm_daemon_host_http_free_refusal_test_result_t){
+        .server_create_attempts_after_refusal = creates_after_refusal,
+        .server_create_attempts = context.server_create_attempts,
+        .thread_start_attempts = context.thread_start_attempts,
+        .server_stops = context.server_stops,
+        .server_free_attempts = context.server_frees,
+        .thread_joins = context.thread_joins,
+        .retained_after_refusal = retained_after_refusal,
+        .replacement_active_after_retry = replacement_active,
+    };
+    return host_http_stop_join_free(&host);
+}
+
+typedef struct {
+    cbm_http_server_t *server;
+    bool free_refused_while_scheduled;
+} host_http_thread_create_failure_test_t;
+
+/* WHY: the signature is fixed by the host_http_ops_t thread_start hook type;
+ * a const pointee would make the function-pointer types incompatible. */
+static int host_http_thread_create_failure_for_test(
+    void *opaque, cbm_thread_t *thread, void *(*entry)(void *),
+    void *entry_context) { // cppcheck-suppress constParameterCallback
+    (void)thread;
+    (void)entry;
+    host_http_thread_create_failure_test_t *test = opaque;
+    if (!test || entry_context != test->server)
+        return -1;
+    test->free_refused_while_scheduled = !cbm_http_server_free(test->server);
+    return -1;
+}
+
+bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void) {
+    cbm_http_server_t *server = cbm_http_server_new(0);
+    if (!server)
+        return false;
+    host_http_thread_create_failure_test_t test = {
+        .server = server,
+    };
+    cbm_thread_t unused_thread = {0};
+    int rc = host_http_thread_schedule_create(&unused_thread, host_http_thread, server,
+                                              host_http_thread_create_failure_for_test, &test);
+    bool free_refused = test.free_refused_while_scheduled;
+    bool final_free_succeeded = free_refused && cbm_http_server_free(server);
+    return rc != 0 && free_refused && final_free_succeeded;
+}
+
 static bool host_background_start(host_state_t *host) {
     if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
         return false;
@@ -677,7 +822,7 @@ static bool host_background_start(host_state_t *host) {
 }
 
 static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
-                                   atomic_int *stop_requested, host_state_t *host) {
+                                   atomic_int *stop_requested, host_state_t *host, bool permanent) {
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
     uint64_t stopping_deadline = 0;
     for (;;) {
@@ -703,7 +848,10 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
          * mid-conversation between per-request connections. */
         bool admitted = cbm_daemon_runtime_service_clients_admitted_total(service) > 0;
         bool stop = stop_requested && atomic_load(stop_requested);
-        if (stop || (!admitted && cbm_now_ms() >= initial_deadline)) {
+        /* A permanent generation (`daemon start`) skips the nobody-ever-
+         * connected window — it exists precisely to idle ahead of clients.
+         * Explicit stop requests (signals) are still honored. */
+        if (stop || (!permanent && !admitted && cbm_now_ms() >= initial_deadline)) {
             cbm_log_info("daemon.lifetime_end", "reason",
                          stop ? "stop_requested" : "initial_window_expired");
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
@@ -842,6 +990,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     cbm_index_supervisor_mark_host();
 
     host_state_t host = {0};
+    host.permanent = config->permanent;
     if (!host_state_prepare(&host, config->endpoint)) {
         cbm_log_error("daemon.start_failed", "component", "application");
         host_state_free(&host);
@@ -864,6 +1013,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         .request_timeout_ms = HOST_REQUEST_TIMEOUT_MS,
         .shutdown_timeout_ms = HOST_RUNTIME_SHUTDOWN_MS,
         .application = callbacks,
+        .permanent = config->permanent,
     };
     cbm_daemon_runtime_service_t *service =
         cbm_daemon_runtime_service_start_reserved(&runtime_config, &lifetime_reservation);
@@ -884,7 +1034,9 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
             host_force_terminate("operations");
         }
         host_background_stop(&host);
-        host_background_join(&host);
+        if (!host_background_join(&host)) {
+            host_force_terminate("background");
+        }
         if (!host_runtime_stop_free(service)) {
             host_force_terminate("runtime");
         }
@@ -914,7 +1066,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                                                     : "unavailable",
                  "memory_budget_bytes", memory_budget, "physical_job_limit", physical_job_limit,
                  "worker_memory_budget_bytes", worker_memory_budget);
-    if (!host_wait_for_lifetime(service, config->stop_requested, &host)) {
+    if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent)) {
         host_force_terminate("runtime");
     }
 
@@ -924,7 +1076,9 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         host_force_terminate("operations");
     }
     host_background_stop(&host);
-    host_background_join(&host);
+    if (!host_background_join(&host)) {
+        host_force_terminate("background");
+    }
     if (!host_runtime_stop_free(service)) {
         host_force_terminate("runtime");
     }

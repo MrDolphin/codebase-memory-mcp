@@ -69,6 +69,11 @@ typedef struct {
 /* lease_timeout_ms is fixed for the coordinator lifetime. All timestamps must
  * come from the same monotonic clock domain. */
 cbm_daemon_coordinator_t *cbm_daemon_coordinator_new(uint64_t lease_timeout_ms);
+
+/* A PERMANENT coordinator (backing a `daemon start` generation) never
+ * self-transitions to STOPPING when its client count reaches zero; only the
+ * explicit stop/drain paths end it. */
+void cbm_daemon_coordinator_set_permanent(cbm_daemon_coordinator_t *coordinator, bool permanent);
 /* The caller must first quiesce coordinator calls and hook invocations. */
 void cbm_daemon_coordinator_free(cbm_daemon_coordinator_t *coordinator);
 

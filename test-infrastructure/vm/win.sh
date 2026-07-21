@@ -58,6 +58,7 @@ SCP=(scp "${SSH_OPTIONS[@]}")
 
 vm() { local env="$1"; shift
       "${SSH[@]}" "C:\\msys64\\msys2_shell.cmd -defterm -no-start -${env} -c \"set -e -o pipefail; $*\""; }
+vm_cmd() { "${SSH[@]}" "$@"; } # plain cmd.exe (CI-shaped environment)
 
 cmd="${1:-status}"; shift || true
 case "$cmd" in
@@ -111,8 +112,21 @@ guards)
     # Match the Windows CI product build: a clean, embedded-UI payload plus the
     # permanent launcher. Passing those freshly built artifacts to the maintained
     # PowerShell driver prevents an earlier non-UI `win.sh build` from silently
-    # turning product guards into precondition skips.
-    vm clangarm64 "cd /c/cbm && scripts/build.sh --with-ui CC=clang CXX=clang++ SANITIZE= && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe -Launcher build/c/codebase-memory-mcp-launcher.exe"
+    # turning product guards into precondition skips. BUILD_DIR isolates the
+    # clean product build from build/c, which build.sh would otherwise wipe —
+    # taking the test-runner and every incremental object with it. The UI build
+    # needs the official MSVC Node.js (/c/node, from provision-windows.sh):
+    # MSVC-built npm native modules cannot resolve Node-API symbols against
+    # MSYS2's mingw node.
+    vm clangarm64 "export PATH=/c/node:\$PATH && cd /c/cbm && scripts/build.sh --with-ui CC=clang CXX=clang++ SANITIZE= BUILD_DIR=build/guards"
+    # The guards themselves run through plain cmd/PowerShell, exactly like the
+    # CI job: under the MSYS2 shell TMP is C:\msys64\tmp, whose ancestry
+    # grants mutation rights to Authenticated Users — the daemon's
+    # cache-private validation (correctly) refuses caches there, which is a
+    # different environment shape than CI's profile-rooted TEMP. Python must
+    # be PREPENDED: the Microsoft Store python.exe alias stub lives early in
+    # the profile PATH and otherwise shadows any appended interpreter.
+    vm_cmd "cd /d C:\\cbm && set PATH=C:\\msys64\\clangarm64\\bin;C:\\msys64\\usr\\bin;%PATH%&& powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\test-windows.ps1 -GuardsOnly -Binary build\\guards\\codebase-memory-mcp.exe -Launcher build\\guards\\codebase-memory-mcp-launcher.exe -Make C:\\msys64\\usr\\bin\\make.exe"
     ;;
 smoke-install)
     # Real managed install E2E with FULL stderr visible — the exact class the

@@ -40,6 +40,13 @@ enum {
     RUNTIME_ACCEPT_POLL_MS = 20,
     RUNTIME_WAIT_POLL_NS = 1000000,
     RUNTIME_WORKER_STACK_SIZE = 256 * 1024,
+    /* Bounds the drain-before-close wait for a peer consuming its final
+     * response; interrupted or already-poisoned connections skip it. */
+    RUNTIME_WORKER_DRAIN_TIMEOUT_MS = 2000,
+    /* Inline rejections run on the accept thread, so their drain stays short:
+     * a local cooperative peer is already blocked in read and consumes the
+     * rejection within milliseconds. */
+    RUNTIME_REJECT_DRAIN_TIMEOUT_MS = 250,
     RUNTIME_PATH_CAP = 4096,
 
     RENDEZVOUS_REQUEST_ABI_OFFSET = 0,
@@ -148,6 +155,9 @@ struct cbm_daemon_runtime_service {
      * entirely between two host polls, and a sampled count then reads zero
      * forever, stopping a daemon whose client is mid-conversation. */
     uint64_t admitted_total;
+    /* Born via `daemon start`: last-client-disconnect does not begin stopping.
+     * The stop/drain ops and process kill remain the only exits. */
+    bool permanent;
 
     cbm_thread_t accept_thread;
     bool accept_thread_started;
@@ -1093,10 +1103,12 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
         if (service->committed_clients > 0) {
             service->committed_clients--;
         }
-        if (service->committed_clients == 0) {
+        if (service->committed_clients == 0 && !service->permanent) {
             /* A HELLO whose application session is still opening is only a
              * provisional coordinator client. It cannot keep the generation
-             * alive after the final fully committed frontend disconnects. */
+             * alive after the final fully committed frontend disconnects.
+             * A permanent generation (`daemon start`) deliberately survives
+             * this: only the stop/drain ops or a process kill end it. */
             runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
                                                   "last_committed_client_disconnected");
         }
@@ -1330,6 +1342,18 @@ static bool runtime_worker_handle_application_cancel(cbm_daemon_runtime_worker_t
     return true;
 }
 
+static bool runtime_worker_handle_close_intent(cbm_daemon_runtime_worker_t *worker,
+                                               uint32_t length) {
+    if (length != 0) {
+        return false;
+    }
+    /* Terminal for the session (admission, coordinator registration, session
+     * cancel), but not for the connection: the worker keeps reading so the
+     * in-flight response tail and the eventual EOF unwind normally. */
+    runtime_worker_disconnect(worker);
+    return true;
+}
+
 static bool runtime_worker_handle_disconnect(cbm_daemon_runtime_worker_t *worker, uint32_t length) {
     if (length != 0) {
         return false;
@@ -1361,6 +1385,12 @@ static void runtime_worker_finish(cbm_daemon_runtime_worker_t *worker) {
         worker->application_session = NULL;
         worker->application_session_opened = false;
     }
+    if (worker->connection) {
+        /* Off the service mutex: a peer that just received its final response
+         * (hello rejection, disconnect acknowledgement) must be able to read
+         * it before the handle closes; see cbm_daemon_ipc_connection_drain. */
+        cbm_daemon_ipc_connection_drain(worker->connection, RUNTIME_WORKER_DRAIN_TIMEOUT_MS);
+    }
     cbm_mutex_lock(&service->mutex);
     if (worker->connection) {
         cbm_daemon_ipc_connection_close(worker->connection);
@@ -1386,6 +1416,159 @@ static bool runtime_activation_peer_matches_claim(cbm_daemon_runtime_service_t *
     char peer_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     return cbm_daemon_runtime_process_build_fingerprint(process_id, peer_fingerprint) &&
            strcmp(peer_fingerprint, claimed_build) == 0;
+}
+
+static bool runtime_control_request_decode(const uint8_t *payload, uint32_t length,
+                                           char build_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (!payload || length != CBM_DAEMON_CONTROL_REQUEST_SIZE ||
+        payload[CBM_DAEMON_CONTROL_REQUEST_SIZE - 1U] != 0U) {
+        return false;
+    }
+    memcpy(build_out, payload, CBM_DAEMON_BUILD_FINGERPRINT_SIZE);
+    return strlen(build_out) == CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1U;
+}
+
+static void runtime_control_collect_clients_locked(cbm_daemon_runtime_service_t *service,
+                                                   cbm_daemon_runtime_worker_t *except,
+                                                   uint8_t *count_out,
+                                                   uint32_t pids[CBM_DAEMON_CONTROL_CLIENT_CAP]) {
+    uint8_t count = 0U;
+    for (size_t index = 0; index < service->worker_capacity; index++) {
+        cbm_daemon_runtime_worker_t *candidate = &service->workers[index];
+        if (!candidate->in_use || !candidate->admission_committed || candidate == except) {
+            continue;
+        }
+        if (count < CBM_DAEMON_CONTROL_CLIENT_CAP) {
+            pids[count] = (uint32_t)candidate->peer_process_id;
+        }
+        count++;
+    }
+    *count_out =
+        count > CBM_DAEMON_CONTROL_CLIENT_CAP ? (uint8_t)CBM_DAEMON_CONTROL_CLIENT_CAP : count;
+}
+
+static void runtime_worker_handle_status(cbm_daemon_runtime_worker_t *worker,
+                                         const uint8_t *payload, uint32_t length) {
+    cbm_daemon_runtime_service_t *service = worker->service;
+    char requested_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool peer_verified =
+        runtime_control_request_decode(payload, length, requested_build) &&
+        runtime_activation_peer_matches_claim(service, worker->peer_process_id, requested_build);
+    uint8_t response[CBM_DAEMON_STATUS_RESPONSE_SIZE];
+    memset(response, 0, sizeof(response));
+    if (peer_verified) {
+        uint8_t count = 0U;
+        uint32_t pids[CBM_DAEMON_CONTROL_CLIENT_CAP] = {0};
+        cbm_mutex_lock(&service->mutex);
+        response[0] = 1U;
+        response[1] =
+            (uint8_t)((service->permanent ? 0x01U : 0U) |
+                      (service->state != CBM_DAEMON_RUNTIME_SERVICE_RUNNING ? 0x02U : 0U));
+        uint16_t committed = service->committed_clients > UINT16_MAX
+                                 ? UINT16_MAX
+                                 : (uint16_t)service->committed_clients;
+        response[2] = (uint8_t)(committed >> 8);
+        response[3] = (uint8_t)(committed & 0xFFU);
+        uint32_t daemon_pid = (uint32_t)runtime_current_process_id();
+        response[4] = (uint8_t)(daemon_pid >> 24);
+        response[5] = (uint8_t)(daemon_pid >> 16);
+        response[6] = (uint8_t)(daemon_pid >> 8);
+        response[7] = (uint8_t)(daemon_pid & 0xFFU);
+        runtime_control_collect_clients_locked(service, worker, &count, pids);
+        response[8] = count;
+        for (size_t index = 0; index < CBM_DAEMON_CONTROL_CLIENT_CAP; index++) {
+            size_t offset = 12U + index * 4U;
+            response[offset] = (uint8_t)(pids[index] >> 24);
+            response[offset + 1U] = (uint8_t)(pids[index] >> 16);
+            response[offset + 2U] = (uint8_t)(pids[index] >> 8);
+            response[offset + 3U] = (uint8_t)(pids[index] & 0xFFU);
+        }
+        (void)snprintf((char *)response + 44U, CBM_DAEMON_BUILD_FINGERPRINT_SIZE, "%s",
+                       service->identity.build_fingerprint);
+        (void)snprintf((char *)response + 109U, 12U, "%s",
+                       service->identity.semantic_version ? service->identity.semantic_version
+                                                          : "");
+        cbm_mutex_unlock(&service->mutex);
+    }
+    (void)runtime_worker_send_frame(worker, CBM_DAEMON_FRAME_RESPONSE, CBM_DAEMON_RUNTIME_OP_STATUS,
+                                    response, (uint32_t)sizeof(response));
+    runtime_worker_finish(worker);
+}
+
+static void runtime_worker_handle_stop(cbm_daemon_runtime_worker_t *worker, const uint8_t *payload,
+                                       uint32_t length) {
+    cbm_daemon_runtime_service_t *service = worker->service;
+    char requested_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool peer_verified =
+        runtime_control_request_decode(payload, length, requested_build) &&
+        runtime_activation_peer_matches_claim(service, worker->peer_process_id, requested_build);
+    uint8_t response[CBM_DAEMON_STOP_RESPONSE_SIZE];
+    memset(response, 0, sizeof(response));
+    bool accepted = false;
+    if (peer_verified) {
+        uint8_t count = 0U;
+        uint32_t pids[CBM_DAEMON_CONTROL_CLIENT_CAP] = {0};
+        uint64_t deadline = runtime_deadline_after(service->shutdown_timeout_ms);
+        cbm_mutex_lock(&service->mutex);
+        response[0] = 1U;
+        uint16_t committed = service->committed_clients > UINT16_MAX
+                                 ? UINT16_MAX
+                                 : (uint16_t)service->committed_clients;
+        runtime_control_collect_clients_locked(service, worker, &count, pids);
+        if (service->committed_clients > 0) {
+            /* Refuse-if-busy: the caller reports these pids to the user as
+             * the processes that must exit before a graceful stop. */
+            response[1] = 0x02U;
+        } else if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING) {
+            /* Explicit stop is the sanctioned exit for PERMANENT generations
+             * as well — begin_stopping here overrides the permanence gate.
+             * Mirror the activation-shutdown ACK protocol: the stopping
+             * teardown must not consume this requester's response slot before
+             * the acceptance byte leaves. */
+            runtime_service_begin_stopping_locked(service, deadline, false,
+                                                  "daemon_stop_requested");
+            /* Same exit criterion as an activation drain: a permanent
+             * coordinator never reports client-terminal, so resource
+             * emptiness must be allowed to complete this stop promptly. */
+            service->activation_shutdown_requested = true;
+            service->activation_response_inflight = true;
+            worker->final_response_inflight = true;
+            response[1] = 0x01U;
+            accepted = true;
+        }
+        response[2] = (uint8_t)(committed >> 8);
+        response[3] = (uint8_t)(committed & 0xFFU);
+        response[4] = count;
+        for (size_t index = 0; index < CBM_DAEMON_CONTROL_CLIENT_CAP; index++) {
+            size_t offset = 8U + index * 4U;
+            response[offset] = (uint8_t)(pids[index] >> 24);
+            response[offset + 1U] = (uint8_t)(pids[index] >> 16);
+            response[offset + 2U] = (uint8_t)(pids[index] >> 8);
+            response[offset + 3U] = (uint8_t)(pids[index] & 0xFFU);
+        }
+        cbm_mutex_unlock(&service->mutex);
+    }
+    if (accepted) {
+        char requester_pid[32];
+        (void)snprintf(requester_pid, sizeof(requester_pid), "%llu",
+                       (unsigned long long)worker->peer_process_id);
+        cbm_log_info("daemon.stop_requested", "requester_pid", requester_pid, "requester_build",
+                     requested_build);
+        runtime_service_interrupt_connections_except(worker->service, worker, true);
+    }
+    (void)runtime_worker_send_frame(worker, CBM_DAEMON_FRAME_RESPONSE, CBM_DAEMON_RUNTIME_OP_STOP,
+                                    response, (uint32_t)sizeof(response));
+    if (accepted) {
+        cbm_daemon_runtime_service_t *stop_service = worker->service;
+        runtime_worker_finish(worker);
+        cbm_mutex_lock(&stop_service->mutex);
+        worker->final_response_inflight = false;
+        stop_service->activation_response_inflight = false;
+        cbm_mutex_unlock(&stop_service->mutex);
+        runtime_service_interrupt_connections(stop_service);
+        return;
+    }
+    runtime_worker_finish(worker);
 }
 
 static void runtime_worker_handle_activation_shutdown(cbm_daemon_runtime_worker_t *worker,
@@ -1434,6 +1617,13 @@ static void runtime_worker_handle_activation_shutdown(cbm_daemon_runtime_worker_
                      "requester_build", requested_build, "action",
                      runtime_activation_action_text(action), "active_clients", active_clients,
                      "active_connections", active_connections);
+        /* Interrupt every other connection BEFORE the ACK leaves: the ACK is
+         * the requester's license to act on "snapshotted and draining", so
+         * every drain must already be initiated when it arrives. Acking first
+         * left a window where a session could still get one request serviced
+         * after the requester observed the ACK. The requester itself is
+         * excepted and its response path stays protected. */
+        runtime_service_interrupt_connections_except(service, worker, true);
     }
     bool response_sent =
         encoded && runtime_worker_send_frame(worker, CBM_DAEMON_FRAME_RESPONSE,
@@ -1446,10 +1636,8 @@ static void runtime_worker_handle_activation_shutdown(cbm_daemon_runtime_worker_
     }
 
     if (result.accepted) {
-        /* Keep the activation ACK protected while interrupting every other
-         * connection. Close this requester normally, then release the global
-         * ACK gate so the accept loop can finish any stragglers. */
-        runtime_service_interrupt_connections_except(service, worker, true);
+        /* Close this requester normally, then release the global ACK gate so
+         * the accept loop can finish any stragglers. */
         runtime_worker_finish(worker);
         cbm_mutex_lock(&service->mutex);
         worker->final_response_inflight = false;
@@ -1479,6 +1667,16 @@ static void *runtime_connection_worker(void *opaque) {
     }
     if (frame.flags == CBM_DAEMON_RUNTIME_OP_ACTIVATION_SHUTDOWN) {
         runtime_worker_handle_activation_shutdown(worker, payload, frame.length);
+        free(payload);
+        return NULL;
+    }
+    if (frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS) {
+        runtime_worker_handle_status(worker, payload, frame.length);
+        free(payload);
+        return NULL;
+    }
+    if (frame.flags == CBM_DAEMON_RUNTIME_OP_STOP) {
+        runtime_worker_handle_stop(worker, payload, frame.length);
         free(payload);
         return NULL;
     }
@@ -1626,6 +1824,9 @@ static void *runtime_connection_worker(void *opaque) {
         case CBM_DAEMON_RUNTIME_OP_APPLICATION_CANCEL:
             keep_running = runtime_worker_handle_application_cancel(worker, payload, frame.length);
             break;
+        case CBM_DAEMON_RUNTIME_OP_CLOSE_INTENT:
+            keep_running = runtime_worker_handle_close_intent(worker, frame.length);
+            break;
         case CBM_DAEMON_RUNTIME_OP_DISCONNECT:
             keep_running = false;
             (void)runtime_worker_handle_disconnect(worker, frame.length);
@@ -1704,6 +1905,9 @@ static void runtime_reject_inline(cbm_daemon_ipc_connection_t *connection, const
     cbm_daemon_runtime_connect_result_t result;
     runtime_result_rejected(&result, message);
     (void)runtime_send_hello_response(connection, &result);
+    /* Same Windows named-pipe discard hazard as runtime_worker_finish: the
+     * peer must get to read the rejection before the handle closes. */
+    cbm_daemon_ipc_connection_drain(connection, RUNTIME_REJECT_DRAIN_TIMEOUT_MS);
     cbm_daemon_ipc_connection_close(connection);
 }
 
@@ -1948,6 +2152,9 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->worker_capacity = config->max_clients;
     service->workers = calloc(service->worker_capacity, sizeof(*service->workers));
     service->coordinator = cbm_daemon_coordinator_new(config->lease_timeout_ms);
+    if (service->coordinator && config->permanent) {
+        cbm_daemon_coordinator_set_permanent(service->coordinator, true);
+    }
     service->conflict_log_path =
         runtime_string_copy_bounded(config->conflict_log_path, RUNTIME_PATH_CAP);
     size_t version_length = 0;
@@ -1971,6 +2178,7 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->request_timeout_ms = config->request_timeout_ms;
     service->shutdown_timeout_ms = config->shutdown_timeout_ms;
     service->application = config->application;
+    service->permanent = config->permanent;
     service->state = CBM_DAEMON_RUNTIME_SERVICE_STARTING;
 
     if (!service->workers || !service->coordinator || !service->conflict_log_path ||
@@ -2252,6 +2460,105 @@ bool cbm_daemon_runtime_request_activation_shutdown(
         memset(result_out, 0, sizeof(*result_out));
     }
     return valid;
+}
+
+static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                         const cbm_daemon_build_identity_t *identity,
+                                         cbm_daemon_runtime_operation_t operation,
+                                         uint32_t timeout_ms, uint32_t response_size,
+                                         uint8_t **payload_out) {
+    *payload_out = NULL;
+    if (!endpoint || !identity || !identity->build_fingerprint ||
+        timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER) {
+        return false;
+    }
+    uint8_t request[CBM_DAEMON_CONTROL_REQUEST_SIZE];
+    memset(request, 0, sizeof(request));
+    int written = snprintf((char *)request, sizeof(request), "%s", identity->build_fingerprint);
+    if (written <= 0 || (size_t)written != CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1U) {
+        return false;
+    }
+    cbm_daemon_ipc_connection_t *connection = cbm_daemon_ipc_connect(endpoint, timeout_ms);
+    bool sent =
+        connection && cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST, operation,
+                                                request, (uint32_t)sizeof(request));
+    cbm_daemon_frame_t frame = {0};
+    uint8_t *payload = NULL;
+    int received = sent ? cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms,
+                                                               response_size, &frame, &payload)
+                        : 0;
+    bool valid = received == 1 && frame.type == CBM_DAEMON_FRAME_RESPONSE &&
+                 frame.flags == operation && frame.length == response_size && payload &&
+                 payload[0] == 1U;
+    cbm_daemon_ipc_connection_close(connection);
+    if (!valid) {
+        free(payload);
+        return false;
+    }
+    *payload_out = payload;
+    return true;
+}
+
+static uint32_t runtime_control_read_u32(const uint8_t *bytes) {
+    return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) |
+           (uint32_t)bytes[3];
+}
+
+bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                       const cbm_daemon_build_identity_t *identity,
+                                       uint32_t timeout_ms,
+                                       cbm_daemon_runtime_status_t *status_out) {
+    if (!status_out) {
+        return false;
+    }
+    memset(status_out, 0, sizeof(*status_out));
+    uint8_t *payload = NULL;
+    if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STATUS, timeout_ms,
+                                      CBM_DAEMON_STATUS_RESPONSE_SIZE, &payload)) {
+        return false;
+    }
+    status_out->permanent = (payload[1] & 0x01U) != 0U;
+    status_out->stopping = (payload[1] & 0x02U) != 0U;
+    status_out->committed_clients = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
+    status_out->daemon_pid = runtime_control_read_u32(payload + 4);
+    status_out->client_count = payload[8] > CBM_DAEMON_CONTROL_CLIENT_CAP
+                                   ? (uint8_t)CBM_DAEMON_CONTROL_CLIENT_CAP
+                                   : payload[8];
+    for (size_t index = 0; index < CBM_DAEMON_CONTROL_CLIENT_CAP; index++) {
+        status_out->client_pids[index] = runtime_control_read_u32(payload + 12U + index * 4U);
+    }
+    memcpy(status_out->build_fingerprint, payload + 44U, CBM_DAEMON_BUILD_FINGERPRINT_SIZE);
+    status_out->build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1U] = '\0';
+    memcpy(status_out->semantic_version, payload + 109U, sizeof(status_out->semantic_version));
+    status_out->semantic_version[sizeof(status_out->semantic_version) - 1U] = '\0';
+    free(payload);
+    return true;
+}
+
+bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                     const cbm_daemon_build_identity_t *identity,
+                                     uint32_t timeout_ms,
+                                     cbm_daemon_runtime_stop_result_t *result_out) {
+    if (!result_out) {
+        return false;
+    }
+    memset(result_out, 0, sizeof(*result_out));
+    uint8_t *payload = NULL;
+    if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STOP, timeout_ms,
+                                      CBM_DAEMON_STOP_RESPONSE_SIZE, &payload)) {
+        return false;
+    }
+    result_out->accepted = (payload[1] & 0x01U) != 0U;
+    result_out->busy = (payload[1] & 0x02U) != 0U;
+    result_out->committed_clients = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
+    result_out->client_count = payload[4] > CBM_DAEMON_CONTROL_CLIENT_CAP
+                                   ? (uint8_t)CBM_DAEMON_CONTROL_CLIENT_CAP
+                                   : payload[4];
+    for (size_t index = 0; index < CBM_DAEMON_CONTROL_CLIENT_CAP; index++) {
+        result_out->client_pids[index] = runtime_control_read_u32(payload + 8U + index * 4U);
+    }
+    free(payload);
+    return true;
 }
 
 cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect(
@@ -2570,9 +2877,15 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
     uint8_t cancel_wire[APPLICATION_CANCEL_REQUEST_SIZE];
     runtime_put_u64(cancel_wire, request_token);
     cbm_mutex_lock(&client->send_mutex);
-    bool sent = cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
-                                          CBM_DAEMON_RUNTIME_OP_APPLICATION_REQUEST, wire,
-                                          (uint32_t)wire_length);
+    cbm_mutex_lock(&client->state_mutex);
+    bool request_can_send = client->usable && !client->closing &&
+                            client->connection == connection &&
+                            client->active_application_token == request_token;
+    cbm_mutex_unlock(&client->state_mutex);
+    bool sent =
+        request_can_send && cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
+                                                      CBM_DAEMON_RUNTIME_OP_APPLICATION_REQUEST,
+                                                      wire, (uint32_t)wire_length);
     bool send_cancel = false;
     cbm_mutex_lock(&client->state_mutex);
     client->application_request_sent = sent;
@@ -2680,18 +2993,45 @@ bool cbm_daemon_runtime_client_close_begin(cbm_daemon_runtime_client_t *client) 
     if (!client) {
         return false;
     }
+    /* Serialize with request publication. If the request won send_mutex, its
+     * exact token is visible here and cancellation is ordered after REQUEST;
+     * if close won, the request path's closing recheck refuses the late send. */
+    cbm_mutex_lock(&client->send_mutex);
     cbm_mutex_lock(&client->state_mutex);
     if (client->closing) {
         cbm_mutex_unlock(&client->state_mutex);
+        cbm_mutex_unlock(&client->send_mutex);
         return false;
     }
     client->closing = true;
     client->close_interrupted_exchange = client->exchange_active;
     cbm_daemon_ipc_connection_t *connection = client->connection;
-    if (client->close_interrupted_exchange && connection) {
-        cbm_daemon_ipc_connection_interrupt(connection);
+    cbm_daemon_runtime_application_token_t cancel_token = client->active_application_token;
+    bool send_cancel = client->close_interrupted_exchange && connection &&
+                       client->application_request_sent && !client->application_cancel_sent &&
+                       cancel_token != CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    if (send_cancel) {
+        client->application_cancel_sent = true;
     }
     cbm_mutex_unlock(&client->state_mutex);
+
+    if (send_cancel) {
+        uint8_t wire[APPLICATION_CANCEL_REQUEST_SIZE];
+        runtime_put_u64(wire, cancel_token);
+        (void)cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
+                                        CBM_DAEMON_RUNTIME_OP_APPLICATION_CANCEL, wire,
+                                        (uint32_t)sizeof(wire));
+    }
+    if (client->close_interrupted_exchange && connection) {
+        /* The interrupted-exchange close cannot run the DISCONNECT handshake,
+         * so announce the departure explicitly (ordered after the cancel);
+         * the server releases this client's admission on receipt instead of
+         * waiting for the handle to close. Mirrors POSIX shutdown() timing. */
+        (void)cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
+                                        CBM_DAEMON_RUNTIME_OP_CLOSE_INTENT, NULL, 0);
+        cbm_daemon_ipc_connection_interrupt(connection);
+    }
+    cbm_mutex_unlock(&client->send_mutex);
     return true;
 }
 

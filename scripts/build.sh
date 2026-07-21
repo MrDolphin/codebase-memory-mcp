@@ -32,6 +32,8 @@ done
 
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
+# shellcheck source=path-safety.sh
+source "$ROOT/scripts/path-safety.sh"
 
 # Parse remaining arguments. BUILD_DIR is tracked for the clean step below so
 # containerized legs can build in their own directory instead of deleting and
@@ -92,7 +94,7 @@ echo "  ui=$WITH_UI version=${VERSION:-dev}"
 verify_compiler "$CC"
 
 # Step 1: Clean C build artifacts only (not node_modules — npm ci handles that)
-rm -rf "${ROOT:?}/${BUILD_DIR}"
+cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
 
 # Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
 if $WITH_UI; then

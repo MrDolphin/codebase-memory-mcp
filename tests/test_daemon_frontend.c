@@ -36,9 +36,9 @@ typedef struct {
 static bool frontend_maintenance_fixture_start(frontend_maintenance_fixture_t *fixture,
                                                const char *tag) {
     memset(fixture, 0, sizeof(*fixture));
-    int written = snprintf(fixture->parent, sizeof(fixture->parent), "%s/cbm-frontend-%s-XXXXXX",
-                           cbm_tmpdir(), tag);
-    if (written <= 0 || written >= (int)sizeof(fixture->parent) || !cbm_mkdtemp(fixture->parent)) {
+    /* Endpoint parents need production-shaped ancestry (LocalAppData on
+     * Windows); temp roots are refused by the runtime ancestry validation. */
+    if (!th_secure_runtime_parent_new(fixture->parent, sizeof(fixture->parent), tag)) {
         return false;
     }
     fixture->endpoint = cbm_daemon_ipc_endpoint_new("0123456789abcdef", fixture->parent);

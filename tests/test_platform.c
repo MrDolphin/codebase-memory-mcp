@@ -3,6 +3,8 @@
  */
 #include "test_framework.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
@@ -22,6 +24,83 @@
 #endif
 
 enum { PLATFORM_TIME_THREADS = 8 };
+
+#include <stdio.h>
+#include <string.h>
+
+/* Worker staging files land under CBM_CACHE_DIR, which users may place at
+ * non-ASCII paths. On Windows the templates must round-trip through the wide
+ * APIs; the ANSI CRT (_mktemp/_open) mangles UTF-8 bytes and fails. */
+/* Store DB paths embed full repo-path-derived project names; deep repo or
+ * runner paths overflow the legacy 260-char limit. The compat file layer must
+ * carry absolute paths of any length (extended-length \\?\ form on
+ * Windows). */
+TEST(platform_file_apis_survive_max_path_overflow) {
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-longpath-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    enum { LONG_SEGMENTS = 5 };
+    static const char segment[] =
+        "segment-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnop";
+    char deep[CBM_SZ_1K];
+    written = snprintf(deep, sizeof(deep), "%s", base);
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(deep));
+    for (int index = 0; index < LONG_SEGMENTS; index++) {
+        written = snprintf(deep + strlen(deep), sizeof(deep) - strlen(deep), "/%s", segment);
+        ASSERT_TRUE(written > 0);
+    }
+    ASSERT_TRUE(strlen(deep) > 300);
+    ASSERT_TRUE(cbm_mkdir_p(deep, 0700));
+
+    char file_path[CBM_SZ_1K];
+    written = snprintf(file_path, sizeof(file_path), "%s/store.db", deep);
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(file_path));
+    FILE *file = cbm_fopen(file_path, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_GTE(fputs("deep\n", file), 0);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_TRUE(cbm_file_exists(file_path));
+    ASSERT_TRUE(cbm_is_dir(deep));
+    ASSERT_EQ(cbm_unlink(file_path), 0);
+    char cursor[CBM_SZ_1K];
+    (void)snprintf(cursor, sizeof(cursor), "%s", deep);
+    for (int index = 0; index < LONG_SEGMENTS; index++) {
+        ASSERT_EQ(cbm_rmdir(cursor), 0);
+        char *slash = strrchr(cursor, '/');
+        ASSERT_NOT_NULL(slash);
+        *slash = '\0';
+    }
+    (void)cbm_rmdir(base);
+    PASS();
+}
+
+TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
+    char base[CBM_SZ_256];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-utf8-Ã©Ã¨-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    char file_template[CBM_SZ_512];
+    written = snprintf(file_template, sizeof(file_template), "%s/.probe-XXXXXX", base);
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(file_template));
+    int descriptor = cbm_mkstemp(file_template);
+    bool created = descriptor >= 0;
+    if (created) {
+#ifdef _WIN32
+        _close(descriptor);
+#else
+        close(descriptor);
+#endif
+        (void)cbm_unlink(file_template);
+    }
+    (void)cbm_rmdir(base);
+    ASSERT_TRUE(created);
+    /* The returned path must keep the caller's UTF-8 directory intact. */
+    ASSERT_NOT_NULL(strstr(file_template, "Ã©Ã¨"));
+    PASS();
+}
 
 TEST(platform_counter_scaling_avoids_intermediate_overflow) {
     const uint64_t frequency = UINT64_C(10000000);
@@ -532,6 +611,8 @@ TEST(cgroup_no_mem_files) {
 #endif /* __linux__ */
 
 SUITE(platform) {
+    RUN_TEST(platform_file_apis_survive_max_path_overflow);
+    RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
     RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);
     RUN_TEST(platform_now_ns_concurrent_first_call);

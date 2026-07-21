@@ -690,7 +690,7 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
 /* UTF-8-safe stat: wide API on Windows, regular stat on POSIX. */
 static int wide_stat(const char *path, struct stat *st) {
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -715,7 +715,7 @@ static int wide_stat(const char *path, struct stat *st) {
  * root, mirroring the POSIX S_ISLNK skip. */
 static int safe_stat(const char *abs_path, struct stat *st) {
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    wchar_t *wpath = cbm_path_to_wide(abs_path);
     if (wpath) {
         DWORD attr = GetFileAttributesW(wpath);
         free(wpath);

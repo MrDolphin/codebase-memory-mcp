@@ -1027,9 +1027,11 @@ ROVO_AGENT="$FAKE_HOME/.rovodev/subagents/codebase-memory.md"
 AMAZON_Q_MCP="$FAKE_HOME/.aws/amazonq/default.json"
 mkdir -p "$GITLAB_DIR" "$(dirname "$GITLAB_HOOKS")" "$DEVIN_DIR"
 mkdir -p "$FAKE_HOME/.local/bin"
-# Copy binary with correct name for platform
+# A Windows portable pair is the installer source, not a valid managed target.
+# Leave the canonical destination absent so install can publish the authenticated
+# generation backing + canonical hard-link pair. A one-link copy at that path is
+# deliberately rejected as an unknown/conflicting installation.
 if [[ "$BINARY" == *.exe ]]; then
-  copy_smoke_binary "$FAKE_HOME/.local/bin/codebase-memory-mcp.exe"
   SELF_PATH="$FAKE_HOME/.local/bin/codebase-memory-mcp.exe"
 else
   cp "$BINARY" "$FAKE_HOME/.local/bin/codebase-memory-mcp"
@@ -2748,8 +2750,9 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   UPDATE_HOME=$(smoke_mktemp_dir)
   mkdir -p "$UPDATE_HOME/.claude" "$UPDATE_HOME/.local/bin"
   if [[ "$BINARY" == *.exe ]]; then
-    copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
-    chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+    # Keep the managed canonical absent until WINDOWS_PAYLOAD installs the
+    # authenticated two-link launcher layout below.
+    :
   else
     cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
     chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp"

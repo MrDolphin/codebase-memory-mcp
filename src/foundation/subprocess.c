@@ -295,6 +295,96 @@ bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv) {
     return true;
 }
 
+static bool cbm_ascii_case_equal(const char *left, const char *right) {
+    if (!left || !right) {
+        return false;
+    }
+    while (*left && *right) {
+        unsigned char left_ch = (unsigned char)*left++;
+        unsigned char right_ch = (unsigned char)*right++;
+        if (left_ch >= 'A' && left_ch <= 'Z') {
+            left_ch = (unsigned char)(left_ch + ('a' - 'A'));
+        }
+        if (right_ch >= 'A' && right_ch <= 'Z') {
+            right_ch = (unsigned char)(right_ch + ('a' - 'A'));
+        }
+        if (left_ch != right_ch) {
+            return false;
+        }
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static bool cbm_win_cmd_path_is_absolute(const char *path) {
+    if (!path) {
+        return false;
+    }
+    size_t path_len = strlen(path);
+    if (path_len < 3) {
+        return false;
+    }
+    bool drive_absolute =
+        ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+    bool unc_absolute = (path[0] == '\\' || path[0] == '/') && path[1] == path[0] && path[2];
+    if (!drive_absolute && !unc_absolute) {
+        return false;
+    }
+
+    const char *basename = path;
+    for (const char *cursor = path; *cursor; cursor++) {
+        if (*cursor == '"' || *cursor == '\r' || *cursor == '\n') {
+            return false;
+        }
+        if (*cursor == '\\' || *cursor == '/') {
+            basename = cursor + 1;
+        }
+    }
+    return cbm_ascii_case_equal(basename, "cmd.exe");
+}
+
+bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable,
+                               const char *payload) {
+    if (!buf || cap == 0) {
+        return false;
+    }
+    buf[0] = '\0';
+    if (!cbm_win_cmd_path_is_absolute(cmd_executable) || !payload || !payload[0]) {
+        return false;
+    }
+
+    static const char prefix[] = "\" /D /S /V:OFF /C ";
+    size_t executable_len = strlen(cmd_executable);
+    size_t payload_len = strlen(payload);
+    size_t remaining = cap - 1; /* reserve the final NUL */
+    if (remaining < 1) {
+        return false;
+    }
+    remaining--; /* opening quote */
+    if (executable_len > remaining) {
+        return false;
+    }
+    remaining -= executable_len;
+    if (sizeof(prefix) - 1 > remaining) {
+        return false;
+    }
+    remaining -= sizeof(prefix) - 1;
+    if (payload_len > remaining) {
+        return false;
+    }
+
+    size_t pos = 0;
+    buf[pos++] = '"';
+    memcpy(buf + pos, cmd_executable, executable_len);
+    pos += executable_len;
+    memcpy(buf + pos, prefix, sizeof(prefix) - 1);
+    pos += sizeof(prefix) - 1;
+    memcpy(buf + pos, payload, payload_len);
+    pos += payload_len;
+    buf[pos] = '\0';
+    return true;
+}
+
 /* ── Nonblocking contained-process supervisor ─────────────────────────────── */
 
 enum { CBM_SUBPROCESS_ARGV_LIMIT = 4096 };
@@ -310,6 +400,7 @@ struct cbm_subprocess {
     char *bin;
     char **argv;
     size_t argc;
+    char *windows_cmd_payload;
     char *log_file;
     cbm_proc_log_cb on_log_line;
     void *log_ud;
@@ -361,6 +452,7 @@ static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
     }
     free(process->argv);
     free(process->bin);
+    free(process->windows_cmd_payload);
     free(process->log_file);
     free(process);
 }
@@ -369,6 +461,16 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
     if (!opts || !opts->bin || !opts->bin[0]) {
         return NULL;
     }
+#ifdef _WIN32
+    if (opts->windows_cmd_payload &&
+        (!opts->windows_cmd_payload[0] || opts->argv || !cbm_win_cmd_path_is_absolute(opts->bin))) {
+        return NULL;
+    }
+#else
+    if (opts->windows_cmd_payload) {
+        return NULL;
+    }
+#endif
 
     size_t argc = 1;
     if (opts->argv) {
@@ -386,9 +488,12 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
         return NULL;
     }
     process->bin = cbm_strdup(opts->bin);
+    process->windows_cmd_payload =
+        opts->windows_cmd_payload ? cbm_strdup(opts->windows_cmd_payload) : NULL;
     process->argv = (char **)calloc(argc + 1, sizeof(*process->argv));
     process->argc = argc;
-    if (!process->bin || !process->argv) {
+    if (!process->bin || !process->argv ||
+        (opts->windows_cmd_payload && !process->windows_cmd_payload)) {
         cbm_subprocess_free_config(process);
         return NULL;
     }
@@ -440,7 +545,7 @@ static void cbm_subprocess_delete_log(cbm_subprocess_t *process) {
         return;
     }
 #ifdef _WIN32
-    wchar_t *path = cbm_utf8_to_wide(process->log_file);
+    wchar_t *path = cbm_path_to_wide(process->log_file);
     if (path) {
         (void)DeleteFileW(path);
         free(path);
@@ -529,7 +634,12 @@ static void cbm_win_close_spawn_handles(HANDLE nul, HANDLE log, LPPROC_THREAD_AT
 
 static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     char cmdline[8192];
-    if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), (const char *const *)process->argv)) {
+    bool built =
+        process->windows_cmd_payload
+            ? cbm_build_win_cmd_payload(cmdline, sizeof(cmdline), process->bin,
+                                        process->windows_cmd_payload)
+            : cbm_build_win_cmdline(cmdline, sizeof(cmdline), (const char *const *)process->argv);
+    if (!built) {
         return -1;
     }
     wchar_t *wbin = cbm_utf8_to_wide(process->bin);
@@ -568,7 +678,7 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
         return -1;
     }
     if (process->log_file) {
-        wchar_t *wlog = cbm_utf8_to_wide(process->log_file);
+        wchar_t *wlog = cbm_path_to_wide(process->log_file);
         if (wlog) {
             log = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ, &security, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, NULL);

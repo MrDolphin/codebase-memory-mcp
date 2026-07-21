@@ -27,6 +27,12 @@
 #endif
 #define CBM_WINDOWS_LAUNCHER_PATH_CAP 32768U
 
+/* Hex-char count of the payload digest embedded in a retired-state directory
+ * name. 16 chars (64 bits) uniquely identifies the retired generation while
+ * keeping the retired path short enough for the managed uninstall's
+ * handle-based directory rename at the deepest supported install depth. */
+#define CBM_WINDOWS_RETIRED_TAG_HEX 16U
+
 typedef struct {
     uint32_t launcher_abi_min;
     uint32_t launcher_abi_max;
@@ -68,10 +74,20 @@ bool cbm_windows_release_descriptor_v1_decode(const uint8_t *record, size_t reco
 cbm_windows_transition_plan_t cbm_windows_transition_plan(
     const cbm_windows_current_v1_t *current, const cbm_windows_release_descriptor_v1_t *candidate);
 
-/* Resolve the immutable payload using the canonical launcher's directory. */
+/* Resolve the immutable generation pair using the canonical launcher's
+ * directory.  A managed generation contains exactly these two executables:
+ * the payload and the launcher's hard-link backing. */
 bool cbm_windows_generation_payload_path(const wchar_t *canonical_launcher_path,
                                          const char payload_sha256[65], wchar_t *path_out,
                                          size_t path_capacity);
+bool cbm_windows_generation_launcher_path(const wchar_t *canonical_launcher_path,
+                                          const char payload_sha256[65], wchar_t *path_out,
+                                          size_t path_capacity);
+/* Derive the race-free retired state sibling shared by the uninstall payload
+ * (its own PID) and supervising launcher (the authenticated child PID). */
+bool cbm_windows_retired_state_path(const wchar_t *canonical_launcher_path,
+                                    const char payload_sha256[65], uint32_t payload_pid,
+                                    wchar_t *path_out, size_t path_capacity);
 
 /* Match main's top-level dispatch.  Tokens after a mode selector (cli,
  * install, config, hook-augment, help/version) are opaque user input. */
@@ -107,15 +123,30 @@ bool cbm_windows_launcher_capability_probe(const wchar_t *target_directory,
                                            const wchar_t *launcher_candidate, char *error,
                                            size_t error_size);
 bool cbm_windows_launcher_file_secure(const wchar_t *launcher_path, char *error, size_t error_size);
+/* Find the unique managed-generation backing for canonical_launcher_path.
+ * The canonical name and backing must be the same file identity with exactly
+ * two links.  The backing need not be in the current payload generation while
+ * a crash-safe cross-ABI transition is between its two publication steps. */
+bool cbm_windows_managed_launcher_backing(const wchar_t *canonical_launcher_path,
+                                          wchar_t *backing_path_out, size_t backing_path_capacity,
+                                          char *error, size_t error_size);
 bool cbm_windows_release_descriptor_probe(const wchar_t *launcher_candidate,
                                           cbm_windows_release_descriptor_v1_t *descriptor_out,
                                           char *error, size_t error_size);
 bool cbm_windows_current_v1_write_atomic(const wchar_t *canonical_launcher_path,
                                          const cbm_windows_current_v1_t *state, char *error,
                                          size_t error_size);
-bool cbm_windows_launcher_replace_atomic(const wchar_t *target_path, const wchar_t *candidate_path,
+/* Publish an exact-one-link immutable generation backing at the canonical
+ * name by hard-linking a same-directory stage and POSIX-renaming that stage.
+ * Success leaves canonical and backing as the same exact-two-link file. */
+bool cbm_windows_launcher_replace_atomic(const wchar_t *target_path, const wchar_t *backing_path,
                                          char *error, size_t error_size);
 bool cbm_windows_launcher_remove_posix(const wchar_t *target_path, char *error, size_t error_size);
+/* Retire .cbm to its generation/PID-qualified sibling, then unlink canonical
+ * as the final uninstall commit.  A failed unlink restores .cbm. */
+bool cbm_windows_launcher_uninstall_commit(const wchar_t *canonical_launcher_path,
+                                           const char payload_sha256[65], char *error,
+                                           size_t error_size);
 bool cbm_windows_generation_rollback_if_unreferenced(const wchar_t *canonical_launcher_path,
                                                      const char payload_sha256[65],
                                                      bool created_by_activation, char *error,

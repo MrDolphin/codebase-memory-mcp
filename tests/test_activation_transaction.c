@@ -458,6 +458,51 @@ TEST(activation_transaction_stage_file_installs_new_target) {
     PASS();
 }
 
+TEST(activation_transaction_stage_file_survives_long_target_path) {
+    /* Managed installs and CI runners place the generation store far below a
+     * deep profile path; the full store path routinely exceeds the legacy
+     * 260-char limit. The activation transaction's own file operations must
+     * carry those paths (extended-length form on Windows). */
+    char base[ACTIVATION_TEST_PATH_CAP];
+    ASSERT_TRUE(th_secure_runtime_parent_new(base, sizeof(base), "act-longpath"));
+    static const char segment[] = "gen-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghij";
+    char deep[ACTIVATION_TEST_PATH_CAP];
+    int written = snprintf(deep, sizeof(deep), "%s", base);
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(deep));
+    /* Append segments until the store path comfortably exceeds the legacy
+     * 260-char Windows limit, regardless of the (platform-dependent) base. */
+    while (strlen(deep) <= 320U) {
+        size_t used = strlen(deep);
+        written = snprintf(deep + used, sizeof(deep) - used, "/%s", segment);
+        ASSERT_TRUE(written > 0 && (size_t)written < sizeof(deep) - used);
+    }
+    ASSERT_TRUE(strlen(deep) > 300);
+    ASSERT_TRUE(cbm_mkdir_p(deep, 0700));
+
+    char source[ACTIVATION_TEST_PATH_CAP];
+    char target[ACTIVATION_TEST_PATH_CAP];
+    ASSERT_TRUE(activation_test_path(source, deep, "downloaded-cbm"));
+    ASSERT_TRUE(activation_test_path(target, deep, "cbm"));
+    ASSERT_TRUE(activation_test_write(source, "downloaded"));
+
+    cbm_activation_transaction_t *transaction = NULL;
+    ASSERT_EQ(cbm_activation_transaction_stage_file(target, source, &transaction),
+              CBM_ACTIVATION_TRANSACTION_OK);
+    activation_test_validation_t validation = {
+        .expect_absent = false,
+        .expected_contents = "downloaded",
+    };
+    ASSERT_EQ(cbm_activation_transaction_commit(transaction, activation_test_validate, &validation),
+              CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_EQ(cbm_activation_transaction_finalize(transaction), CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_EQ(cbm_activation_transaction_close(&transaction), CBM_ACTIVATION_TRANSACTION_OK);
+    char contents[ACTIVATION_TEST_CONTENT_CAP];
+    ASSERT_TRUE(activation_test_read(target, contents));
+    ASSERT_STR_EQ(contents, "downloaded");
+    ASSERT_EQ(th_rmtree(base), 0);
+    PASS();
+}
+
 TEST(activation_transaction_removal_can_rollback_or_finalize) {
     char directory[ACTIVATION_TEST_PATH_CAP];
     char target[ACTIVATION_TEST_PATH_CAP];
@@ -922,6 +967,7 @@ SUITE(activation_transaction) {
     RUN_TEST(activation_transaction_validation_failure_restores_previous_target);
     RUN_TEST(activation_transaction_explicit_rollback_restores_previous_target);
     RUN_TEST(activation_transaction_stage_file_installs_new_target);
+    RUN_TEST(activation_transaction_stage_file_survives_long_target_path);
     RUN_TEST(activation_transaction_removal_can_rollback_or_finalize);
     RUN_TEST(activation_transaction_rejects_cross_account_writable_target_directory);
     RUN_TEST(activation_transaction_rejects_windows_callback_allow_directory_ace);

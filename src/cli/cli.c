@@ -199,6 +199,9 @@ static const char *g_cli_activation_runtime_parent_for_test = NULL;
 static cbm_windows_launcher_context_t g_windows_launcher_context;
 static bool cli_windows_current_path(const wchar_t *canonical_launcher,
                                      wchar_t out[CBM_WINDOWS_LAUNCHER_PATH_CAP]);
+static bool cli_windows_read_current(const wchar_t *canonical_launcher,
+                                     cbm_windows_current_v1_t *state_out, bool *exists_out);
+static bool cli_windows_canonicalize_launcher_path(wchar_t path[CBM_WINDOWS_LAUNCHER_PATH_CAP]);
 
 static bool cli_windows_current_process_size(uint64_t *size_out) {
     if (!size_out) {
@@ -314,6 +317,13 @@ int cbm_cli_windows_launcher_startup_authenticate(int argc, char *const argv[]) 
     if (!cbm_windows_launcher_context_complete(&context, true, error, sizeof(error))) {
         (void)fprintf(stderr, "codebase-memory-mcp: Windows launcher completion failed: %s\n",
                       error[0] ? error : "authority acknowledgement failed");
+        return CLI_TRUE;
+    }
+    if (context.canonical_launcher_path[0] != L'\0' &&
+        !cli_windows_canonicalize_launcher_path(context.canonical_launcher_path)) {
+        (void)cbm_windows_launcher_context_complete(&context, false, error, sizeof(error));
+        (void)fprintf(stderr, "codebase-memory-mcp: managed Windows launcher path could not "
+                              "be canonicalized; startup refused\n");
         return CLI_TRUE;
     }
     g_windows_launcher_context = context;
@@ -5685,9 +5695,56 @@ static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
     return CLI_OK;
 }
 
+/* Canonical, file-API-safe wide form: full resolution plus the extended-length
+ * prefix once the resolved path nears the legacy MAX_PATH limit (240, matching
+ * the activation and foundation converters). Every derived install path
+ * (generations, state, patterns) inherits the prefix from its root, which
+ * keeps hardlink-identity and backing comparisons form-consistent. */
+static bool cli_windows_canonicalize_launcher_path(wchar_t path[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    wchar_t resolved[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    DWORD length = GetFullPathNameW(path, CBM_WINDOWS_LAUNCHER_PATH_CAP, resolved, NULL);
+    if (length == 0 || length >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+        return false;
+    }
+    bool already_prefixed = wcsncmp(resolved, L"\\\\?\\", 4) == 0;
+    bool drive_absolute = !already_prefixed &&
+                          ((resolved[0] >= L'A' && resolved[0] <= L'Z') ||
+                           (resolved[0] >= L'a' && resolved[0] <= L'z')) &&
+                          resolved[1] == L':' && resolved[2] == L'\\';
+    /* Always extended-length, not just past a threshold: derived install
+     * paths (generations, payloads, transaction temporaries) grow ~145 chars
+     * beyond this root, so a conditional prefix would split behavior by
+     * install depth. One uniform form also means every install exercises the
+     * exact path shape the deep-path guards verify. */
+    if (drive_absolute) {
+        if (length + 5U >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+            return false;
+        }
+        wmemcpy(path, L"\\\\?\\", 4);
+        wmemcpy(path + 4, resolved, length + 1U);
+    } else {
+        wmemcpy(path, resolved, length + 1U);
+    }
+    return true;
+}
+
+/* User-facing form of a canonical wide path: agent configs, PATH advice, and
+ * install messages must carry the classic drive form, never the \\?\\
+ * namespace the file APIs use internally. */
+static char *cli_windows_plain_utf8(const wchar_t *path) {
+    if (path && wcsncmp(path, L"\\\\?\\", 4) == 0) {
+        path += 4;
+    }
+    return cbm_wide_to_utf8(path);
+}
+
 static bool cli_windows_module_path(wchar_t out[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
     DWORD length = GetModuleFileNameW(NULL, out, CBM_WINDOWS_LAUNCHER_PATH_CAP);
-    return length > 0 && length < CBM_WINDOWS_LAUNCHER_PATH_CAP;
+    return length > 0 && length < CBM_WINDOWS_LAUNCHER_PATH_CAP &&
+           cli_windows_canonicalize_launcher_path(out);
 }
 
 static bool cli_windows_parent_path(const wchar_t *path, wchar_t *out, size_t capacity) {
@@ -5723,6 +5780,11 @@ static bool cli_windows_join_path(const wchar_t *directory, const wchar_t *name,
         out[0] = L'\0';
         return false;
     }
+    /* Join targets feed file APIs and derived-path builders directly; only
+     * the full-capacity launcher buffers can hold the canonical form. */
+    if (capacity >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
+        return cli_windows_canonicalize_launcher_path(out);
+    }
     return true;
 }
 
@@ -5747,16 +5809,23 @@ static bool cli_windows_regular_file_no_reparse(const wchar_t *path, uint64_t *s
     return valid;
 }
 
-/* A portable release pair provides the source launcher adjacent to the
- * payload. A managed reinstall uses the already-authenticated canonical
- * launcher because immutable generation payloads intentionally have no
- * sibling launcher. */
+/* A portable release pair provides a one-link source launcher adjacent to the
+ * payload. A managed reinstall must instead validate the canonical launcher's
+ * exact two-link identity and copy from the backing that owns that identity.
+ * The backing can intentionally differ from current-v1 during a crash-safe ABI
+ * transition, so it is discovered by file identity rather than payload SHA. */
 static bool cli_windows_install_source_launcher(
     const wchar_t *payload_path, wchar_t launcher_out[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
     if (g_windows_launcher_context.present && g_windows_launcher_context.managed) {
-        int copied = _snwprintf_s(launcher_out, CBM_WINDOWS_LAUNCHER_PATH_CAP, _TRUNCATE, L"%ls",
-                                  g_windows_launcher_context.canonical_launcher_path);
-        return copied > 0 && cli_windows_regular_file_no_reparse(launcher_out, NULL);
+        char error[CLI_BUF_512] = {0};
+        if (cbm_windows_managed_launcher_backing(g_windows_launcher_context.canonical_launcher_path,
+                                                 launcher_out, CBM_WINDOWS_LAUNCHER_PATH_CAP, error,
+                                                 sizeof(error))) {
+            return true;
+        }
+        (void)fprintf(stderr, "error: managed launcher backing validation failed: %s\n",
+                      error[0] ? error : "canonical launcher is not an exact two-link pair");
+        return false;
     }
     wchar_t directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
     return cli_windows_parent_path(payload_path, directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
@@ -5765,200 +5834,343 @@ static bool cli_windows_install_source_launcher(
            cli_windows_regular_file_no_reparse(launcher_out, NULL);
 }
 
-static bool cli_windows_remove_tree(const wchar_t *directory) {
-    DWORD attributes = GetFileAttributesW(directory);
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
-    }
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
-        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        return false;
-    }
-
-    wchar_t pattern[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_join_path(directory, L"*", pattern, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        return false;
-    }
-    WIN32_FIND_DATAW entry;
-    HANDLE search = FindFirstFileW(pattern, &entry);
-    if (search == INVALID_HANDLE_VALUE) {
-        return GetLastError() == ERROR_FILE_NOT_FOUND && RemoveDirectoryW(directory) != 0;
-    }
-    bool ok = true;
-    do {
-        if (wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0) {
-            continue;
-        }
-        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-            ok = false;
-            break;
-        }
-        wchar_t child[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-        if (!cli_windows_join_path(directory, entry.cFileName, child,
-                                   CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-            ok = false;
-            break;
-        }
-        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            ok = cli_windows_remove_tree(child);
-        } else {
-            ok = DeleteFileW(child) != 0;
-        }
-    } while (ok && FindNextFileW(search, &entry));
-    DWORD find_error = GetLastError();
-    (void)FindClose(search);
-    return ok && find_error == ERROR_NO_MORE_FILES && RemoveDirectoryW(directory) != 0;
-}
-
-static bool cli_windows_remove_managed_state(const wchar_t *canonical_launcher) {
+static void cli_windows_remove_empty_managed_state(const wchar_t *canonical_launcher) {
     wchar_t directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
     wchar_t state[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    return cli_windows_parent_path(canonical_launcher, directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-           cli_windows_join_path(directory, L".cbm", state, CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-           cli_windows_remove_tree(state);
+    wchar_t generations[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    if (!cli_windows_parent_path(canonical_launcher, directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !cli_windows_join_path(directory, L".cbm", state, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !cli_windows_join_path(state, L"generations", generations, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+        return;
+    }
+    /* Rollback already removed the exact generation and current-v1 created by
+     * this activation. Remove only now-empty parents: recursive cleanup could
+     * erase a pre-existing recovery generation that this attempt did not own. */
+    (void)RemoveDirectoryW(generations);
+    (void)RemoveDirectoryW(state);
+}
+
+static bool cli_windows_stage_private_file(const char *source, const char *target,
+                                           char fingerprint_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
+static bool cli_windows_stage_private_bytes(
+    const unsigned char *bytes, size_t bytes_size, const char *target,
+    char fingerprint_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
+
+static bool cli_windows_path_absent(const wchar_t *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+static bool cli_windows_file_fingerprint_matches(const wchar_t *path,
+                                                 const char expected_sha256[65]) {
+    char *path_utf8 = cbm_wide_to_utf8(path);
+    char observed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool matches = path_utf8 && expected_sha256 &&
+                   cbm_daemon_build_fingerprint_file(path_utf8, observed) &&
+                   strcmp(observed, expected_sha256) == 0;
+    free(path_utf8);
+    return matches;
+}
+
+static bool cli_windows_generation_launcher_secure(const wchar_t *canonical_launcher,
+                                                   const wchar_t *generation_launcher,
+                                                   const char expected_launcher_sha256[65]) {
+    wchar_t current_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    char error[CLI_BUF_256] = {0};
+    bool managed_backing =
+        cbm_windows_managed_launcher_backing(canonical_launcher, current_backing,
+                                             CBM_WINDOWS_LAUNCHER_PATH_CAP, error, sizeof(error)) &&
+        _wcsicmp(current_backing, generation_launcher) == 0;
+    bool unpublished_backing = !managed_backing && cbm_windows_launcher_file_secure(
+                                                       generation_launcher, error, sizeof(error));
+    if (!managed_backing && !unpublished_backing) {
+        (void)fprintf(stderr, "error: generation launcher backing validation failed: %s (os %lu)\n",
+                      error[0] ? error : "no matching backing", (unsigned long)GetLastError());
+        return false;
+    }
+    if (!cli_windows_file_fingerprint_matches(generation_launcher, expected_launcher_sha256)) {
+        (void)fprintf(stderr, "error: generation launcher fingerprint mismatch (os %lu)\n",
+                      (unsigned long)GetLastError());
+        return false;
+    }
+    return true;
+}
+
+static bool cli_windows_generation_payload_secure(const wchar_t *payload,
+                                                  const cbm_windows_current_v1_t *state) {
+    uint64_t payload_size = 0;
+    char payload_error[CLI_BUF_256] = {0};
+    if (!state || !cli_windows_regular_file_no_reparse(payload, &payload_size)) {
+        (void)fprintf(stderr, "error: generation payload open/shape validation failed (os %lu)\n",
+                      (unsigned long)GetLastError());
+        return false;
+    }
+    if (payload_size != state->payload_size) {
+        (void)fprintf(stderr, "error: generation payload size mismatch\n");
+        return false;
+    }
+    if (!cbm_windows_launcher_file_secure(payload, payload_error, sizeof(payload_error))) {
+        (void)fprintf(stderr, "error: generation payload security validation failed: %s (os %lu)\n",
+                      payload_error[0] ? payload_error : "unsafe path or policy",
+                      (unsigned long)GetLastError());
+        return false;
+    }
+    if (!cli_windows_file_fingerprint_matches(payload, state->payload_sha256)) {
+        (void)fprintf(stderr, "error: generation payload fingerprint mismatch (os %lu)\n",
+                      (unsigned long)GetLastError());
+        return false;
+    }
+    return true;
+}
+
+static bool cli_windows_generation_pair_valid(const wchar_t *canonical_launcher,
+                                              const wchar_t *payload,
+                                              const wchar_t *generation_launcher,
+                                              const cbm_windows_current_v1_t *state,
+                                              const char expected_launcher_sha256[65]) {
+    return cli_windows_generation_payload_secure(payload, state) &&
+           cli_windows_generation_launcher_secure(canonical_launcher, generation_launcher,
+                                                  expected_launcher_sha256);
+}
+
+static void cli_windows_generation_pair_cleanup(const wchar_t *payload,
+                                                const wchar_t *generation_launcher,
+                                                const wchar_t *generation_directory,
+                                                bool payload_created, bool launcher_created,
+                                                bool directory_created) {
+    if (payload_created && payload && payload[0]) {
+        (void)DeleteFileW(payload);
+    }
+    if (launcher_created && generation_launcher && generation_launcher[0]) {
+        (void)DeleteFileW(generation_launcher);
+    }
+    if (directory_created && generation_directory && generation_directory[0]) {
+        (void)RemoveDirectoryW(generation_directory);
+    }
+}
+
+static bool cli_windows_generation_unreferenced_by_current(const wchar_t *canonical_launcher,
+                                                           const char payload_sha256[65]) {
+    cbm_windows_current_v1_t current;
+    bool exists = false;
+    return cli_windows_read_current(canonical_launcher, &current, &exists) &&
+           (!exists || strcmp(current.payload_sha256, payload_sha256) != 0);
 }
 
 static bool cli_windows_publish_generation(const wchar_t *canonical_launcher,
+                                           const wchar_t *launcher_source,
                                            const wchar_t *payload_source,
                                            const cbm_windows_current_v1_t *state,
                                            bool *created_out) {
     if (created_out) {
         *created_out = false;
     }
-    wchar_t generation[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cbm_windows_generation_payload_path(canonical_launcher, state->payload_sha256, generation,
-                                             CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+    wchar_t payload[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    if (!launcher_source || !payload_source || !state ||
+        !cbm_windows_generation_payload_path(canonical_launcher, state->payload_sha256, payload,
+                                             CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !cbm_windows_generation_launcher_path(canonical_launcher, state->payload_sha256,
+                                              generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+        (void)fprintf(stderr, "error: generation path construction failed (os %lu)\n",
+                      (unsigned long)GetLastError());
         return false;
     }
-    uint64_t existing_size = 0;
-    if (cli_windows_regular_file_no_reparse(generation, &existing_size)) {
-        char *existing_utf8 = cbm_wide_to_utf8(generation);
-        char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-        bool valid = existing_utf8 && existing_size == state->payload_size &&
-                     cbm_daemon_build_fingerprint_file(existing_utf8, fingerprint) &&
-                     strcmp(fingerprint, state->payload_sha256) == 0;
-        free(existing_utf8);
-        return valid;
+    char *launcher_source_utf8 = cbm_wide_to_utf8(launcher_source);
+    char expected_launcher_sha256[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool launcher_identity =
+        launcher_source_utf8 &&
+        cbm_daemon_build_fingerprint_file(launcher_source_utf8, expected_launcher_sha256);
+    free(launcher_source_utf8);
+    if (!launcher_identity) {
+        (void)fprintf(stderr, "error: launcher build-identity fingerprint failed (os %lu)\n",
+                      (unsigned long)GetLastError());
+        return false;
+    }
+    bool payload_absent = cli_windows_path_absent(payload);
+    bool launcher_absent = cli_windows_path_absent(generation_launcher);
+    if (!payload_absent && !launcher_absent) {
+        bool pair_valid = cli_windows_generation_pair_valid(
+            canonical_launcher, payload, generation_launcher, state, expected_launcher_sha256);
+        if (!pair_valid) {
+            (void)fprintf(stderr, "error: existing generation pair failed validation (os %lu)\n",
+                          (unsigned long)GetLastError());
+        }
+        return pair_valid;
+    }
+    bool fresh_generation = payload_absent && launcher_absent;
+    if (!cli_windows_generation_unreferenced_by_current(canonical_launcher,
+                                                        state->payload_sha256)) {
+        (void)fprintf(stderr, "error: generation is still referenced by current state (os %lu)\n",
+                      (unsigned long)GetLastError());
+        return false;
+    }
+    if (!fresh_generation) {
+        bool existing_secure =
+            payload_absent ? cli_windows_generation_launcher_secure(
+                                 canonical_launcher, generation_launcher, expected_launcher_sha256)
+                           : cli_windows_generation_payload_secure(payload, state);
+        if (!existing_secure) {
+            (void)fprintf(stderr, "error: partial generation failed security validation (os %lu)\n",
+                          (unsigned long)GetLastError());
+            return false;
+        }
     }
 
     wchar_t generation_dir[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_parent_path(generation, generation_dir, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+    if (!cli_windows_parent_path(payload, generation_dir, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+        (void)fprintf(stderr, "error: generation directory path construction failed (os %lu)\n",
+                      (unsigned long)GetLastError());
         return false;
     }
     char *generation_dir_utf8 = cbm_wide_to_utf8(generation_dir);
-    char *generation_utf8 = cbm_wide_to_utf8(generation);
-    char *source_utf8 = cbm_wide_to_utf8(payload_source);
-    bool prepared = generation_dir_utf8 && generation_utf8 && source_utf8 &&
+    char *payload_utf8 = cbm_wide_to_utf8(payload);
+    char *generation_launcher_utf8 = cbm_wide_to_utf8(generation_launcher);
+    char *payload_source_utf8 = cbm_wide_to_utf8(payload_source);
+    launcher_source_utf8 = cbm_wide_to_utf8(launcher_source);
+    bool generation_directory_absent = cli_windows_path_absent(generation_dir);
+    bool prepared = generation_dir_utf8 && payload_utf8 && generation_launcher_utf8 &&
+                    payload_source_utf8 && launcher_source_utf8 &&
                     cbm_mkdir_p(generation_dir_utf8, CLI_OCTAL_PERM);
-    cbm_activation_transaction_t *transaction = NULL;
-    cbm_activation_transaction_status_t staged =
-        prepared ? cbm_activation_transaction_stage_file(generation_utf8, source_utf8, &transaction)
-                 : CBM_ACTIVATION_TRANSACTION_IO;
-    cli_binary_validator_t validator = {{0}};
-    prepared = staged == CBM_ACTIVATION_TRANSACTION_OK && transaction &&
-               cli_activation_transaction_expected_build(transaction, &validator) &&
-               strcmp(validator.fingerprint, state->payload_sha256) == 0 &&
-               cli_activation_transaction_commit_validated(transaction, &validator,
-                                                           CLI_OCTAL_PERM) == CLI_OK &&
-               cli_activation_transaction_finalize_close(&transaction) == CLI_OK;
-    (void)cli_activation_transaction_abort(&transaction);
+    if (!prepared) {
+        (void)fprintf(stderr, "error: generation directory creation failed (os %lu)\n",
+                      (unsigned long)GetLastError());
+    }
+    char payload_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char launcher_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool payload_created = false;
+    bool launcher_created = false;
+    if (prepared && payload_absent) {
+        payload_created =
+            cli_windows_stage_private_file(payload_source_utf8, payload_utf8, payload_fingerprint);
+        prepared = payload_created && strcmp(payload_fingerprint, state->payload_sha256) == 0;
+        if (payload_created && !prepared) {
+            (void)fprintf(stderr, "error: staged payload fingerprint mismatch\n");
+        }
+    }
+    if (prepared && launcher_absent) {
+        launcher_created = cli_windows_stage_private_file(
+            launcher_source_utf8, generation_launcher_utf8, launcher_fingerprint);
+        prepared = launcher_created && strcmp(launcher_fingerprint, expected_launcher_sha256) == 0;
+        if (launcher_created && !prepared) {
+            (void)fprintf(stderr, "error: staged launcher fingerprint mismatch\n");
+        }
+    }
+    if (prepared) {
+        prepared = cli_windows_generation_pair_valid(
+            canonical_launcher, payload, generation_launcher, state, expected_launcher_sha256);
+        if (!prepared) {
+            (void)fprintf(stderr,
+                          "error: published generation pair failed final validation (os %lu)\n",
+                          (unsigned long)GetLastError());
+        }
+    }
     free(generation_dir_utf8);
-    free(generation_utf8);
-    free(source_utf8);
-    if (prepared && created_out) {
-        *created_out = true;
+    free(payload_utf8);
+    free(generation_launcher_utf8);
+    free(payload_source_utf8);
+    free(launcher_source_utf8);
+    if (!prepared) {
+        cli_windows_generation_pair_cleanup(payload, generation_launcher, generation_dir,
+                                            payload_created, launcher_created,
+                                            generation_directory_absent);
+        return false;
+    }
+    if (created_out) {
+        *created_out = fresh_generation;
     }
     return prepared;
 }
 
 static bool cli_windows_publish_generation_bytes(const wchar_t *canonical_launcher,
                                                  const cbm_windows_current_v1_t *state,
-                                                 const unsigned char *payload, size_t payload_size,
-                                                 bool *created_out) {
+                                                 const unsigned char *launcher,
+                                                 size_t launcher_size, const unsigned char *payload,
+                                                 size_t payload_size, bool *created_out) {
     if (created_out) {
         *created_out = false;
     }
-    if (!payload || payload_size == 0 || payload_size != state->payload_size) {
+    if (!state || !launcher || launcher_size == 0 || !payload || payload_size == 0 ||
+        payload_size != state->payload_size) {
         return false;
     }
-    wchar_t generation[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cbm_windows_generation_payload_path(canonical_launcher, state->payload_sha256, generation,
-                                             CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+    wchar_t generation_payload[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    if (!cbm_windows_generation_payload_path(canonical_launcher, state->payload_sha256,
+                                             generation_payload, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
+        !cbm_windows_generation_launcher_path(canonical_launcher, state->payload_sha256,
+                                              generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
         return false;
     }
-    uint64_t existing_size = 0;
-    if (cli_windows_regular_file_no_reparse(generation, &existing_size)) {
-        char *existing_utf8 = cbm_wide_to_utf8(generation);
-        char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-        bool valid = existing_utf8 && existing_size == payload_size &&
-                     cbm_daemon_build_fingerprint_file(existing_utf8, fingerprint) &&
-                     strcmp(fingerprint, state->payload_sha256) == 0;
-        free(existing_utf8);
-        return valid;
+    char expected_launcher_sha256[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    cbm_sha256_hex(launcher, launcher_size, expected_launcher_sha256);
+    bool payload_absent = cli_windows_path_absent(generation_payload);
+    bool launcher_absent = cli_windows_path_absent(generation_launcher);
+    if (!payload_absent && !launcher_absent) {
+        return cli_windows_generation_pair_valid(canonical_launcher, generation_payload,
+                                                 generation_launcher, state,
+                                                 expected_launcher_sha256);
+    }
+    bool fresh_generation = payload_absent && launcher_absent;
+    if (!cli_windows_generation_unreferenced_by_current(canonical_launcher,
+                                                        state->payload_sha256)) {
+        return false;
+    }
+    if (!fresh_generation) {
+        bool existing_secure =
+            payload_absent ? cli_windows_generation_launcher_secure(
+                                 canonical_launcher, generation_launcher, expected_launcher_sha256)
+                           : cli_windows_generation_payload_secure(generation_payload, state);
+        if (!existing_secure) {
+            return false;
+        }
     }
     wchar_t generation_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_parent_path(generation, generation_directory, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
+    if (!cli_windows_parent_path(generation_payload, generation_directory,
+                                 CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
         return false;
     }
     char *directory_utf8 = cbm_wide_to_utf8(generation_directory);
-    char *generation_utf8 = cbm_wide_to_utf8(generation);
-    bool ready = directory_utf8 && generation_utf8 && cbm_mkdir_p(directory_utf8, CLI_OCTAL_PERM);
-    cbm_activation_transaction_t *transaction = NULL;
-    cbm_activation_transaction_status_t staged =
-        ready ? cbm_activation_transaction_stage_bytes(generation_utf8, payload, payload_size,
-                                                       &transaction)
-              : CBM_ACTIVATION_TRANSACTION_IO;
-    cli_binary_validator_t validator = {{0}};
-    ready = staged == CBM_ACTIVATION_TRANSACTION_OK && transaction &&
-            cli_activation_transaction_expected_build(transaction, &validator) &&
-            strcmp(validator.fingerprint, state->payload_sha256) == 0 &&
-            cli_activation_transaction_commit_validated(transaction, &validator, CLI_OCTAL_PERM) ==
-                CLI_OK &&
-            cli_activation_transaction_finalize_close(&transaction) == CLI_OK;
-    (void)cli_activation_transaction_abort(&transaction);
+    char *payload_utf8 = cbm_wide_to_utf8(generation_payload);
+    char *launcher_utf8 = cbm_wide_to_utf8(generation_launcher);
+    bool generation_directory_absent = cli_windows_path_absent(generation_directory);
+    bool ready = directory_utf8 && payload_utf8 && launcher_utf8 &&
+                 cbm_mkdir_p(directory_utf8, CLI_OCTAL_PERM);
+    char payload_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char launcher_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool payload_created = false;
+    bool launcher_created = false;
+    if (ready && payload_absent) {
+        payload_created = cli_windows_stage_private_bytes(payload, payload_size, payload_utf8,
+                                                          payload_fingerprint);
+        ready = payload_created && strcmp(payload_fingerprint, state->payload_sha256) == 0;
+    }
+    if (ready && launcher_absent) {
+        launcher_created = cli_windows_stage_private_bytes(launcher, launcher_size, launcher_utf8,
+                                                           launcher_fingerprint);
+        ready = launcher_created && strcmp(launcher_fingerprint, expected_launcher_sha256) == 0;
+    }
+    ready = ready &&
+            cli_windows_generation_pair_valid(canonical_launcher, generation_payload,
+                                              generation_launcher, state, expected_launcher_sha256);
     free(directory_utf8);
-    free(generation_utf8);
-    if (ready && created_out) {
-        *created_out = true;
-    }
-    return ready;
-}
-
-static bool cli_windows_stage_launcher_candidate(
-    const wchar_t *canonical_launcher, const char payload_sha256[65], const unsigned char *launcher,
-    size_t launcher_size, wchar_t candidate_out[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
-    wchar_t current[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t state_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!launcher || launcher_size == 0 || !cli_windows_current_path(canonical_launcher, current) ||
-        !cli_windows_parent_path(current, state_directory, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        return false;
-    }
-    wchar_t name[96];
-    int name_length = _snwprintf_s(name, sizeof(name) / sizeof(name[0]), _TRUNCATE,
-                                   L"launcher-next-%hs.exe", payload_sha256);
-    if (name_length <= 0 || !cli_windows_join_path(state_directory, name, candidate_out,
-                                                   CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        return false;
-    }
-    char *state_utf8 = cbm_wide_to_utf8(state_directory);
-    char *candidate_utf8 = cbm_wide_to_utf8(candidate_out);
-    bool ready = state_utf8 && candidate_utf8 && cbm_mkdir_p(state_utf8, CLI_OCTAL_PERM);
-    cbm_activation_transaction_t *transaction = NULL;
-    cbm_activation_transaction_status_t staged =
-        ready ? cbm_activation_transaction_stage_bytes(candidate_utf8, launcher, launcher_size,
-                                                       &transaction)
-              : CBM_ACTIVATION_TRANSACTION_IO;
-    cli_binary_validator_t validator = {{0}};
-    ready = staged == CBM_ACTIVATION_TRANSACTION_OK && transaction &&
-            cli_activation_transaction_expected_build(transaction, &validator) &&
-            cli_activation_transaction_commit_validated(transaction, &validator, CLI_OCTAL_PERM) ==
-                CLI_OK &&
-            cli_activation_transaction_finalize_close(&transaction) == CLI_OK;
-    (void)cli_activation_transaction_abort(&transaction);
-    free(state_utf8);
-    free(candidate_utf8);
+    free(payload_utf8);
+    free(launcher_utf8);
     if (!ready) {
-        candidate_out[0] = L'\0';
+        cli_windows_generation_pair_cleanup(generation_payload, generation_launcher,
+                                            generation_directory, payload_created, launcher_created,
+                                            generation_directory_absent);
+        return false;
+    }
+    if (created_out) {
+        *created_out = fresh_generation;
     }
     return ready;
 }
@@ -9413,11 +9625,13 @@ typedef struct {
     wchar_t canonical_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
     wchar_t launcher_source[CBM_WINDOWS_LAUNCHER_PATH_CAP];
     wchar_t payload_source[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t previous_launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
     cbm_windows_current_v1_t state;
     cbm_windows_current_v1_t previous_state;
     cbm_windows_transition_plan_t transition_plan;
     bool initial_install;
     bool previous_state_valid;
+    bool previous_launcher_backing_valid;
     bool delete_indexes;
     bool skip_config;
     bool force;
@@ -9468,6 +9682,68 @@ static bool cli_windows_read_current(const wchar_t *canonical_launcher,
     (void)CloseHandle(file);
     *exists_out = true;
     return valid;
+}
+
+static bool cli_windows_current_equal(const cbm_windows_current_v1_t *left,
+                                      const cbm_windows_current_v1_t *right) {
+    return left && right && left->launcher_abi_min == right->launcher_abi_min &&
+           left->launcher_abi_max == right->launcher_abi_max &&
+           left->payload_size == right->payload_size &&
+           strcmp(left->payload_sha256, right->payload_sha256) == 0;
+}
+
+static bool cli_windows_remove_current_if_present(const wchar_t *canonical_launcher) {
+    cbm_windows_current_v1_t observed;
+    bool exists = false;
+    wchar_t current[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    if (!cli_windows_read_current(canonical_launcher, &observed, &exists) ||
+        !cli_windows_current_path(canonical_launcher, current)) {
+        return false;
+    }
+    if (!exists) {
+        return true;
+    }
+    return DeleteFileW(current) != 0;
+}
+
+static bool cli_windows_restore_managed_pair(const wchar_t *canonical_launcher,
+                                             const wchar_t *previous_launcher_backing,
+                                             bool previous_launcher_backing_valid,
+                                             const cbm_windows_current_v1_t *previous_state,
+                                             bool previous_state_valid, char *error,
+                                             size_t error_size) {
+    if (error && error_size > 0U) {
+        error[0] = '\0';
+    }
+    char launcher_error[CLI_BUF_256] = {0};
+    bool launcher_restored =
+        previous_launcher_backing_valid
+            ? cbm_windows_launcher_replace_atomic(canonical_launcher, previous_launcher_backing,
+                                                  launcher_error, sizeof(launcher_error))
+            : (cli_windows_path_absent(canonical_launcher) ||
+               cbm_windows_launcher_remove_posix(canonical_launcher, launcher_error,
+                                                 sizeof(launcher_error)));
+    char current_error[CLI_BUF_256] = {0};
+    bool current_restored =
+        previous_state_valid
+            ? cbm_windows_current_v1_write_atomic(canonical_launcher, previous_state, current_error,
+                                                  sizeof(current_error))
+            : cli_windows_remove_current_if_present(canonical_launcher);
+    if (!launcher_restored || !current_restored) {
+        if (error && error_size > 0U) {
+            (void)snprintf(
+                error, error_size, "%s%s%s",
+                !launcher_restored
+                    ? (launcher_error[0] ? launcher_error : "canonical backing restoration failed")
+                    : "",
+                !launcher_restored && !current_restored ? "; " : "",
+                !current_restored
+                    ? (current_error[0] ? current_error : "current-v1 restoration failed")
+                    : "");
+        }
+        return false;
+    }
+    return true;
 }
 
 static bool cli_windows_stage_private_file(
@@ -9775,52 +10051,77 @@ static int cli_windows_managed_install_activate(void *opaque) {
         bool launcher_committed = false;
         bool current_committed = false;
         char error[CLI_BUF_512] = {0};
+        cbm_windows_current_v1_t observed_current;
+        bool observed_current_exists = false;
+        wchar_t observed_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
+        bool current_unchanged =
+            cli_windows_read_current(activation->canonical_launcher, &observed_current,
+                                     &observed_current_exists) &&
+            observed_current_exists == activation->previous_state_valid &&
+            (!observed_current_exists ||
+             cli_windows_current_equal(&observed_current, &activation->previous_state));
+        bool backing_unchanged =
+            activation->previous_launcher_backing_valid
+                ? (cbm_windows_managed_launcher_backing(
+                       activation->canonical_launcher, observed_backing,
+                       CBM_WINDOWS_LAUNCHER_PATH_CAP, error, sizeof(error)) &&
+                   _wcsicmp(observed_backing, activation->previous_launcher_backing) == 0)
+                : cli_windows_path_absent(activation->canonical_launcher);
+        bool previous_pair_unchanged = current_unchanged && backing_unchanged;
+        if (!previous_pair_unchanged) {
+            (void)fprintf(stderr, "error: managed Windows launcher/current state changed before "
+                                  "install activation; no generation was published\n");
+            return CLI_TRUE;
+        }
+        wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
         bool generation_ready = cli_windows_publish_generation(
-            activation->canonical_launcher, activation->payload_source, &activation->state,
-            &generation_created);
+            activation->canonical_launcher, activation->launcher_source, activation->payload_source,
+            &activation->state, &generation_created);
+        generation_ready = generation_ready &&
+                           cbm_windows_generation_launcher_path(
+                               activation->canonical_launcher, activation->state.payload_sha256,
+                               generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP);
         if (generation_ready &&
             activation->transition_plan == CBM_WINDOWS_TRANSITION_CURRENT_FIRST) {
             current_committed = cbm_windows_current_v1_write_atomic(
                 activation->canonical_launcher, &activation->state, error, sizeof(error));
-            launcher_committed = current_committed &&
-                                 cbm_windows_launcher_replace_atomic(activation->canonical_launcher,
-                                                                     activation->launcher_source,
-                                                                     error, sizeof(error));
+            launcher_committed =
+                current_committed &&
+                cbm_windows_launcher_replace_atomic(activation->canonical_launcher,
+                                                    generation_launcher, error, sizeof(error));
         } else if (generation_ready) {
             launcher_committed = cbm_windows_launcher_replace_atomic(
-                activation->canonical_launcher, activation->launcher_source, error, sizeof(error));
+                activation->canonical_launcher, generation_launcher, error, sizeof(error));
             current_committed = launcher_committed && cbm_windows_current_v1_write_atomic(
                                                           activation->canonical_launcher,
                                                           &activation->state, error, sizeof(error));
         }
         if (!generation_ready || !launcher_committed || !current_committed) {
-            if (activation->transition_plan == CBM_WINDOWS_TRANSITION_CURRENT_FIRST &&
-                current_committed && !launcher_committed && activation->previous_state_valid) {
-                char restore_error[CLI_BUF_256] = {0};
-                if (!cbm_windows_current_v1_write_atomic(activation->canonical_launcher,
-                                                         &activation->previous_state, restore_error,
-                                                         sizeof(restore_error))) {
-                    (void)fprintf(stderr,
-                                  "error: managed Windows install could not restore "
-                                  "the previous current-v1 after launcher failure: %s\n",
-                                  restore_error[0] ? restore_error : "atomic restoration failed");
-                }
-            }
-            if (activation->initial_install) {
-                char cleanup_error[CLI_BUF_256] = {0};
-                (void)cbm_windows_launcher_remove_posix(activation->canonical_launcher,
-                                                        cleanup_error, sizeof(cleanup_error));
-                (void)cli_windows_remove_managed_state(activation->canonical_launcher);
+            char restore_error[CLI_BUF_512] = {0};
+            bool restored = cli_windows_restore_managed_pair(
+                activation->canonical_launcher, activation->previous_launcher_backing,
+                activation->previous_launcher_backing_valid, &activation->previous_state,
+                activation->previous_state_valid, restore_error, sizeof(restore_error));
+            if (!restored) {
+                (void)fprintf(stderr,
+                              "error: managed Windows install could not restore the "
+                              "previous launcher/current pair: %s\n",
+                              restore_error[0] ? restore_error : "atomic restoration failed");
             }
             char rollback_error[CLI_BUF_256] = {0};
-            if (!cbm_windows_generation_rollback_if_unreferenced(
-                    activation->canonical_launcher, activation->state.payload_sha256,
-                    generation_created, rollback_error, sizeof(rollback_error))) {
+            bool generation_rolled_back = cbm_windows_generation_rollback_if_unreferenced(
+                activation->canonical_launcher, activation->state.payload_sha256,
+                generation_created, rollback_error, sizeof(rollback_error));
+            if (!generation_rolled_back) {
                 (void)fprintf(stderr,
                               "error: managed Windows install generation rollback "
                               "failed: %s\n",
                               rollback_error[0] ? rollback_error
                                                 : "generation remains for safe recovery");
+            }
+            if (activation->initial_install && !activation->previous_launcher_backing_valid &&
+                generation_created && restored && generation_rolled_back) {
+                cli_windows_remove_empty_managed_state(activation->canonical_launcher);
             }
             (void)fprintf(stderr, "error: managed Windows install commit failed: %s\n",
                           error[0] ? error : "generation/launcher/current publish failed");
@@ -9911,7 +10212,7 @@ static int cli_windows_managed_install(const char *home, const char *requested_b
     }
 
     char *bin_dir = cbm_wide_to_utf8(full_directory);
-    char *bin_target = cbm_wide_to_utf8(canonical_launcher);
+    char *bin_target = cli_windows_plain_utf8(canonical_launcher);
     char *payload_utf8 = cbm_wide_to_utf8(payload_source);
     char *launcher_utf8 = cbm_wide_to_utf8(launcher_source);
     char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
@@ -9947,28 +10248,53 @@ static int cli_windows_managed_install(const char *home, const char *requested_b
     memset(&previous, 0, sizeof(previous));
     bool current_exists = false;
     bool current_valid = cli_windows_read_current(canonical_launcher, &previous, &current_exists);
-    bool launcher_exists = cli_windows_regular_file_no_reparse(canonical_launcher, NULL);
+    DWORD launcher_attributes = GetFileAttributesW(canonical_launcher);
+    DWORD launcher_attribute_error =
+        launcher_attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    bool launcher_exists = launcher_attributes != INVALID_FILE_ATTRIBUTES;
+    bool launcher_absent = launcher_attributes == INVALID_FILE_ATTRIBUTES &&
+                           (launcher_attribute_error == ERROR_FILE_NOT_FOUND ||
+                            launcher_attribute_error == ERROR_PATH_NOT_FOUND);
     const char *current_version_argv[] = {bin_target, "--version", NULL};
-    char target_error[CLI_BUF_256] = {0};
+    char target_error[CLI_BUF_512] = {0};
+    wchar_t target_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
     bool current_target_secure =
-        !launcher_exists ||
-        cbm_windows_launcher_file_secure(canonical_launcher, target_error, sizeof(target_error));
-    char installed_launcher_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+        launcher_exists && cbm_windows_managed_launcher_backing(canonical_launcher, target_backing,
+                                                                CBM_WINDOWS_LAUNCHER_PATH_CAP,
+                                                                target_error, sizeof(target_error));
     /* A crash between the fresh install's atomic launcher publication and
      * current-v1 publication leaves one recognizable partial state. Repair it
-     * only when the visible launcher is still private and byte-identical to
-     * this candidate; an arbitrary launcher/current mismatch remains a hard
-     * conflict. The guarded activation republishes the launcher and current-v1
-     * before it reports success. */
+     * only when canonical is the exact second link of this candidate's complete
+     * generation. An arbitrary launcher/current mismatch remains a hard
+     * conflict. */
+    cbm_windows_current_v1_t interrupted_state = {
+        .launcher_abi_min = descriptor.payload_launcher_abi_min,
+        .launcher_abi_max = descriptor.payload_launcher_abi_max,
+        .payload_size = descriptor.payload_size,
+    };
+    (void)snprintf(interrupted_state.payload_sha256, sizeof(interrupted_state.payload_sha256), "%s",
+                   fingerprint);
     bool interrupted_initial_install =
         current_valid && !current_exists && launcher_exists && current_target_secure &&
-        cbm_daemon_build_fingerprint_file(bin_target, installed_launcher_fingerprint) &&
-        strcmp(installed_launcher_fingerprint, launcher_fingerprint) == 0;
+        cbm_windows_generation_payload_path(canonical_launcher, fingerprint, prepared_payload,
+                                            CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
+        cbm_windows_generation_launcher_path(canonical_launcher, fingerprint, prepared_launcher,
+                                             CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
+        _wcsicmp(target_backing, prepared_launcher) == 0 &&
+        cli_windows_generation_pair_valid(canonical_launcher, prepared_payload, prepared_launcher,
+                                          &interrupted_state, launcher_fingerprint);
+    bool fresh_target = current_valid && !current_exists && launcher_absent;
+    bool intact_target = current_valid && current_exists && current_target_secure;
+    /* A launcher-first initial-install crash intentionally has no current-v1
+     * yet. Executing canonical in that state must fail closed (it cannot select
+     * a managed payload and its two-link layout forbids portable mode). The
+     * exact generation identities above authenticate that recovery state; the
+     * copied source pair is executed again during private staging below. */
     bool current_pair_runnable =
-        !current_exists ||
-        (current_target_secure && cbm_exec_no_shell(current_version_argv) == CLI_OK);
-    if (!current_valid || (current_exists != launcher_exists && !interrupted_initial_install) ||
-        !current_target_secure || !current_pair_runnable) {
+        fresh_target || interrupted_initial_install ||
+        (intact_target && cbm_exec_no_shell(current_version_argv) == CLI_OK);
+    if ((!fresh_target && !intact_target && !interrupted_initial_install) ||
+        !current_pair_runnable) {
         (void)fprintf(stderr,
                       "error: target is not an intact compatible managed Windows "
                       "installation; remove the conflicting files before install%s%s\n",
@@ -10070,12 +10396,16 @@ static int cli_windows_managed_install(const char *home, const char *requested_b
                                           : CBM_WINDOWS_TRANSITION_LAUNCHER_FIRST,
         .initial_install = !current_exists,
         .previous_state_valid = current_exists,
+        .previous_launcher_backing_valid = launcher_exists,
         .delete_indexes = delete_indexes,
         .skip_config = skip_config,
         .force = force,
         .dry_run = dry_run,
     };
     memcpy(activation.canonical_launcher, canonical_launcher, sizeof(canonical_launcher));
+    if (launcher_exists) {
+        memcpy(activation.previous_launcher_backing, target_backing, sizeof(target_backing));
+    }
     memcpy(activation.launcher_source, pair_prepared ? prepared_launcher : launcher_source,
            sizeof(launcher_source));
     memcpy(activation.payload_source, pair_prepared ? prepared_payload : payload_source,
@@ -11579,6 +11909,8 @@ typedef struct {
     const char *home;
     const char *canonical_launcher_utf8;
     wchar_t canonical_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    cbm_windows_current_v1_t state;
     cbm_detected_agents_t agents;
     bool delete_indexes;
     bool dry_run;
@@ -11587,6 +11919,22 @@ typedef struct {
 static int cli_windows_managed_uninstall_activate(void *opaque) {
     cli_windows_uninstall_activation_t *activation = opaque;
     if (!activation || !activation->home || !activation->canonical_launcher_utf8) {
+        return CLI_TRUE;
+    }
+    cbm_windows_current_v1_t observed;
+    bool observed_exists = false;
+    wchar_t observed_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
+    char validation_error[CLI_BUF_512] = {0};
+    if (!cli_windows_read_current(activation->canonical_launcher, &observed, &observed_exists) ||
+        !observed_exists || !cli_windows_current_equal(&observed, &activation->state) ||
+        !cbm_windows_managed_launcher_backing(activation->canonical_launcher, observed_backing,
+                                              CBM_WINDOWS_LAUNCHER_PATH_CAP, validation_error,
+                                              sizeof(validation_error)) ||
+        _wcsicmp(observed_backing, activation->launcher_backing) != 0) {
+        (void)fprintf(stderr,
+                      "error: managed Windows launcher/current state changed before "
+                      "uninstall activation; no configuration was removed%s%s\n",
+                      validation_error[0] ? ": " : "", validation_error[0] ? validation_error : "");
         return CLI_TRUE;
     }
     if (activation->agents.claude_code) {
@@ -11607,22 +11955,8 @@ static int cli_windows_managed_uninstall_activate(void *opaque) {
         return CLI_OK;
     }
 
-    char error[CLI_BUF_512] = {0};
-    if (!cbm_windows_launcher_remove_posix(activation->canonical_launcher, error, sizeof(error))) {
-        (void)fprintf(stderr, "error: managed launcher removal failed: %s\n",
-                      error[0] ? error : "atomic POSIX unlink unavailable");
-        return CLI_TRUE;
-    }
-    printf("Removed %s\n", activation->canonical_launcher_utf8);
-
-    /* The visible launcher unlink is the uninstall commit point. The private
-     * launcher/payload copies are not inside this tree, so cleanup is
-     * synchronous and no installed image remains mapped. */
-    if (!cli_windows_remove_managed_state(activation->canonical_launcher)) {
-        (void)fprintf(stderr, "error: launcher was removed, but managed current/generation "
-                              "cleanup did not complete\n");
-        return CLI_ACTIVATION_PARTIAL;
-    }
+    /* Finish every fallible cleanup before retiring managed state and
+     * unlinking the only public retry entry point. */
     if (activation->delete_indexes) {
         int expected = count_db_indexes(activation->home);
         int removed = cbm_remove_indexes(activation->home);
@@ -11633,6 +11967,25 @@ static int cli_windows_managed_uninstall_activate(void *opaque) {
             return CLI_ACTIVATION_PARTIAL;
         }
     }
+
+    char error[CLI_BUF_512] = {0};
+    if (!cbm_windows_launcher_uninstall_commit(activation->canonical_launcher,
+                                               activation->state.payload_sha256, error,
+                                               sizeof(error))) {
+        (void)fprintf(stderr, "error: managed launcher uninstall commit failed: %s\n",
+                      error[0] ? error : "state retirement or atomic launcher unlink failed");
+        (void)fprintf(stderr,
+                      "error: configuration/index cleanup completed before the failed commit; "
+                      "retry after reviewing the retained managed state\n");
+        return CLI_TRUE;
+    }
+    printf("Removed %s\n", activation->canonical_launcher_utf8);
+
+    /* The commit moved .cbm to a SHA/PID-qualified sibling before unlinking
+     * canonical. The permanent launcher derives that exact authenticated name
+     * and removes only that retired tree after both mapped images exit; a
+     * concurrent reinstall can safely create a new .cbm immediately. */
+    printf("Retired managed generation cleanup will complete after the launcher exits.\n");
     return CLI_OK;
 }
 
@@ -11644,16 +11997,21 @@ static int cli_windows_managed_uninstall(const char *home, bool dry_run) {
     }
     cbm_windows_current_v1_t current;
     bool current_exists = false;
+    wchar_t launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
+    char validation_error[CLI_BUF_512] = {0};
     if (!cli_windows_read_current(g_windows_launcher_context.canonical_launcher_path, &current,
                                   &current_exists) ||
         !current_exists ||
         !cbm_windows_current_v1_supports_launcher_abi(&current, CBM_WINDOWS_LAUNCHER_ABI_CURRENT) ||
         current.payload_size != g_windows_launcher_context.payload_size ||
         strcmp(current.payload_sha256, g_windows_launcher_context.expected_payload_sha256) != 0 ||
-        !cli_windows_regular_file_no_reparse(g_windows_launcher_context.canonical_launcher_path,
-                                             NULL)) {
-        (void)fprintf(stderr, "error: authenticated managed launcher state changed before "
-                              "uninstall; no sessions were stopped\n");
+        !cbm_windows_managed_launcher_backing(g_windows_launcher_context.canonical_launcher_path,
+                                              launcher_backing, CBM_WINDOWS_LAUNCHER_PATH_CAP,
+                                              validation_error, sizeof(validation_error))) {
+        (void)fprintf(stderr,
+                      "error: authenticated managed launcher state changed before "
+                      "uninstall; no sessions were stopped%s%s\n",
+                      validation_error[0] ? ": " : "", validation_error[0] ? validation_error : "");
         return CLI_TRUE;
     }
     wchar_t target_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
@@ -11697,12 +12055,14 @@ static int cli_windows_managed_uninstall(const char *home, bool dry_run) {
     cli_windows_uninstall_activation_t activation = {
         .home = home,
         .canonical_launcher_utf8 = canonical_utf8,
+        .state = current,
         .agents = cbm_detect_agents(home),
         .delete_indexes = delete_indexes,
         .dry_run = dry_run,
     };
     memcpy(activation.canonical_launcher, g_windows_launcher_context.canonical_launcher_path,
            sizeof(activation.canonical_launcher));
+    memcpy(activation.launcher_backing, launcher_backing, sizeof(launcher_backing));
     int result = dry_run
                      ? cli_windows_managed_uninstall_activate(&activation)
                      : cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_UNINSTALL, NULL, NULL,
@@ -11844,6 +12204,7 @@ typedef struct {
     const char *home;
     const char *canonical_launcher_utf8;
     wchar_t canonical_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
+    wchar_t previous_launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
     cbm_windows_release_pair_t pair;
     cbm_windows_current_v1_t state;
     cbm_windows_current_v1_t previous_state;
@@ -11859,61 +12220,53 @@ static int cli_windows_managed_update_activate(void *opaque) {
     }
     cbm_windows_current_v1_t observed;
     bool observed_exists = false;
+    wchar_t observed_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
+    char error[CLI_BUF_512] = {0};
     if (!cli_windows_read_current(activation->canonical_launcher, &observed, &observed_exists) ||
-        !observed_exists ||
-        observed.launcher_abi_min != activation->previous_state.launcher_abi_min ||
-        observed.launcher_abi_max != activation->previous_state.launcher_abi_max ||
-        observed.payload_size != activation->previous_state.payload_size ||
-        strcmp(observed.payload_sha256, activation->previous_state.payload_sha256) != 0 ||
+        !observed_exists || !cli_windows_current_equal(&observed, &activation->previous_state) ||
+        !cbm_windows_managed_launcher_backing(activation->canonical_launcher, observed_backing,
+                                              CBM_WINDOWS_LAUNCHER_PATH_CAP, error,
+                                              sizeof(error)) ||
+        _wcsicmp(observed_backing, activation->previous_launcher_backing) != 0 ||
         activation->transition_plan == CBM_WINDOWS_TRANSITION_INCOMPATIBLE) {
         (void)fprintf(stderr, "error: managed Windows state changed before update "
                               "activation; no generation was published\n");
         return CLI_TRUE;
     }
-    wchar_t candidate[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char error[CLI_BUF_512] = {0};
-    bool candidate_ready = cli_windows_stage_launcher_candidate(
-        activation->canonical_launcher, activation->state.payload_sha256, activation->pair.launcher,
-        (size_t)activation->pair.launcher_len, candidate);
+    wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
     bool generation_created = false;
-    bool generation_ready =
-        candidate_ready &&
-        cli_windows_publish_generation_bytes(
-            activation->canonical_launcher, &activation->state, activation->pair.payload,
-            (size_t)activation->pair.payload_len, &generation_created);
+    bool generation_ready = cli_windows_publish_generation_bytes(
+        activation->canonical_launcher, &activation->state, activation->pair.launcher,
+        (size_t)activation->pair.launcher_len, activation->pair.payload,
+        (size_t)activation->pair.payload_len, &generation_created);
+    generation_ready =
+        generation_ready && cbm_windows_generation_launcher_path(
+                                activation->canonical_launcher, activation->state.payload_sha256,
+                                generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP);
     bool launcher_committed = false;
     bool current_committed = false;
     if (generation_ready && activation->transition_plan == CBM_WINDOWS_TRANSITION_CURRENT_FIRST) {
         current_committed = cbm_windows_current_v1_write_atomic(
             activation->canonical_launcher, &activation->state, error, sizeof(error));
-        launcher_committed = current_committed &&
-                             cbm_windows_launcher_replace_atomic(activation->canonical_launcher,
-                                                                 candidate, error, sizeof(error));
+        launcher_committed = current_committed && cbm_windows_launcher_replace_atomic(
+                                                      activation->canonical_launcher,
+                                                      generation_launcher, error, sizeof(error));
     } else if (generation_ready) {
-        launcher_committed = cbm_windows_launcher_replace_atomic(activation->canonical_launcher,
-                                                                 candidate, error, sizeof(error));
+        launcher_committed = cbm_windows_launcher_replace_atomic(
+            activation->canonical_launcher, generation_launcher, error, sizeof(error));
         current_committed = launcher_committed && cbm_windows_current_v1_write_atomic(
                                                       activation->canonical_launcher,
                                                       &activation->state, error, sizeof(error));
     }
-    if (candidate[0] != L'\0') {
-        DWORD attributes = GetFileAttributesW(candidate);
-        if (attributes != INVALID_FILE_ATTRIBUTES) {
-            (void)DeleteFileW(candidate);
-        }
-    }
     if (!generation_ready || !launcher_committed || !current_committed) {
-        if (activation->transition_plan == CBM_WINDOWS_TRANSITION_CURRENT_FIRST &&
-            current_committed && !launcher_committed) {
-            char restore_error[CLI_BUF_256] = {0};
-            if (!cbm_windows_current_v1_write_atomic(activation->canonical_launcher,
-                                                     &activation->previous_state, restore_error,
-                                                     sizeof(restore_error))) {
-                (void)fprintf(stderr,
-                              "error: managed Windows update could not restore the "
-                              "previous current-v1 after launcher failure: %s\n",
-                              restore_error[0] ? restore_error : "atomic restoration failed");
-            }
+        char restore_error[CLI_BUF_512] = {0};
+        if (!cli_windows_restore_managed_pair(
+                activation->canonical_launcher, activation->previous_launcher_backing, true,
+                &activation->previous_state, true, restore_error, sizeof(restore_error))) {
+            (void)fprintf(stderr,
+                          "error: managed Windows update could not restore the previous "
+                          "launcher/current pair: %s\n",
+                          restore_error[0] ? restore_error : "atomic restoration failed");
         }
         char rollback_error[CLI_BUF_256] = {0};
         if (!cbm_windows_generation_rollback_if_unreferenced(
@@ -12004,18 +12357,25 @@ static int cli_windows_extract_and_activate_update(const char *archive_path, con
     cbm_windows_current_v1_t current;
     memset(&current, 0, sizeof(current));
     bool current_exists = false;
+    wchar_t previous_launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
+    char backing_error[CLI_BUF_512] = {0};
     bool current_compatible =
         cli_windows_read_current(g_windows_launcher_context.canonical_launcher_path, &current,
                                  &current_exists) &&
         current_exists &&
-        cbm_windows_current_v1_supports_launcher_abi(&current, CBM_WINDOWS_LAUNCHER_ABI_CURRENT);
+        cbm_windows_current_v1_supports_launcher_abi(&current, CBM_WINDOWS_LAUNCHER_ABI_CURRENT) &&
+        cbm_windows_managed_launcher_backing(
+            g_windows_launcher_context.canonical_launcher_path, previous_launcher_backing,
+            CBM_WINDOWS_LAUNCHER_PATH_CAP, backing_error, sizeof(backing_error));
     char *canonical_utf8 =
         current_compatible ? cbm_wide_to_utf8(g_windows_launcher_context.canonical_launcher_path)
                            : NULL;
     if (!canonical_utf8) {
         cbm_windows_release_pair_free(&pair);
-        (void)fprintf(stderr, "error: old/new managed launcher ABI compatibility check "
-                              "failed before update activation\n");
+        (void)fprintf(stderr,
+                      "error: old/new managed launcher ABI or two-link backing check "
+                      "failed before update activation%s%s\n",
+                      backing_error[0] ? ": " : "", backing_error[0] ? backing_error : "");
         return CLI_TRUE;
     }
     wchar_t prepared_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
@@ -12077,6 +12437,8 @@ static int cli_windows_extract_and_activate_update(const char *archive_path, con
     };
     memcpy(activation.canonical_launcher, g_windows_launcher_context.canonical_launcher_path,
            sizeof(activation.canonical_launcher));
+    memcpy(activation.previous_launcher_backing, previous_launcher_backing,
+           sizeof(previous_launcher_backing));
     int result =
         cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_UPDATE, NULL, next.payload_sha256,
                              cli_windows_managed_update_activate, &activation);
@@ -12088,6 +12450,8 @@ static int cli_windows_extract_and_activate_update(const char *archive_path, con
 static bool cli_windows_managed_update_preflight(bool probe_capability) {
     cbm_windows_current_v1_t current;
     bool current_exists = false;
+    wchar_t launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
+    char error[CLI_BUF_512] = {0};
     if (!g_windows_launcher_context.present || !g_windows_launcher_context.managed ||
         !g_windows_launcher_context.private_activation ||
         g_windows_launcher_context.action != CBM_WINDOWS_LAUNCHER_ACTION_UPDATE ||
@@ -12096,17 +12460,20 @@ static bool cli_windows_managed_update_preflight(bool probe_capability) {
         !current_exists || current.payload_size != g_windows_launcher_context.payload_size ||
         strcmp(current.payload_sha256, g_windows_launcher_context.expected_payload_sha256) != 0 ||
         !cbm_windows_current_v1_supports_launcher_abi(&current, CBM_WINDOWS_LAUNCHER_ABI_CURRENT) ||
-        !cli_windows_regular_file_no_reparse(g_windows_launcher_context.canonical_launcher_path,
-                                             NULL)) {
-        (void)fprintf(stderr, "error: authenticated managed launcher state changed before "
-                              "update; no network or daemon operation was started\n");
+        !cbm_windows_managed_launcher_backing(g_windows_launcher_context.canonical_launcher_path,
+                                              launcher_backing, CBM_WINDOWS_LAUNCHER_PATH_CAP,
+                                              error, sizeof(error))) {
+        (void)fprintf(stderr,
+                      "error: authenticated managed launcher state changed before "
+                      "update; no network or daemon operation was started%s%s\n",
+                      error[0] ? ": " : "", error[0] ? error : "");
         return false;
     }
     if (!probe_capability) {
         return true;
     }
     wchar_t directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    char error[CLI_BUF_512] = {0};
+    error[0] = '\0';
     if (!cli_windows_parent_path(g_windows_launcher_context.canonical_launcher_path, directory,
                                  CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
         !cbm_windows_launcher_capability_probe(

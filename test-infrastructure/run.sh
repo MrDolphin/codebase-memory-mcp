@@ -10,11 +10,14 @@
 #                   vm/win.sh for mandatory real-Windows verification]
 #   macOS:          run natively (not in Docker)
 #
-# Speed first: test containers run unconstrained by default. Before pushing
-# anything that touches timing, scheduling, or subprocess code, run ONE pass
-# with CBM_LOCAL_CI_CPUS=4 (CI-fidelity mode, mirrors the 4-core GitHub
-# runners) — deadline/starvation failures only reproduce under that
-# constraint. ccache persists in named volumes; entries are content-verified
+# Full power, always: the test containers run unconstrained — the suite is
+# built to be core-count-independent for correctness (timing/scheduling/
+# subprocess suites assert invariants — ordering, bounded-return, RUNNING poll
+# state — not wall-clock), so it passes at any parallelism and there is no
+# reason to throttle it. The CBM_LOCAL_CI_CPUS knob survives only for the
+# smoke/soak services, where deliberate resource starvation is the point; it is
+# NOT a pre-push gate for the regular suite. ccache persists in named volumes;
+# entries are content-verified
 # (stale hits impossible), so warm reruns skip unchanged compilation.
 # Run this from the WORKTREE you want tested: the containers mount the repo
 # this script resides in.

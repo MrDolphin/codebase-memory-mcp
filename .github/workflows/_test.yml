@@ -285,8 +285,8 @@ jobs:
 
       - name: Windows regression guards (#636/#357, #618, #548, #423/#20)
         shell: pwsh
-        # -GuardsOnly runs the four green guards and gates on them. The runner sets
-        # CBM_INDEX_SUPERVISOR=0 for determinism, but the non-ASCII CLI guard drops that
-        # override so it exercises the real supervisor->worker spawn (where #423/#20's
-        # second half lives); the other guards test path/hook/drive fixes in-process.
+        # -GuardsOnly runs the four green guards and gates on them. All guards run
+        # against the real supervisor->worker spawn path: under the mandatory
+        # coordination daemon, CBM_INDEX_SUPERVISOR=0 is a fail-closed refusal, so
+        # the driver no longer sets it anywhere.
         run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe

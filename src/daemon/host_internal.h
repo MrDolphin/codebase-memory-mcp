@@ -40,10 +40,32 @@ typedef struct {
     bool active_after_sequence;
 } cbm_daemon_host_http_reconcile_test_result_t;
 
+typedef struct {
+    size_t server_create_attempts_after_refusal;
+    size_t server_create_attempts;
+    size_t thread_start_attempts;
+    size_t server_stops;
+    size_t server_free_attempts;
+    size_t thread_joins;
+    bool retained_after_refusal;
+    bool replacement_active_after_retry;
+} cbm_daemon_host_http_free_refusal_test_result_t;
+
 /* Drive the production HTTP reconciliation state machine at explicit
  * monotonic timestamps with deterministic transient failures. */
 bool cbm_daemon_host_http_reconcile_sequence_for_test(
     const uint64_t *timestamps_ms, size_t timestamp_count, size_t create_failures,
     size_t thread_start_failures, cbm_daemon_host_http_reconcile_test_result_t *result_out);
+
+/* Change the configured UI port for one poll under an active fake server,
+ * inject one server-free refusal, revert the desired port, then drive the
+ * next retry. */
+bool cbm_daemon_host_http_reconcile_free_refusal_for_test(
+    cbm_daemon_host_http_free_refusal_test_result_t *result_out);
+
+/* Exercise the production HTTP schedule/create/cancel adapter with an injected
+ * create failure. The callback verifies free is refused while SCHEDULED; after
+ * the failure, the adapter must cancel so the final free succeeds. */
+bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void);
 
 #endif /* CBM_DAEMON_HOST_INTERNAL_H */

@@ -740,7 +740,7 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
     if (!bounded_length(path, DAEMON_SERVICE_PATH_CAP, &path_length) || path_length == 0) {
         return false;
     }
-    wchar_t *wide = cbm_utf8_to_wide(path);
+    wchar_t *wide = cbm_path_to_wide(path);
     if (!wide) {
         return false;
     }
@@ -829,7 +829,7 @@ static bool windows_log_path_open(const char *log_path, windows_log_path_t *path
         return false;
     }
 
-    path->wide = cbm_utf8_to_wide(log_path);
+    path->wide = cbm_path_to_wide(log_path);
     if (!path->wide) {
         return false;
     }
@@ -851,15 +851,22 @@ static bool windows_private_file_prepare(const char *directory, const char *base
     /* cbm_daemon_ipc_private_log_open supplies the same explicit protected
      * current-SID DACL and reparse/owner checks as the daemon's operation log.
      * Its brief FILE_SHARE_READ handle can collide with a concurrent opener,
-     * so retry that transient window rather than dropping a conflict event. */
-    for (unsigned int attempt = 0; attempt < 100; attempt++) {
+     * so retry that transient window rather than dropping a conflict event.
+     * The retry budget is a short deadline, not a count: Sleep(2) rounds up
+     * to the ~16 ms timer granularity, and a permanently obstructed path
+     * (e.g. a directory squatting on it) must fail fast — a rejected client
+     * is waiting behind this on the hello path with its own timeout. */
+    ULONGLONG deadline = GetTickCount64() + 250;
+    for (;;) {
         FILE *file = cbm_daemon_ipc_private_log_open(directory, base, SIZE_MAX);
         if (file) {
             return fclose(file) == 0;
         }
+        if (GetTickCount64() >= deadline) {
+            return false;
+        }
         Sleep(2);
     }
-    return false;
 }
 
 static HANDLE windows_lock_open(const wchar_t *path) {

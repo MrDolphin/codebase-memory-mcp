@@ -150,6 +150,16 @@ cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoin
                                                     uint32_t timeout_ms);
 void cbm_daemon_ipc_connection_close(cbm_daemon_ipc_connection_t *connection);
 
+/* Bounded wait for the peer to consume everything already sent, by reading
+ * (and discarding) until peer EOF or the timeout. On POSIX this is a no-op:
+ * closing a stream socket leaves buffered data deliverable, so the final
+ * response survives an immediate close. On Windows named pipes, closing the
+ * server handle discards data the client has not yet read; a server that
+ * sends a final response and closes immediately races the client's decode.
+ * Peer EOF is proof of consumption because clients close only after reading
+ * their pending response. Callers close the connection afterwards. */
+void cbm_daemon_ipc_connection_drain(cbm_daemon_ipc_connection_t *connection, uint32_t timeout_ms);
+
 /* Interrupt pending I/O without freeing the connection object. This is
  * idempotent and may be called from a supervisor thread; the connection's
  * owning worker must still call connection_close after its I/O unwinds. */

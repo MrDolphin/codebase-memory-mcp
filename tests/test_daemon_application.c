@@ -77,9 +77,8 @@ static bool app_project_lock_fixture_init(app_project_lock_fixture_t *fixture) {
         return false;
     }
     memset(fixture, 0, sizeof(*fixture));
-    (void)snprintf(fixture->runtime_parent, sizeof(fixture->runtime_parent),
-                   "%s/cbm-app-project-lock-XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(fixture->runtime_parent)) {
+    if (!th_secure_runtime_parent_new(fixture->runtime_parent, sizeof(fixture->runtime_parent),
+                                      "app-project-lock")) {
         return false;
     }
     fixture->endpoint = cbm_daemon_ipc_endpoint_new("fedcba9876543210", fixture->runtime_parent);
@@ -109,6 +108,28 @@ static bool app_project_lock_release(cbm_project_lock_lease_t **lease) {
         }
     }
     return *lease == NULL;
+}
+
+/* Windows may briefly report an overlapping byte-range lock as BUSY while the
+ * just-completed worker's handle close becomes visible to another manager.
+ * Accept only that bounded handoff; IO/UNSAFE failures remain immediate. */
+static cbm_private_file_lock_status_t app_project_lock_try_acquire_until_released(
+    cbm_project_lock_manager_t *manager, const char *project,
+    cbm_project_lock_lease_t **lease_out) {
+    if (!lease_out) {
+        return CBM_PRIVATE_FILE_LOCK_UNSAFE;
+    }
+    *lease_out = NULL;
+    uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+    cbm_private_file_lock_status_t status = CBM_PRIVATE_FILE_LOCK_BUSY;
+    do {
+        status = cbm_project_lock_try_acquire(manager, project, lease_out);
+        if (status != CBM_PRIVATE_FILE_LOCK_BUSY) {
+            return status;
+        }
+        cbm_usleep(1000);
+    } while (cbm_now_ms() < deadline);
+    return status;
 }
 
 static cbm_daemon_runtime_application_session_t *app_test_open(
@@ -606,10 +627,21 @@ static bool app_test_create_empty_file(const char *path) {
 
 static int app_test_git(const char *root, const char *operation, const char *argument_one,
                         const char *argument_two) {
-    const char *argv[] = {"git", "-C", root, operation, argument_one, argument_two, NULL};
+    const char *git = "git";
+#ifdef _WIN32
+    char git_executable[APP_TEST_PATH_CAP];
+    const char *resolved = cbm_find_cli("git", cbm_get_home_dir());
+    int resolved_length =
+        resolved ? snprintf(git_executable, sizeof(git_executable), "%s", resolved) : -1;
+    if (resolved_length <= 0 || (size_t)resolved_length >= sizeof(git_executable)) {
+        return -1;
+    }
+    git = git_executable;
+#endif
+    const char *argv[] = {git, "-C", root, operation, argument_one, argument_two, NULL};
     cbm_proc_opts_t options = {0};
     cbm_proc_result_t result = {0};
-    options.bin = "git";
+    options.bin = git;
     options.argv = argv;
     options.quiet_timeout_ms = 10000;
     return cbm_subprocess_run(&options, &result) == 0 && result.outcome == CBM_PROC_CLEAN ? 0 : -1;
@@ -3937,7 +3969,8 @@ TEST(daemon_application_worker_lock_serializes_external_mutation) {
     cbm_project_lock_lease_t *terminal_other_probe = NULL;
     cbm_private_file_lock_status_t terminal_other_status =
         other_worker_acquired
-            ? cbm_project_lock_try_acquire(locks.probe_locks, other_project, &terminal_other_probe)
+            ? app_project_lock_try_acquire_until_released(locks.probe_locks, other_project,
+                                                          &terminal_other_probe)
             : CBM_PRIVATE_FILE_LOCK_IO;
     bool other_lock_released_at_terminal =
         terminal_other_status == CBM_PRIVATE_FILE_LOCK_OK && terminal_other_probe;
@@ -3956,7 +3989,8 @@ TEST(daemon_application_worker_lock_serializes_external_mutation) {
     cbm_project_lock_lease_t *blocked_probe = NULL;
     cbm_private_file_lock_status_t terminal_blocked_status =
         blocked_worker_acquired
-            ? cbm_project_lock_try_acquire(locks.probe_locks, blocked_project, &blocked_probe)
+            ? app_project_lock_try_acquire_until_released(locks.probe_locks, blocked_project,
+                                                          &blocked_probe)
             : CBM_PRIVATE_FILE_LOCK_IO;
     bool blocked_lock_released_at_terminal =
         terminal_blocked_status == CBM_PRIVATE_FILE_LOCK_OK && blocked_probe;

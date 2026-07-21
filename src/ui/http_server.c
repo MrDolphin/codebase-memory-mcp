@@ -39,6 +39,7 @@
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -72,12 +73,26 @@
 static char g_cors[256];      /* CORS headers only */
 static char g_cors_json[512]; /* CORS + Content-Type: application/json */
 
-/* Inspect the Origin header and only reflect it if it's a localhost URL.
- * This prevents remote websites from making cross-origin requests to the
- * local graph-ui server (the key defense against CORS-based data exfil). */
-static void update_cors(const cbm_http_req_t *req) {
-    if (req->origin[0] != '\0' && (cbm_http_path_match(req->origin, "http://localhost:*") ||
-                                   cbm_http_path_match(req->origin, "http://127.0.0.1:*"))) {
+static bool origin_is_same_server(const char *origin, int port) {
+    char expected[128];
+    int length = snprintf(expected, sizeof(expected), "http://127.0.0.1:%d", port);
+    if (length > 0 && (size_t)length < sizeof(expected) && strcmp(origin, expected) == 0)
+        return true;
+    length = snprintf(expected, sizeof(expected), "http://localhost:%d", port);
+    return length > 0 && (size_t)length < sizeof(expected) && strcmp(origin, expected) == 0;
+}
+
+static bool origin_matches_host(const char *origin, const char *host, int port) {
+    const char *hostname = strncmp(host, "localhost", 9) == 0 ? "localhost" : "127.0.0.1";
+    char expected[128];
+    int length = snprintf(expected, sizeof(expected), "http://%s:%d", hostname, port);
+    return length > 0 && (size_t)length < sizeof(expected) && strcmp(origin, expected) == 0;
+}
+
+/* Foreign origins are rejected before this runs. Reflect only the exact
+ * same-server origin; a different localhost port is a different principal. */
+static void update_cors(const cbm_http_req_t *req, int port) {
+    if (req->origin[0] != '\0' && origin_is_same_server(req->origin, port)) {
         snprintf(g_cors, sizeof(g_cors),
                  "Access-Control-Allow-Origin: %s\r\n"
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
@@ -129,6 +144,13 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
 #define MAX_INDEX_JOBS 4
 
+enum {
+    HTTP_RUN_IDLE = 0,
+    HTTP_RUN_SCHEDULED = 1,
+    HTTP_RUN_RUNNING = 2,
+    HTTP_RUN_COMPLETED = 3,
+};
+
 typedef struct {
     cbm_http_server_t *server;
     char root_path[1024];
@@ -137,6 +159,7 @@ typedef struct {
     char error_msg[256];
     cbm_thread_t thread;
     bool thread_started;
+    atomic_int completed;
 } index_job_t;
 
 struct cbm_http_server {
@@ -150,6 +173,7 @@ struct cbm_http_server {
     void *mutation_context;
     index_job_t index_jobs[MAX_INDEX_JOBS];
     atomic_int stop_flag;
+    atomic_int run_state;
     int port;
     bool listener_ok;
 };
@@ -591,6 +615,14 @@ static void append_roots_json(char *buf, size_t bufsz, int *pos) {
         if (!(drives & (1u << i))) {
             continue;
         }
+        /* Advertise exactly what /api/browse will accept: a mounted letter
+         * without a readable medium (empty optical drive, unformatted or
+         * offline volume) fails the same cbm_is_dir gate browse applies, and
+         * a root the picker cannot open must not be offered. */
+        char root[4] = {(char)('A' + i), ':', '/', '\0'};
+        if (!cbm_is_dir(root)) {
+            continue;
+        }
         if (count++ > 0) {
             buf[(*pos)++] = ',';
         }
@@ -880,12 +912,21 @@ static bool resolve_self_executable(char *out, size_t outsz) {
 }
 #else
 static bool resolve_self_executable(char *out, size_t outsz) {
-    char buf[1024];
-    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)sizeof(buf));
-    if (n > 0 && n < sizeof(buf)) {
-        return copy_path(out, outsz, buf);
+    /* GetModuleFileNameA renders the module path through the ANSI code page,
+     * which mangles non-ASCII install paths (café_日本語 -> caf?_???). Resolve
+     * wide and convert to UTF-8 so the returned path survives verbatim. */
+    wchar_t wbuf[1024];
+    DWORD n = GetModuleFileNameW(NULL, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0])));
+    if (n == 0 || n >= sizeof(wbuf) / sizeof(wbuf[0])) {
+        return false;
     }
-    return false;
+    char *utf8 = cbm_wide_to_utf8(wbuf);
+    if (!utf8) {
+        return false;
+    }
+    bool ok = copy_path(out, outsz, utf8);
+    free(utf8);
+    return ok;
 }
 #endif
 
@@ -904,7 +945,12 @@ bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t ou
     }
 #else
     if (argv0 && argv0[0]) {
-        DWORD attrs = GetFileAttributesA(argv0);
+        /* GetFileAttributesA reads argv0 through the ANSI code page and fails on
+         * non-ASCII install paths, forcing a fallback that can mangle the path;
+         * check wide so a valid non-ASCII argv0 is used verbatim. */
+        wchar_t *wargv0 = cbm_utf8_to_wide(argv0);
+        DWORD attrs = wargv0 ? GetFileAttributesW(wargv0) : INVALID_FILE_ATTRIBUTES;
+        free(wargv0);
         if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
             return copy_path(out, outsz, argv0);
         }
@@ -943,6 +989,7 @@ static void *index_thread_fn(void *arg) {
         atomic_store(&job->status, 2);
     }
     cbm_log_info("ui.index.done", "path", job->root_path, "rc", result == 0 ? "ok" : "err");
+    atomic_store_explicit(&job->completed, 1, memory_order_release);
     return NULL;
 }
 
@@ -986,7 +1033,10 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
     int slot = -1;
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
         int st = atomic_load(&server->index_jobs[i].status);
-        if (st == 0 || st == 2 || st == 3) {
+        bool reusable =
+            !server->index_jobs[i].thread_started ||
+            atomic_load_explicit(&server->index_jobs[i].completed, memory_order_acquire);
+        if ((st == 0 || st == 2 || st == 3) && reusable) {
             slot = i;
             break;
         }
@@ -999,7 +1049,10 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
 
     index_job_t *job = &server->index_jobs[slot];
     if (job->thread_started) {
-        (void)cbm_thread_join(&job->thread);
+        if (cbm_thread_join(&job->thread) != 0) {
+            cbm_http_replyf(c, 503, g_cors_json, "{\"error\":\"index worker unavailable\"}");
+            return;
+        }
         job->thread_started = false;
     }
     job->server = server;
@@ -1007,11 +1060,13 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
     snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
     job->error_msg[0] = '\0';
     atomic_store(&job->status, 1);
+    atomic_store_explicit(&job->completed, 0, memory_order_release);
     yyjson_doc_free(doc);
 
     /* Spawn background thread */
     if (cbm_thread_create(&job->thread, 0, index_thread_fn, job) != 0) {
         atomic_store(&job->status, 3);
+        atomic_store_explicit(&job->completed, 1, memory_order_release);
         snprintf(job->error_msg, sizeof(job->error_msg), "thread creation failed");
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"thread creation failed\"}");
         return;
@@ -1507,11 +1562,51 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
 /* ── Handle JSON-RPC request ──────────────────────────────────── */
 
+static yyjson_val *json_unique_member(yyjson_val *object, const char *name) {
+    if (!yyjson_is_obj(object))
+        return NULL;
+    yyjson_val *found = NULL;
+    size_t index, maximum;
+    yyjson_val *key, *value;
+    yyjson_obj_foreach(object, index, maximum, key, value) {
+        if (strcmp(yyjson_get_str(key), name) == 0) {
+            if (found)
+                return NULL;
+            found = value;
+        }
+    }
+    return found;
+}
+
+static bool rpc_is_allowed_for_ui(const char *body, size_t body_len) {
+    yyjson_doc *document = yyjson_read(body, body_len, 0);
+    if (!document)
+        return false;
+    yyjson_val *root = yyjson_doc_get_root(document);
+    yyjson_val *method = json_unique_member(root, "method");
+    yyjson_val *params = json_unique_member(root, "params");
+    yyjson_val *name = json_unique_member(params, "name");
+    const char *method_text = yyjson_is_str(method) ? yyjson_get_str(method) : NULL;
+    const char *name_text = yyjson_is_str(name) ? yyjson_get_str(name) : NULL;
+    bool allowed =
+        method_text && strcmp(method_text, "tools/call") == 0 && name_text &&
+        (strcmp(name_text, "list_projects") == 0 || strcmp(name_text, "get_code_snippet") == 0);
+    yyjson_doc_free(document);
+    return allowed;
+}
+
 static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_server_t *mcp) {
     if (req->body_len == 0 || req->body_len > MAX_BODY_SIZE || !req->body) {
         cbm_http_replyf(c, 400, g_cors_json,
                         "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,"
                         "\"message\":\"invalid request size\"},\"id\":null}");
+        return;
+    }
+
+    if (!rpc_is_allowed_for_ui(req->body, req->body_len)) {
+        cbm_http_replyf(c, 403, g_cors_json,
+                        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,"
+                        "\"message\":\"UI RPC method is not allowed\"},\"id\":null}");
         return;
     }
 
@@ -1528,31 +1623,68 @@ static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_se
 
 /* ── Request dispatch ─────────────────────────────────────────── */
 
-/* True when the Host header names the loopback interface the server binds to
- * (with or without a port). Anything else means the request reached us under a
+/* True when the Host header names the loopback interface and exact port the
+ * server binds to. Anything else means the request reached us under a
  * name that is not loopback — a rebinding DNS host or a proxy pointed at the
  * local port — which is the DNS-rebinding / cross-site vector against a
  * localhost-only service. */
-static bool host_is_loopback(const char *host) {
-    return cbm_http_path_match(host, "localhost") || cbm_http_path_match(host, "localhost:*") ||
-           cbm_http_path_match(host, "127.0.0.1") || cbm_http_path_match(host, "127.0.0.1:*") ||
-           cbm_http_path_match(host, "[::1]") || cbm_http_path_match(host, "[::1]:*");
+static bool host_is_this_server(const char *host, int port) {
+    char expected[128];
+    int length = snprintf(expected, sizeof(expected), "127.0.0.1:%d", port);
+    if (length > 0 && (size_t)length < sizeof(expected) && strcmp(host, expected) == 0)
+        return true;
+    length = snprintf(expected, sizeof(expected), "localhost:%d", port);
+    return length > 0 && (size_t)length < sizeof(expected) && strcmp(host, expected) == 0;
+}
+
+static bool route_is_protected(const char *path) {
+    return strcmp(path, "/api") == 0 || strncmp(path, "/api/", 5) == 0 || strcmp(path, "/rpc") == 0;
+}
+
+static bool content_type_is_json(const char *content_type) {
+    static const char json_type[] = "application/json";
+    size_t type_length = sizeof(json_type) - 1;
+    if (strlen(content_type) < type_length)
+        return false;
+    for (size_t i = 0; i < type_length; i++) {
+        if (tolower((unsigned char)content_type[i]) != json_type[i])
+            return false;
+    }
+    const char *suffix = content_type + type_length;
+    while (*suffix == ' ' || *suffix == '\t')
+        suffix++;
+    return *suffix == '\0' || *suffix == ';';
+}
+
+static bool request_passes_http_security(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                                         const cbm_http_req_t *req) {
+    if (req->http_minor == 1 && req->host[0] == '\0') {
+        cbm_http_replyf(c, 400, "", "%s", "{\"error\":\"Host header required\"}");
+        return false;
+    }
+    if (req->host[0] != '\0' && !host_is_this_server(req->host, srv->port)) {
+        cbm_http_replyf(c, 403, "", "%s", "{\"error\":\"forbidden host\"}");
+        return false;
+    }
+    if (req->origin[0] != '\0' &&
+        (req->host[0] == '\0' || !origin_is_same_server(req->origin, srv->port) ||
+         !origin_matches_host(req->origin, req->host, srv->port))) {
+        cbm_http_replyf(c, 403, "", "%s", "{\"error\":\"forbidden origin\"}");
+        return false;
+    }
+    update_cors(req, srv->port);
+    bool is_post = strcmp(req->method, "POST") == 0;
+    if (route_is_protected(req->path) && is_post && !content_type_is_json(req->content_type)) {
+        cbm_http_replyf(c, 415, g_cors_json, "%s", "{\"error\":\"application/json required\"}");
+        return false;
+    }
+    return true;
 }
 
 static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
                              const cbm_http_req_t *req) {
-    /* Build per-request CORS headers (only reflects localhost origins) */
-    update_cors(req);
-
-    /* DNS-rebinding / cross-site guard: the server binds to loopback only, so a
-     * request carrying any non-loopback Host was routed here under a foreign
-     * name (a rebinding DNS record, a proxy) and must be refused before it can
-     * reach a state-changing endpoint. A bare request with no Host header
-     * (HTTP/1.0 local tooling) is still allowed. */
-    if (req->host[0] != '\0' && !host_is_loopback(req->host)) {
-        cbm_http_replyf(c, 403, g_cors, "%s", "{\"error\":\"forbidden host\"}");
+    if (!request_passes_http_security(srv, c, req))
         return;
-    }
 
     bool is_get = strcmp(req->method, "GET") == 0;
     bool is_post = strcmp(req->method, "POST") == 0;
@@ -1680,7 +1812,8 @@ cbm_http_server_t *cbm_http_server_new(int port) {
         return NULL;
 
     srv->port = port;
-    atomic_store(&srv->stop_flag, 0);
+    atomic_init(&srv->stop_flag, 0);
+    atomic_init(&srv->run_state, HTTP_RUN_IDLE);
 
     /* Create a dedicated MCP server for HTTP (own SQLite connection) */
     srv->mcp = cbm_mcp_server_new(NULL);
@@ -1716,29 +1849,62 @@ cbm_http_server_t *cbm_http_server_new(int port) {
     return srv;
 }
 
-void cbm_http_server_free(cbm_http_server_t *srv) {
+bool cbm_http_server_free(cbm_http_server_t *srv) {
     if (!srv)
-        return;
+        return true;
+    int run_state = atomic_load_explicit(&srv->run_state, memory_order_acquire);
+    if (run_state == HTTP_RUN_SCHEDULED || run_state == HTTP_RUN_RUNNING)
+        return false;
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
         if (srv->index_jobs[i].thread_started) {
-            (void)cbm_thread_join(&srv->index_jobs[i].thread);
+            if (!atomic_load_explicit(&srv->index_jobs[i].completed, memory_order_acquire))
+                return false;
+            if (cbm_thread_join(&srv->index_jobs[i].thread) != 0)
+                return false;
             srv->index_jobs[i].thread_started = false;
         }
     }
-    cbm_httpd_close(srv->listener);
+    if (!cbm_httpd_close(srv->listener))
+        return false;
     cbm_mcp_server_free(srv->mcp);
     free(srv);
+    return true;
 }
 
 void cbm_http_server_stop(cbm_http_server_t *srv) {
     if (srv) {
         atomic_store(&srv->stop_flag, 1);
+        cbm_httpd_interrupt(srv->listener);
     }
 }
 
-void cbm_http_server_run(cbm_http_server_t *srv) {
+bool cbm_http_server_schedule_run(cbm_http_server_t *srv) {
     if (!srv || !srv->listener_ok)
+        return false;
+    int expected = HTTP_RUN_IDLE;
+    return atomic_compare_exchange_strong_explicit(&srv->run_state, &expected, HTTP_RUN_SCHEDULED,
+                                                   memory_order_acq_rel, memory_order_acquire);
+}
+
+bool cbm_http_server_cancel_scheduled_run(cbm_http_server_t *srv) {
+    if (!srv)
+        return false;
+    int expected = HTTP_RUN_SCHEDULED;
+    return atomic_compare_exchange_strong_explicit(&srv->run_state, &expected, HTTP_RUN_IDLE,
+                                                   memory_order_acq_rel, memory_order_acquire);
+}
+
+void cbm_http_server_run(cbm_http_server_t *srv) {
+    if (!srv)
         return;
+    int expected = HTTP_RUN_SCHEDULED;
+    if (!atomic_compare_exchange_strong_explicit(&srv->run_state, &expected, HTTP_RUN_RUNNING,
+                                                 memory_order_acq_rel, memory_order_acquire))
+        return;
+    if (!srv->listener_ok) {
+        atomic_store_explicit(&srv->run_state, HTTP_RUN_COMPLETED, memory_order_release);
+        return;
+    }
 
     while (!atomic_load(&srv->stop_flag)) {
         cbm_http_conn_t *conn = cbm_httpd_accept(srv->listener, 200);
@@ -1749,6 +1915,11 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
         cbm_http_req_t req;
         int rc = cbm_httpd_read_request(conn, &req);
         if (rc == 0) {
+            if (atomic_load(&srv->stop_flag)) {
+                cbm_http_req_free(&req);
+                cbm_httpd_conn_close(conn);
+                break;
+            }
             dispatch_request(srv, conn, &req);
             cbm_log_http_request("graph_ui", req.method, req.path, cbm_http_conn_status(conn),
                                  (int64_t)(cbm_now_ms() - request_start_ms), req.body_len,
@@ -1764,6 +1935,11 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
         }
         cbm_httpd_conn_close(conn);
     }
+    atomic_store_explicit(&srv->run_state, HTTP_RUN_COMPLETED, memory_order_release);
+}
+
+cbm_httpd_activity_t cbm_http_server_activity_for_test(cbm_http_server_t *srv) {
+    return srv ? cbm_httpd_activity_for_test(srv->listener) : CBM_HTTPD_ACTIVITY_IDLE;
 }
 
 bool cbm_http_server_is_running(const cbm_http_server_t *srv) {

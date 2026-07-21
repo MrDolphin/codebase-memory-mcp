@@ -179,6 +179,8 @@ struct cbm_daemon_application {
     bool update_thread_done;
     bool update_thread_joining;
     bool stopping;
+    /* See cbm_daemon_application_set_permanent. */
+    bool permanent;
 };
 
 typedef struct {
@@ -455,11 +457,19 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
         }
         return;
     }
+    /* Physical registration is the commit point. Never publish a logical
+     * subscription that the shared watcher failed to install. */
+    if (!cbm_watcher_watch(application->watcher, project, root)) {
+        cbm_log_warn("daemon.watch.registration_failed", "project", project, "action", "retry");
+        free(watch->project);
+        free(watch->root);
+        free(watch);
+        return;
+    }
     watch->subscribers = 1;
     watch->next = application->watches;
     application->watches = watch;
     session->watch = watch;
-    cbm_watcher_watch(application->watcher, project, root);
 }
 
 static void application_refresh_watch(cbm_daemon_application_session_t *session) {
@@ -2694,10 +2704,12 @@ static void application_session_cancel(void *context,
                 final_live_session = false;
             }
         }
-        if (final_live_session) {
+        if (final_live_session && !application->permanent) {
             /* The daemon runtime cannot close this allocation until an
              * in-flight callback joins. Stop new admission now and cancel
-             * watcher/UI jobs that are not owned by session->active_job. */
+             * watcher/UI jobs that are not owned by session->active_job.
+             * A PERMANENT generation deliberately outlives its sessions and
+             * keeps admitting new ones; only the stop/drain paths latch it. */
             application->stopping = true;
             application_cancel_jobs_locked(application);
             application_update_cancel_locked(application);
@@ -2755,6 +2767,15 @@ static void application_session_close(void *context,
     free(session->hook_event);
     free(session->hook_dialect);
     free(session);
+}
+
+void cbm_daemon_application_set_permanent(cbm_daemon_application_t *application, bool permanent) {
+    if (!application) {
+        return;
+    }
+    cbm_mutex_lock(&application->mutex);
+    application->permanent = permanent;
+    cbm_mutex_unlock(&application->mutex);
 }
 
 cbm_daemon_application_t *cbm_daemon_application_new(

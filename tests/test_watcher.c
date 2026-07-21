@@ -5,6 +5,8 @@
  * poll_once behavior.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_thread.h"
+#include "../src/foundation/constants.h"
 #include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -12,11 +14,19 @@
 #include <watcher/watcher.h>
 #include <store/store.h>
 #include <errno.h>
+#include <stdatomic.h>
+#include <signal.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "../src/foundation/win_utf8.h"
+#endif
+#ifdef __APPLE__
+#include <libproc.h>
+#endif
 
 /* Portable git: `git -C "<dir>" <args>` with identity + non-interactive
  * config injected via -c, so it needs no global config and no POSIX shell
@@ -133,6 +143,20 @@ TEST(watcher_watch_replace) {
     /* Replace with new path */
     cbm_watcher_watch(w, "project-a", "/tmp/new-path");
     ASSERT_EQ(cbm_watcher_watch_count(w), 1); /* still 1 */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_stopped_rejects_new_registration) {
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+
+    cbm_watcher_stop(w);
+    ASSERT_FALSE(cbm_watcher_watch(w, "late-project", "/tmp/late-project"));
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -645,6 +669,498 @@ TEST(watcher_stop_flag) {
     PASS();
 }
 
+/* test_main turns an exact private-path alias named git/git.exe into a
+ * deterministic child that publishes its PID and ignores graceful shutdown.
+ * This reproduces the production failure where popen() left watcher shutdown
+ * blocked forever in pclose(). The test owns a verified forced-termination
+ * backstop so the pre-fix RED cannot wedge the rest of the suite. */
+#define WATCHER_TEST_BLOCKING_GIT_MARKER_ENV "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE"
+
+#ifdef _WIN32
+typedef struct {
+    cbm_watcher_t *watcher;
+    atomic_bool completed;
+} watcher_windows_blocked_run_t;
+
+typedef struct {
+    char canonical_path[CBM_SZ_4K];
+    BY_HANDLE_FILE_INFORMATION information;
+} watcher_windows_image_identity_t;
+
+static void *watcher_windows_blocked_run_thread(void *opaque) {
+    watcher_windows_blocked_run_t *run = opaque;
+    (void)cbm_watcher_run(run->watcher, 10);
+    atomic_store_explicit(&run->completed, true, memory_order_release);
+    return NULL;
+}
+
+static bool watcher_windows_copy_self(const char *destination) {
+    wchar_t source[32768];
+    DWORD source_length =
+        GetModuleFileNameW(NULL, source, (DWORD)(sizeof(source) / sizeof(source[0])));
+    wchar_t *destination_wide = cbm_utf8_to_wide(destination);
+    bool copied = source_length > 0 &&
+                  source_length < (DWORD)(sizeof(source) / sizeof(source[0])) && destination_wide &&
+                  CopyFileW(source, destination_wide, TRUE) != 0;
+    free(destination_wide);
+    return copied;
+}
+
+static bool watcher_windows_capture_image_identity(const char *path,
+                                                   watcher_windows_image_identity_t *identity) {
+    if (!path || !identity) {
+        return false;
+    }
+    memset(identity, 0, sizeof(*identity));
+    if (!cbm_canonical_path(path, identity->canonical_path, sizeof(identity->canonical_path))) {
+        return false;
+    }
+    wchar_t *wide = cbm_utf8_to_wide(identity->canonical_path);
+    HANDLE file = wide ? CreateFileW(wide, FILE_READ_ATTRIBUTES,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                     OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL)
+                       : INVALID_HANDLE_VALUE;
+    bool captured = file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK &&
+                    GetFileInformationByHandle(file, &identity->information) != 0 &&
+                    (identity->information.dwFileAttributes &
+                     (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+    if (file != INVALID_HANDLE_VALUE) {
+        (void)CloseHandle(file);
+    }
+    free(wide);
+    if (!captured) {
+        memset(identity, 0, sizeof(*identity));
+    }
+    return captured;
+}
+
+static bool watcher_windows_same_image_identity(const watcher_windows_image_identity_t *first,
+                                                const watcher_windows_image_identity_t *second) {
+    return first && second && _stricmp(first->canonical_path, second->canonical_path) == 0 &&
+           first->information.dwVolumeSerialNumber == second->information.dwVolumeSerialNumber &&
+           first->information.nFileIndexHigh == second->information.nFileIndexHigh &&
+           first->information.nFileIndexLow == second->information.nFileIndexLow;
+}
+
+static bool watcher_windows_process_matches_image(
+    HANDLE process, const watcher_windows_image_identity_t *expected) {
+    if (!process || !expected) {
+        return false;
+    }
+    DWORD exit_code = 0;
+    wchar_t image[32768];
+    DWORD image_length = (DWORD)(sizeof(image) / sizeof(image[0]));
+    bool queried = GetExitCodeProcess(process, &exit_code) != 0 && exit_code == STILL_ACTIVE &&
+                   QueryFullProcessImageNameW(process, 0U, image, &image_length) != 0 &&
+                   image_length > 0 && image_length < (DWORD)(sizeof(image) / sizeof(image[0]));
+    if (queried) {
+        image[image_length] = L'\0';
+    }
+    char *image_utf8 = queried ? cbm_wide_to_utf8(image) : NULL;
+    watcher_windows_image_identity_t actual;
+    bool captured = image_utf8 && watcher_windows_capture_image_identity(image_utf8, &actual);
+    free(image_utf8);
+    return captured && watcher_windows_same_image_identity(&actual, expected);
+}
+
+static bool watcher_windows_wait_pid(const char *marker, uint64_t deadline_ms,
+                                     uint64_t *process_id_out) {
+    if (process_id_out) {
+        *process_id_out = 0;
+    }
+    while (cbm_now_ms() < deadline_ms) {
+        FILE *file = cbm_fopen(marker, "rb");
+        unsigned long long parsed = 0;
+        bool valid = file && fscanf(file, "%llu", &parsed) == 1 && parsed > 1 &&
+                     parsed <= MAXDWORD && parsed != (unsigned long long)GetCurrentProcessId();
+        if (file) {
+            (void)fclose(file);
+        }
+        if (valid) {
+            if (process_id_out) {
+                *process_id_out = (uint64_t)parsed;
+            }
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return false;
+}
+
+static HANDLE watcher_windows_open_exact_process(uint64_t process_id,
+                                                 const watcher_windows_image_identity_t *expected) {
+    if (process_id <= 1 || process_id > MAXDWORD || process_id == (uint64_t)GetCurrentProcessId()) {
+        return NULL;
+    }
+    HANDLE process =
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
+                    (DWORD)process_id);
+    if (!watcher_windows_process_matches_image(process, expected)) {
+        if (process) {
+            (void)CloseHandle(process);
+        }
+        return NULL;
+    }
+    return process;
+}
+
+static bool watcher_windows_wait_complete(atomic_bool *completed, uint64_t deadline_ms) {
+    while (cbm_now_ms() < deadline_ms) {
+        if (atomic_load_explicit(completed, memory_order_acquire)) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return atomic_load_explicit(completed, memory_order_acquire);
+}
+
+static bool watcher_windows_wait_process_gone(HANDLE process, uint64_t deadline_ms) {
+    while (cbm_now_ms() < deadline_ms) {
+        if (WaitForSingleObject(process, 0U) == WAIT_OBJECT_0) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return WaitForSingleObject(process, 0U) == WAIT_OBJECT_0;
+}
+
+static bool watcher_windows_terminate_verified(HANDLE process,
+                                               const watcher_windows_image_identity_t *expected,
+                                               uint64_t deadline_ms) {
+    if (!process) {
+        return false;
+    }
+    if (WaitForSingleObject(process, 0U) == WAIT_OBJECT_0) {
+        return true;
+    }
+    /* Re-query the live process image immediately before the only test-side
+     * kill. The retained handle fixes the process instance; canonical path and
+     * file identity ensure a cleanup backstop can target only our private copy. */
+    if (!watcher_windows_process_matches_image(process, expected) ||
+        TerminateProcess(process, 99U) == 0) {
+        return false;
+    }
+    return watcher_windows_wait_process_gone(process, deadline_ms);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+typedef struct {
+    cbm_watcher_t *watcher;
+    atomic_bool completed;
+} watcher_blocked_run_t;
+
+static void *watcher_blocked_run_thread(void *opaque) {
+    watcher_blocked_run_t *run = opaque;
+    (void)cbm_watcher_run(run->watcher, 10);
+    atomic_store_explicit(&run->completed, true, memory_order_release);
+    return NULL;
+}
+
+static bool watcher_test_self_image(char out[CBM_SZ_4K]) {
+#ifdef __APPLE__
+    int length = proc_pidpath(getpid(), out, CBM_SZ_4K);
+    if (length <= 0 || length >= CBM_SZ_4K) {
+        return false;
+    }
+    out[length] = '\0';
+    return true;
+#else
+    ssize_t length = readlink("/proc/self/exe", out, CBM_SZ_4K - 1);
+    if (length <= 0 || length >= CBM_SZ_4K - 1) {
+        return false;
+    }
+    out[length] = '\0';
+    return true;
+#endif
+}
+
+static bool watcher_test_wait_pid(const char *marker, uint64_t deadline_ms, pid_t *pid_out) {
+    while (cbm_now_ms() < deadline_ms) {
+        FILE *file = cbm_fopen(marker, "rb");
+        long parsed = 0;
+        bool valid = file && fscanf(file, "%ld", &parsed) == 1 && parsed > 1 && parsed != getpid();
+        if (file) {
+            (void)fclose(file);
+        }
+        if (valid) {
+            *pid_out = (pid_t)parsed;
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return false;
+}
+
+static bool watcher_test_wait_complete(atomic_bool *completed, uint64_t deadline_ms) {
+    while (cbm_now_ms() < deadline_ms) {
+        if (atomic_load_explicit(completed, memory_order_acquire)) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return atomic_load_explicit(completed, memory_order_acquire);
+}
+
+static bool watcher_test_wait_process_gone(pid_t process, uint64_t deadline_ms) {
+    while (cbm_now_ms() < deadline_ms) {
+        errno = 0;
+        if (kill(process, 0) != 0 && errno == ESRCH) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    errno = 0;
+    return kill(process, 0) != 0 && errno == ESRCH;
+}
+#endif
+
+TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
+#ifdef _WIN32
+    char work[CBM_SZ_1K] = "/tmp/cbm-watcher-blocked-git-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(work));
+    char root[CBM_SZ_1K];
+    char bin[CBM_SZ_1K];
+    char fake_git[CBM_SZ_1K];
+    char marker[CBM_SZ_1K];
+    char unwatch_marker[CBM_SZ_1K];
+    ASSERT_TRUE(snprintf(root, sizeof(root), "%s/root", work) > 0);
+    ASSERT_TRUE(snprintf(bin, sizeof(bin), "%s/bin", work) > 0);
+    ASSERT_TRUE(snprintf(fake_git, sizeof(fake_git), "%s/git.exe", bin) > 0);
+    ASSERT_TRUE(snprintf(marker, sizeof(marker), "%s/git.pid", work) > 0);
+    ASSERT_TRUE(snprintf(unwatch_marker, sizeof(unwatch_marker), "%s/unwatch-git.pid", work) > 0);
+    ASSERT_TRUE(cbm_mkdir_p(root, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(bin, 0700));
+    ASSERT_TRUE(watcher_windows_copy_self(fake_git));
+    watcher_windows_image_identity_t expected_git;
+    ASSERT_TRUE(watcher_windows_capture_image_identity(fake_git, &expected_git));
+
+    const char *old_path_raw = getenv("PATH");
+    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    char *old_path = old_path_raw ? cbm_strdup(old_path_raw) : NULL;
+    char *old_marker = old_marker_raw ? cbm_strdup(old_marker_raw) : NULL;
+    size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
+    char *path = malloc(path_size);
+    ASSERT_NOT_NULL(path);
+    (void)snprintf(path, path_size, "%s;%s", bin, old_path ? old_path : "");
+    ASSERT_EQ(cbm_setenv("PATH", path, 1), 0);
+    ASSERT_EQ(cbm_setenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV, marker, 1), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    ASSERT_NOT_NULL(watcher);
+    ASSERT_TRUE(cbm_watcher_watch(watcher, "blocked-git", root));
+    watcher_windows_blocked_run_t run = {.watcher = watcher};
+    atomic_init(&run.completed, false);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 128U * 1024U, watcher_windows_blocked_run_thread, &run),
+              0);
+
+    uint64_t child_id = 0;
+    bool marker_ready = watcher_windows_wait_pid(marker, cbm_now_ms() + 5000, &child_id);
+    HANDLE child_process =
+        marker_ready ? watcher_windows_open_exact_process(child_id, &expected_git) : NULL;
+    bool exact_stop_image = child_process != NULL;
+    cbm_watcher_stop(watcher);
+    uint64_t stop_deadline = cbm_now_ms() + 2500;
+    bool stop_process_gone =
+        exact_stop_image && watcher_windows_wait_process_gone(child_process, stop_deadline);
+    bool stop_run_completed = watcher_windows_wait_complete(&run.completed, stop_deadline);
+    bool stopped_without_backstop = stop_process_gone && stop_run_completed;
+    bool stop_cleanup_terminated = true;
+    if (exact_stop_image && !stop_process_gone) {
+        stop_cleanup_terminated =
+            watcher_windows_terminate_verified(child_process, &expected_git, cbm_now_ms() + 5000);
+    }
+    bool cleanup_process_gone =
+        exact_stop_image && watcher_windows_wait_process_gone(child_process, cbm_now_ms() + 5000);
+    bool cleanup_completed = watcher_windows_wait_complete(&run.completed, cbm_now_ms() + 5000);
+    int join_rc = cleanup_completed ? cbm_thread_join(&thread) : -1;
+    if (child_process) {
+        (void)CloseHandle(child_process);
+    }
+    cbm_watcher_free(watcher);
+
+    /* A project losing its final daemon-session owner must cancel that
+     * project's in-flight Git tree even while the shared watcher stays live. */
+    ASSERT_EQ(cbm_setenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV, unwatch_marker, 1), 0);
+    cbm_watcher_t *unwatch_watcher = cbm_watcher_new(store, NULL, NULL);
+    ASSERT_NOT_NULL(unwatch_watcher);
+    ASSERT_TRUE(cbm_watcher_watch(unwatch_watcher, "blocked-unwatch", root));
+    watcher_windows_blocked_run_t unwatch_run = {.watcher = unwatch_watcher};
+    atomic_init(&unwatch_run.completed, false);
+    cbm_thread_t unwatch_thread;
+    ASSERT_EQ(cbm_thread_create(&unwatch_thread, 128U * 1024U, watcher_windows_blocked_run_thread,
+                                &unwatch_run),
+              0);
+    uint64_t unwatch_child_id = 0;
+    bool unwatch_marker_ready =
+        watcher_windows_wait_pid(unwatch_marker, cbm_now_ms() + 5000, &unwatch_child_id);
+    HANDLE unwatch_process =
+        unwatch_marker_ready ? watcher_windows_open_exact_process(unwatch_child_id, &expected_git)
+                             : NULL;
+    bool exact_unwatch_image = unwatch_process != NULL;
+    cbm_watcher_unwatch(unwatch_watcher, "blocked-unwatch");
+    bool unwatch_cancelled_without_backstop =
+        exact_unwatch_image &&
+        watcher_windows_wait_process_gone(unwatch_process, cbm_now_ms() + 2500);
+    bool unwatch_cleanup_terminated = true;
+    if (exact_unwatch_image && !unwatch_cancelled_without_backstop) {
+        unwatch_cleanup_terminated =
+            watcher_windows_terminate_verified(unwatch_process, &expected_git, cbm_now_ms() + 5000);
+    }
+    bool unwatch_cleanup_gone = exact_unwatch_image && watcher_windows_wait_process_gone(
+                                                           unwatch_process, cbm_now_ms() + 5000);
+    cbm_watcher_stop(unwatch_watcher);
+    bool unwatch_run_completed =
+        watcher_windows_wait_complete(&unwatch_run.completed, cbm_now_ms() + 5000);
+    int unwatch_join_rc = unwatch_run_completed ? cbm_thread_join(&unwatch_thread) : -1;
+    if (unwatch_process) {
+        (void)CloseHandle(unwatch_process);
+    }
+    cbm_watcher_free(unwatch_watcher);
+    cbm_store_close(store);
+    if (old_path) {
+        (void)cbm_setenv("PATH", old_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    if (old_marker) {
+        (void)cbm_setenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV, old_marker, 1);
+    } else {
+        (void)cbm_unsetenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    }
+    free(path);
+    free(old_marker);
+    free(old_path);
+    (void)th_rmtree(work);
+
+    ASSERT_TRUE(marker_ready);
+    ASSERT_TRUE(exact_stop_image);
+    ASSERT_TRUE(stop_cleanup_terminated);
+    ASSERT_TRUE(cleanup_process_gone);
+    ASSERT_TRUE(cleanup_completed);
+    ASSERT_EQ(join_rc, 0);
+    ASSERT_TRUE(stopped_without_backstop);
+    ASSERT_TRUE(unwatch_marker_ready);
+    ASSERT_TRUE(exact_unwatch_image);
+    ASSERT_TRUE(unwatch_cleanup_terminated);
+    ASSERT_TRUE(unwatch_cancelled_without_backstop);
+    ASSERT_TRUE(unwatch_cleanup_gone);
+    ASSERT_TRUE(unwatch_run_completed);
+    ASSERT_EQ(unwatch_join_rc, 0);
+    PASS();
+#elif defined(__APPLE__) || defined(__linux__)
+    char work[CBM_SZ_1K] = "/tmp/cbm-watcher-blocked-git-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(work));
+    char root[CBM_SZ_1K];
+    char bin[CBM_SZ_1K];
+    char fake_git[CBM_SZ_1K];
+    char marker[CBM_SZ_1K];
+    char unwatch_marker[CBM_SZ_1K];
+    char self[CBM_SZ_4K];
+    ASSERT_TRUE(snprintf(root, sizeof(root), "%s/root", work) > 0);
+    ASSERT_TRUE(snprintf(bin, sizeof(bin), "%s/bin", work) > 0);
+    ASSERT_TRUE(snprintf(fake_git, sizeof(fake_git), "%s/git", bin) > 0);
+    ASSERT_TRUE(snprintf(marker, sizeof(marker), "%s/git.pid", work) > 0);
+    ASSERT_TRUE(snprintf(unwatch_marker, sizeof(unwatch_marker), "%s/unwatch-git.pid", work) > 0);
+    ASSERT_TRUE(cbm_mkdir_p(root, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(bin, 0700));
+    ASSERT_TRUE(watcher_test_self_image(self));
+    ASSERT_EQ(symlink(self, fake_git), 0);
+
+    const char *old_path_raw = getenv("PATH");
+    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    char *old_path = old_path_raw ? strdup(old_path_raw) : NULL;
+    char *old_marker = old_marker_raw ? strdup(old_marker_raw) : NULL;
+    size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
+    char *path = malloc(path_size);
+    ASSERT_NOT_NULL(path);
+    (void)snprintf(path, path_size, "%s:%s", bin, old_path ? old_path : "");
+    ASSERT_EQ(cbm_setenv("PATH", path, 1), 0);
+    ASSERT_EQ(cbm_setenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV, marker, 1), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    ASSERT_NOT_NULL(watcher);
+    cbm_watcher_watch(watcher, "blocked-git", root);
+    watcher_blocked_run_t run = {.watcher = watcher};
+    atomic_init(&run.completed, false);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 128U * 1024U, watcher_blocked_run_thread, &run), 0);
+
+    pid_t child = 0;
+    bool marker_ready = watcher_test_wait_pid(marker, cbm_now_ms() + 5000, &child);
+    cbm_watcher_stop(watcher);
+    bool stopped_without_backstop =
+        marker_ready && watcher_test_wait_complete(&run.completed, cbm_now_ms() + 2500);
+    if (marker_ready && !stopped_without_backstop) {
+        (void)kill(child, SIGKILL);
+    }
+    bool cleanup_completed = watcher_test_wait_complete(&run.completed, cbm_now_ms() + 5000);
+    int join_rc = cleanup_completed ? cbm_thread_join(&thread) : -1;
+
+    cbm_watcher_free(watcher);
+
+    /* A project losing its final daemon-session owner must cancel that
+     * project's in-flight Git tree even while the shared watcher stays live. */
+    ASSERT_EQ(cbm_setenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV, unwatch_marker, 1), 0);
+    cbm_watcher_t *unwatch_watcher = cbm_watcher_new(store, NULL, NULL);
+    ASSERT_NOT_NULL(unwatch_watcher);
+    ASSERT_TRUE(cbm_watcher_watch(unwatch_watcher, "blocked-unwatch", root));
+    watcher_blocked_run_t unwatch_run = {.watcher = unwatch_watcher};
+    atomic_init(&unwatch_run.completed, false);
+    cbm_thread_t unwatch_thread;
+    ASSERT_EQ(
+        cbm_thread_create(&unwatch_thread, 128U * 1024U, watcher_blocked_run_thread, &unwatch_run),
+        0);
+    pid_t unwatch_child = 0;
+    bool unwatch_marker_ready =
+        watcher_test_wait_pid(unwatch_marker, cbm_now_ms() + 5000, &unwatch_child);
+    cbm_watcher_unwatch(unwatch_watcher, "blocked-unwatch");
+    bool unwatch_cancelled_without_backstop =
+        unwatch_marker_ready && watcher_test_wait_process_gone(unwatch_child, cbm_now_ms() + 2500);
+    if (unwatch_marker_ready && !unwatch_cancelled_without_backstop) {
+        (void)kill(unwatch_child, SIGKILL);
+    }
+    bool unwatch_cleanup_gone =
+        unwatch_marker_ready && watcher_test_wait_process_gone(unwatch_child, cbm_now_ms() + 5000);
+    cbm_watcher_stop(unwatch_watcher);
+    bool unwatch_run_completed =
+        watcher_test_wait_complete(&unwatch_run.completed, cbm_now_ms() + 5000);
+    int unwatch_join_rc = unwatch_run_completed ? cbm_thread_join(&unwatch_thread) : -1;
+    cbm_watcher_free(unwatch_watcher);
+    cbm_store_close(store);
+    if (old_path) {
+        (void)cbm_setenv("PATH", old_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    if (old_marker) {
+        (void)cbm_setenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV, old_marker, 1);
+    } else {
+        (void)cbm_unsetenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    }
+    free(path);
+    free(old_marker);
+    free(old_path);
+    (void)th_rmtree(work);
+
+    ASSERT_TRUE(marker_ready);
+    ASSERT_TRUE(cleanup_completed);
+    ASSERT_EQ(join_rc, 0);
+    ASSERT_TRUE(stopped_without_backstop);
+    ASSERT_TRUE(unwatch_marker_ready);
+    ASSERT_TRUE(unwatch_cancelled_without_backstop);
+    ASSERT_TRUE(unwatch_cleanup_gone);
+    ASSERT_TRUE(unwatch_run_completed);
+    ASSERT_EQ(unwatch_join_rc, 0);
+    PASS();
+#else
+    SKIP_PLATFORM("copied test-runner git probe is supported on Windows/macOS/Linux");
+#endif
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  GIT CHANGE DETECTION (with temp repo)
  * ══════════════════════════════════════════════════════════════════ */
@@ -699,6 +1215,45 @@ TEST(watcher_detects_git_commit) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
+    PASS();
+}
+
+/* SHA-256 repositories emit a 64-hex-character HEAD. The watcher must retain
+ * the complete object ID (plus line terminator/NUL while reading it), otherwise
+ * baseline initialization silently retries forever and auto-refresh never runs. */
+TEST(watcher_detects_sha256_git_commit) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_sha256_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    if (wt_git(tmpdir, "init -q --object-format=sha256") != 0) {
+        th_rmtree(tmpdir);
+        SKIP_PLATFORM("installed Git does not support SHA-256 repositories");
+    }
+    char path[300];
+    th_write_file(wt_path(path, sizeof(path), tmpdir, "file.txt"), "first\n");
+    ASSERT_EQ(wt_git(tmpdir, "add file.txt"), 0);
+    ASSERT_EQ(wt_git(tmpdir, "commit -q -m first"), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, index_callback, NULL);
+    ASSERT_NOT_NULL(watcher);
+    ASSERT_TRUE(cbm_watcher_watch(watcher, "sha256-repo", tmpdir));
+    index_call_count = 0;
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 0); /* establish baseline */
+
+    th_append_file(path, "second\n");
+    ASSERT_EQ(wt_git(tmpdir, "add file.txt"), 0);
+    ASSERT_EQ(wt_git(tmpdir, "commit -q -m second"), 0);
+    cbm_watcher_touch(watcher, "sha256-repo");
+    (void)cbm_watcher_poll_once(watcher);
+
+    int observed = index_call_count;
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    ASSERT_EQ(observed, 1);
     PASS();
 }
 
@@ -2458,6 +3013,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_unwatch);
     RUN_TEST(watcher_unwatch_nonexistent);
     RUN_TEST(watcher_watch_replace);
+    RUN_TEST(watcher_stopped_rejects_new_registration);
     RUN_TEST(watcher_null_safety);
 
     /* Polling */
@@ -2473,9 +3029,11 @@ SUITE(watcher) {
     RUN_TEST(watcher_root_restore_resets_prune_streak);
     RUN_TEST(watcher_poll_this_repo);
     RUN_TEST(watcher_stop_flag);
+    RUN_TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop);
 
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
+    RUN_TEST(watcher_detects_sha256_git_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_identical_watch_preserves_dirty_baseline);
     RUN_TEST(watcher_detects_new_file);

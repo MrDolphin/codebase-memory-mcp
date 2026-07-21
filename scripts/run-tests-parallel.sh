@@ -100,7 +100,7 @@ run_one() {
     # Uses `timeout` where available (always in the Linux container / CI); on a
     # host without it the suite runs uncapped (no regression vs before).
     case "$s" in
-        incremental) st="${CBM_SUITE_TIMEOUT_SLOW:-3600}" ;;
+        incremental | store_arch) st="${CBM_SUITE_TIMEOUT_SLOW:-3600}" ;;
         *) st="${CBM_SUITE_TIMEOUT:-900}" ;;
     esac
     if command -v timeout >/dev/null 2>&1; then

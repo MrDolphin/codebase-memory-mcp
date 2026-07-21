@@ -45,6 +45,8 @@ struct cbm_daemon_coordinator {
     cbm_daemon_job_t *jobs;
     cbm_daemon_watch_t *watches;
     size_t client_count;
+    /* See cbm_daemon_coordinator_set_permanent. */
+    bool permanent;
     size_t job_count;
     size_t watch_count;
     size_t callback_count;
@@ -289,7 +291,7 @@ static void release_client_locked(cbm_daemon_coordinator_t *coordinator,
     release_client_resources_locked(coordinator, client->id, batch);
     free(client);
     coordinator->client_count--;
-    if (coordinator->client_count == 0) {
+    if (coordinator->client_count == 0 && !coordinator->permanent) {
         coordinator->state = CBM_DAEMON_COORDINATOR_STOPPING;
     }
 }
@@ -316,6 +318,15 @@ static bool terminal_job_locked(cbm_daemon_coordinator_t *coordinator, const cha
         *free_after_unlock = job;
     }
     return true;
+}
+
+void cbm_daemon_coordinator_set_permanent(cbm_daemon_coordinator_t *coordinator, bool permanent) {
+    if (!coordinator) {
+        return;
+    }
+    cbm_mutex_lock(&coordinator->mutex);
+    coordinator->permanent = permanent;
+    cbm_mutex_unlock(&coordinator->mutex);
 }
 
 cbm_daemon_coordinator_t *cbm_daemon_coordinator_new(uint64_t lease_timeout_ms) {

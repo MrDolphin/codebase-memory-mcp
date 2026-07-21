@@ -218,7 +218,9 @@ static bool bootstrap_fake_handoff(void *opaque, cbm_daemon_bootstrap_lock_t loc
 
 static bool bootstrap_fake_spawn(void *opaque, const cbm_daemon_bootstrap_launch_spec_t *spec) {
     bootstrap_fake_ops_t *fake = opaque;
-    bool exact = spec && spec->argc == CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC && spec->argv[0] &&
+    /* Client bootstrap must only ever spawn the EPHEMERAL two-argument
+     * shape; the permanent shape belongs exclusively to `daemon start`. */
+    bool exact = spec && spec->argc == 2U && spec->argv[0] &&
                  spec->argv[1] && !spec->argv[2] &&
                  strcmp(spec->argv[1], CBM_DAEMON_INTERNAL_ARG) == 0 && spec->detached &&
                  !spec->inherit_standard_handles && !spec->use_shell &&
@@ -366,11 +368,59 @@ TEST(daemon_bootstrap_uses_one_stable_per_account_endpoint) {
 TEST(daemon_bootstrap_launches_only_exact_detached_hidden_role) {
     cbm_daemon_bootstrap_launch_spec_t spec;
     ASSERT_TRUE(cbm_daemon_bootstrap_launch_spec_init("/tmp/cbm exact", &spec));
-    ASSERT_EQ(spec.argc, CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC);
+    ASSERT_EQ(spec.argc, 2U);
     ASSERT_STR_EQ(spec.executable_path, "/tmp/cbm exact");
     ASSERT_STR_EQ(spec.argv[0], "/tmp/cbm exact");
     ASSERT_STR_EQ(spec.argv[1], CBM_DAEMON_INTERNAL_ARG);
     ASSERT_NULL(spec.argv[2]);
+    ASSERT_TRUE(spec.detached);
+    ASSERT_FALSE(spec.inherit_standard_handles);
+    ASSERT_FALSE(spec.use_shell);
+    PASS();
+}
+
+TEST(daemon_bootstrap_permanent_daemon_argv_is_byte_exact) {
+    char *permanent[] = {"codebase-memory-mcp", CBM_DAEMON_INTERNAL_ARG, CBM_DAEMON_PERMANENT_ARG,
+                         NULL};
+    char *reordered[] = {"codebase-memory-mcp", CBM_DAEMON_PERMANENT_ARG, CBM_DAEMON_INTERNAL_ARG,
+                         NULL};
+    char *repeated[] = {"codebase-memory-mcp", CBM_DAEMON_INTERNAL_ARG, CBM_DAEMON_INTERNAL_ARG,
+                        NULL};
+    char *extended[] = {"codebase-memory-mcp", CBM_DAEMON_INTERNAL_ARG, CBM_DAEMON_PERMANENT_ARG,
+                        "extra", NULL};
+    char *wrong_flag[] = {"codebase-memory-mcp", CBM_DAEMON_INTERNAL_ARG, "--permanent", NULL};
+    ASSERT_EQ(classify(3, permanent), CBM_DAEMON_PROCESS_DAEMON);
+    ASSERT_EQ(classify(3, reordered), CBM_DAEMON_PROCESS_INVALID);
+    ASSERT_EQ(classify(3, repeated), CBM_DAEMON_PROCESS_INVALID);
+    ASSERT_EQ(classify(4, extended), CBM_DAEMON_PROCESS_INVALID);
+    ASSERT_EQ(classify(3, wrong_flag), CBM_DAEMON_PROCESS_INVALID);
+    PASS();
+}
+
+TEST(daemon_bootstrap_daemon_ctl_token_routes_after_cli) {
+    char *start[] = {"codebase-memory-mcp", "daemon", "start", NULL};
+    char *stop[] = {"codebase-memory-mcp", "daemon", "stop", NULL};
+    char *status[] = {"codebase-memory-mcp", "daemon", "status", NULL};
+    char *help[] = {"codebase-memory-mcp", "daemon", "--help", NULL};
+    /* `daemon` after `cli` is opaque tool input, never a control command. */
+    char *opaque[] = {"codebase-memory-mcp", "cli", "search_code", "daemon", "start", NULL};
+    ASSERT_EQ(classify(3, start), CBM_DAEMON_PROCESS_DAEMON_CTL);
+    ASSERT_EQ(classify(3, stop), CBM_DAEMON_PROCESS_DAEMON_CTL);
+    ASSERT_EQ(classify(3, status), CBM_DAEMON_PROCESS_DAEMON_CTL);
+    ASSERT_EQ(classify(3, help), CBM_DAEMON_PROCESS_STATELESS);
+    ASSERT_EQ(classify(5, opaque), CBM_DAEMON_PROCESS_LOCAL_CLI);
+    ASSERT_FALSE(cbm_daemon_process_role_requires_client(CBM_DAEMON_PROCESS_DAEMON_CTL));
+    PASS();
+}
+
+TEST(daemon_bootstrap_permanent_launch_spec_is_exact) {
+    cbm_daemon_bootstrap_launch_spec_t spec;
+    ASSERT_TRUE(cbm_daemon_bootstrap_launch_spec_init_permanent("/tmp/cbm exact", &spec));
+    ASSERT_EQ(spec.argc, 3U);
+    ASSERT_STR_EQ(spec.argv[0], "/tmp/cbm exact");
+    ASSERT_STR_EQ(spec.argv[1], CBM_DAEMON_INTERNAL_ARG);
+    ASSERT_STR_EQ(spec.argv[2], CBM_DAEMON_PERMANENT_ARG);
+    ASSERT_NULL(spec.argv[3]);
     ASSERT_TRUE(spec.detached);
     ASSERT_FALSE(spec.inherit_standard_handles);
     ASSERT_FALSE(spec.use_shell);
@@ -725,6 +775,9 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_rejects_ambiguous_internal_daemon_argv);
     RUN_TEST(daemon_bootstrap_uses_one_stable_per_account_endpoint);
     RUN_TEST(daemon_bootstrap_launches_only_exact_detached_hidden_role);
+    RUN_TEST(daemon_bootstrap_permanent_daemon_argv_is_byte_exact);
+    RUN_TEST(daemon_bootstrap_daemon_ctl_token_routes_after_cli);
+    RUN_TEST(daemon_bootstrap_permanent_launch_spec_is_exact);
     RUN_TEST(daemon_bootstrap_stateless_roles_bypass_every_daemon_operation);
     RUN_TEST(daemon_bootstrap_cohort_conflict_is_visible_before_probe_or_spawn);
     RUN_TEST(daemon_bootstrap_existing_exact_daemon_connects_without_spawn);

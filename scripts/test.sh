@@ -37,6 +37,8 @@ done
 
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
+# shellcheck source=path-safety.sh
+source "$ROOT/scripts/path-safety.sh"
 
 # Forward CC/CXX and collect make-passthrough args. BUILD_DIR is honored for
 # the explicit target path below so containerized legs can build in their own
@@ -58,16 +60,25 @@ print_env "test.sh"
 # Step 0: fast build/security harness regressions run before the compiler-heavy
 # suite. The Windows package surface is static here; native launcher behavior is
 # exercised by scripts/test-windows.ps1.
-echo "=== Step 0a: Windows launcher bundle contract ==="
-bash "$ROOT/tests/test_windows_bundle_contract.sh"
+echo "=== Step 0a: build directory safety contract ==="
+bash "$ROOT/tests/test_build_dir_safety.sh"
 
 echo "=== Step 0b: Windows VM worktree sync contract ==="
 bash "$ROOT/tests/test_vm_worktree_manifest.sh"
 
-echo "=== Step 0c: tree-sitter runtime Makefile dependencies ==="
+echo "=== Step 0c: UI development proxy security contract ==="
+bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
+
+echo "=== Step 0d: daemon soak recovery contract ==="
+bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
+
+echo "=== Step 0e: Windows launcher bundle contract ==="
+bash "$ROOT/tests/test_windows_bundle_contract.sh"
+
+echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-echo "=== Step 0d: security fuzz harness self-test ==="
+echo "=== Step 0g: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
 # Verify compiler supports target arch

@@ -61,8 +61,10 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
 
 /* ── Watch list management ──────────────────────────────────────── */
 
-/* Add a project to the watch list. root_path is copied. */
-void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path);
+/* Add a project to the watch list. root_path is copied. Returns true only when
+ * the physical registration exists (including an identical existing watch).
+ * A stopped watcher rejects new registrations. */
+bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path);
 
 /* Remove a project from the watch list. Any not-yet-admitted callback in the
  * current poll snapshot is invalidated before this function returns. */

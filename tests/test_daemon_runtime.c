@@ -1240,17 +1240,14 @@ static bool runtime_test_fixture_start_failed(const char *tag, const char *stage
     return false;
 }
 
+static bool runtime_test_fixture_permanent = false;
+
 static bool runtime_test_fixture_start_configured(
     runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
     uint32_t max_clients, uint64_t lease_timeout_ms,
     const cbm_daemon_runtime_application_callbacks_t *application) {
     memset(fixture, 0, sizeof(*fixture));
-    int parent_written = snprintf(fixture->parent, sizeof(fixture->parent),
-                                  "%s/cbm-runtime-%s-XXXXXX", cbm_tmpdir(), tag);
-    if (parent_written <= 0 || parent_written >= (int)sizeof(fixture->parent)) {
-        return runtime_test_fixture_start_failed(tag, "temporary-path", parent_written);
-    }
-    if (!cbm_mkdtemp(fixture->parent)) {
+    if (!th_secure_runtime_parent_new(fixture->parent, sizeof(fixture->parent), tag)) {
         return runtime_test_fixture_start_failed(tag, "temporary-directory",
                                                  runtime_test_last_os_error());
     }
@@ -1293,6 +1290,9 @@ static bool runtime_test_fixture_start_configured(
         .lease_timeout_ms = lease_timeout_ms,
         .request_timeout_ms = RUNTIME_TEST_TIMEOUT_MS,
         .shutdown_timeout_ms = RUNTIME_TEST_TIMEOUT_MS,
+        /* Default false: every teardown-latency fixture depends on prompt
+         * last-client-exit. Only the permanent-lifecycle tests flip this. */
+        .permanent = runtime_test_fixture_permanent,
     };
     if (application) {
         config.application = *application;
@@ -1402,7 +1402,9 @@ static bool runtime_test_read_log(const char *path, char out[RUNTIME_TEST_LOG_CA
 /* A detached daemon loses its inherited stderr by design. Failures before the
  * runtime listener exists must therefore reach the owner-private operation log
  * or users and smoke tests see only a generic bootstrap timeout. An existing
- * daemon claim deterministically fails before runtime startup. */
+ * daemon claim deterministically fails before runtime startup on POSIX. The
+ * Windows same-process participant guard rejects the nested host one stage
+ * earlier, and that platform-correct refusal must be equally durable. */
 TEST(daemon_host_early_coordination_failure_is_durable) {
     const char *old_cache = getenv("CBM_CACHE_DIR");
     bool had_cache = old_cache != NULL;
@@ -1412,14 +1414,11 @@ TEST(daemon_host_early_coordination_failure_is_durable) {
     char parent[RUNTIME_TEST_PATH_CAP] = {0};
     char cache[RUNTIME_TEST_PATH_CAP] = {0};
     char log_path[RUNTIME_TEST_PATH_CAP] = {0};
-    int parent_written =
-        snprintf(parent, sizeof(parent), "%s/cbm-host-early-log-XXXXXX", cbm_tmpdir());
-    bool parent_created = snapshot_ok && parent_written > 0 &&
-                          parent_written < (int)sizeof(parent) && cbm_mkdtemp(parent) != NULL;
+    bool parent_created =
+        snapshot_ok && th_secure_runtime_parent_new(parent, sizeof(parent), "host-early-log");
     int cache_written = parent_created ? snprintf(cache, sizeof(cache), "%s/cache", parent) : -1;
-    int log_written = parent_created
-                          ? snprintf(log_path, sizeof(log_path), "%s/logs/cbm-daemon.log", cache)
-                          : -1;
+    int log_written =
+        parent_created ? snprintf(log_path, sizeof(log_path), "%s/logs/cbm-daemon.log", cache) : -1;
     bool environment_ready = cache_written > 0 && cache_written < (int)sizeof(cache) &&
                              log_written > 0 && log_written < (int)sizeof(log_path) &&
                              cbm_mkdir_p(cache, 0700) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
@@ -1434,10 +1433,9 @@ TEST(daemon_host_early_coordination_failure_is_durable) {
         runtime_test_identity("active-host", runtime_test_self_build());
     active_identity.cache_fingerprint = RUNTIME_BUILD_B;
     cbm_version_cohort_status_t active_status =
-        active_manager
-            ? cbm_version_cohort_acquire(active_manager, &active_identity, UINT64_MAX,
-                                         &active_lease, &active_conflict)
-            : CBM_VERSION_COHORT_IO;
+        active_manager ? cbm_version_cohort_acquire(active_manager, &active_identity, UINT64_MAX,
+                                                    &active_lease, &active_conflict)
+                       : CBM_VERSION_COHORT_IO;
     cbm_version_cohort_status_t claim_status =
         active_status == CBM_VERSION_COHORT_OK
             ? cbm_version_cohort_daemon_claim_acquire(active_manager, &active_claim)
@@ -1452,9 +1450,14 @@ TEST(daemon_host_early_coordination_failure_is_durable) {
     int run_result = claim_status == CBM_VERSION_COHORT_OK ? cbm_daemon_host_run(&config) : 0;
 
     char log[RUNTIME_TEST_LOG_CAP] = {0};
-    bool durable = runtime_test_read_log(log_path, log) &&
-                   strstr(log, "daemon.start_failed") != NULL &&
-                   strstr(log, "claim") != NULL;
+    bool log_read = runtime_test_read_log(log_path, log);
+    bool durable_component = false;
+#ifdef _WIN32
+    durable_component = strstr(log, "participant") != NULL;
+#else
+    durable_component = strstr(log, "claim") != NULL;
+#endif
+    bool durable = log_read && strstr(log, "daemon.start_failed") != NULL && durable_component;
     bool endpoint_created = endpoint != NULL;
     while (active_claim &&
            cbm_version_cohort_daemon_claim_release(&active_claim) != CBM_PRIVATE_FILE_LOCK_OK) {
@@ -1497,10 +1500,8 @@ TEST(daemon_host_refuses_unopenable_runtime_config_database) {
     char parent[RUNTIME_TEST_PATH_CAP] = {0};
     char cache[RUNTIME_TEST_PATH_CAP] = {0};
     char config_blocker[RUNTIME_TEST_PATH_CAP] = {0};
-    int parent_written =
-        snprintf(parent, sizeof(parent), "%s/cbm-host-config-XXXXXX", cbm_tmpdir());
-    bool parent_created = snapshot_ok && parent_written > 0 &&
-                          parent_written < (int)sizeof(parent) && cbm_mkdtemp(parent) != NULL;
+    bool parent_created =
+        snapshot_ok && th_secure_runtime_parent_new(parent, sizeof(parent), "host-config");
     int cache_written = parent_created ? snprintf(cache, sizeof(cache), "%s/cache", parent) : -1;
     int blocker_written =
         parent_created ? snprintf(config_blocker, sizeof(config_blocker), "%s/_config.db", cache)
@@ -1569,6 +1570,26 @@ TEST(daemon_host_http_retry_backoff_is_bounded) {
     ASSERT_EQ(result.server_stops, 0);
     ASSERT_EQ(result.server_frees, 0);
     ASSERT_EQ(result.thread_joins, 0);
+    PASS();
+}
+
+/* A server can refuse destruction while an index callback still owns its host
+ * context. Reconfiguration must retain that server and retry its retirement
+ * even if the desired port reverts to the cached value before the next poll;
+ * only successful retirement permits a replacement. */
+TEST(daemon_host_http_reconcile_retains_busy_server_until_free_succeeds) {
+    cbm_daemon_host_http_free_refusal_test_result_t result = {0};
+    bool driven = cbm_daemon_host_http_reconcile_free_refusal_for_test(&result);
+
+    ASSERT_TRUE(driven);
+    ASSERT_TRUE(result.retained_after_refusal);
+    ASSERT_EQ(result.server_create_attempts_after_refusal, 1);
+    ASSERT_TRUE(result.replacement_active_after_retry);
+    ASSERT_EQ(result.server_create_attempts, 2);
+    ASSERT_EQ(result.thread_start_attempts, 2);
+    ASSERT_EQ(result.server_stops, 1);
+    ASSERT_EQ(result.server_free_attempts, 2);
+    ASSERT_EQ(result.thread_joins, 1);
     PASS();
 }
 
@@ -2369,6 +2390,13 @@ TEST(daemon_runtime_conflict_log_failure_uses_operation_log_fallback) {
         explicit_conflict = rejected == NULL &&
                             conflict_result.status == CBM_DAEMON_RUNTIME_CONNECT_CONFLICT &&
                             conflict_result.hello_status == CBM_DAEMON_HELLO_BUILD_CONFLICT;
+        if (!explicit_conflict) {
+            printf("  conflict fallback diagnostic: owner=%d rejected=%d owner_status=%d "
+                   "conflict_status=%d hello_status=%d message=%s\n",
+                   owner != NULL ? 1 : 0, rejected != NULL ? 1 : 0, (int)owner_result.status,
+                   (int)conflict_result.status, (int)conflict_result.hello_status,
+                   conflict_result.message);
+        }
         (void)cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
         owner = NULL;
         exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
@@ -2726,6 +2754,10 @@ TEST(daemon_runtime_application_response_roundtrip_is_byte_exact) {
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.opened), 1);
     ASSERT_EQ(atomic_load(&context.requests), 1);
+    /* A close after a completed exchange has nothing to cancel: the client
+     * only sends APPLICATION_CANCEL for an interrupted in-flight token, and
+     * the server treats stale tokens as deliberate one-way no-ops. */
+    ASSERT_EQ(atomic_load(&context.request_cancels), 0);
     ASSERT_EQ(atomic_load(&context.cancelled), 1);
     ASSERT_EQ(atomic_load(&context.closed), 1);
     PASS();
@@ -3382,7 +3414,12 @@ TEST(daemon_runtime_disconnect_cancels_blocked_application_before_exit) {
     if (started) {
         exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
     }
-    request_interrupted = call.status == CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR &&
+    /* close_begin cancels the exchange and, on Windows, also sends the
+     * active token's APPLICATION_CANCEL. Whether the local interrupt or the
+     * server's CANCELLED response wins that race, the request ended promptly
+     * without a payload — both outcomes are the contract. */
+    request_interrupted = (call.status == CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR ||
+                           call.status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) &&
                           call.response == NULL && call.response_length == 0;
     free(call.response);
     runtime_test_fixture_finish(&fixture);
@@ -3435,8 +3472,15 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     char bin[RUNTIME_TEST_PATH_CAP] = {0};
     char fake_git[RUNTIME_TEST_PATH_CAP] = {0};
     char marker[RUNTIME_TEST_PATH_CAP] = {0};
+#ifdef _WIN32
+    /* cmd.exe searches a native PATH. Keep the copied git probe out of the
+     * MSYS2 TEMP ancestry and canonicalize its directory before publication. */
+    bool work_ready =
+        snapshots_ok && th_secure_runtime_parent_new(work, sizeof(work), "non-index-work");
+#else
     (void)snprintf(work, sizeof(work), "%s/cbm-runtime-non-index-XXXXXX", cbm_tmpdir());
     bool work_ready = snapshots_ok && cbm_mkdtemp(work) != NULL;
+#endif
     int root_written = work_ready ? snprintf(root, sizeof(root), "%s/root", work) : -1;
     int cache_written = work_ready ? snprintf(cache, sizeof(cache), "%s/cache", work) : -1;
     int bin_written = work_ready ? snprintf(bin, sizeof(bin), "%s/bin", work) : -1;
@@ -3455,6 +3499,21 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
                        cbm_mkdir_p(cache, 0700) && cbm_mkdir_p(bin, 0700) &&
                        runtime_test_copy_self_image(fake_git);
 
+    char path_bin[RUNTIME_TEST_PATH_CAP] = {0};
+#ifdef _WIN32
+    bool path_bin_ready = paths_ready && cbm_canonical_path(bin, path_bin, sizeof(path_bin));
+    if (path_bin_ready) {
+        for (char *cursor = path_bin; *cursor; cursor++) {
+            if (*cursor == '/') {
+                *cursor = '\\';
+            }
+        }
+    }
+#else
+    int path_bin_written = paths_ready ? snprintf(path_bin, sizeof(path_bin), "%s", bin) : -1;
+    bool path_bin_ready = path_bin_written > 0 && path_bin_written < (int)sizeof(path_bin);
+#endif
+
     char *project = paths_ready ? cbm_project_name_from_path(root) : NULL;
     char db_path[RUNTIME_TEST_PATH_CAP] = {0};
     int db_written = project ? snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project) : -1;
@@ -3463,13 +3522,13 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     bool seeded = seed && cbm_store_upsert_project(seed, project, root) == CBM_STORE_OK;
     cbm_store_close(seed);
 
-    size_t path_length = strlen(bin) + 2U + (saved_path ? strlen(saved_path) : 0U);
-    char *test_path = seeded ? malloc(path_length) : NULL;
+    size_t path_length = strlen(path_bin) + 2U + (saved_path ? strlen(saved_path) : 0U);
+    char *test_path = seeded && path_bin_ready ? malloc(path_length) : NULL;
     if (test_path) {
 #ifdef _WIN32
-        (void)snprintf(test_path, path_length, "%s;%s", bin, saved_path ? saved_path : "");
+        (void)snprintf(test_path, path_length, "%s;%s", path_bin, saved_path ? saved_path : "");
 #else
-        (void)snprintf(test_path, path_length, "%s:%s", bin, saved_path ? saved_path : "");
+        (void)snprintf(test_path, path_length, "%s:%s", path_bin, saved_path ? saved_path : "");
 #endif
     }
     bool environment_ready = test_path && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
@@ -3530,8 +3589,8 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
         request_thread_started &&
         runtime_test_wait_pid_marker(marker, CHILD_READY_BOUND_MS, &child_process_id);
     if (request_thread_started && !marker_published) {
-        printf("  blocking git marker missing: completed=%d status=%d response=%.*s\n",
-               atomic_load_explicit(&call.completed, memory_order_acquire) ? 1 : 0,
+        printf("  blocking git marker missing: image=%s completed=%d status=%d response=%.*s\n",
+               fake_git, atomic_load_explicit(&call.completed, memory_order_acquire) ? 1 : 0,
                (int)call.status, (int)call.response_length,
                call.response ? (const char *)call.response : "");
     }
@@ -3539,9 +3598,16 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
         marker_published && runtime_test_process_image_matches(child_process_id, fake_git);
 
     bool first_close_begun = child_identity_exact && cbm_daemon_runtime_client_close_begin(first);
+    /* Admission must drop at close_begin on every platform: POSIX signals it
+     * through shutdown()/EOF, Windows through the CLOSE_INTENT frame — a
+     * named-pipe client has no transport-level half-close to lean on. */
     bool only_second_admitted =
         first_close_begun &&
         cbm_daemon_runtime_service_wait_for_clients(fixture.service, 1, RUNTIME_TEST_TIMEOUT_MS);
+    size_t clients_after_admission_wait =
+        started ? cbm_daemon_runtime_service_active_clients(fixture.service) : 0;
+    size_t connections_after_admission_wait =
+        started ? cbm_daemon_runtime_service_active_connections(fixture.service) : 0;
     bool child_gone_without_backstop =
         first_close_begun &&
         runtime_test_wait_process_image_gone(child_process_id, fake_git, CHILD_CANCEL_BOUND_MS);
@@ -3603,8 +3669,20 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     free(saved_cache);
     bool files_removed = !work_ready || th_rmtree(work) == 0;
 
+    if (!only_second_admitted || !child_gone_without_backstop || !request_completed ||
+        !second_usable_after) {
+        printf("  non-index cancellation diagnostic: close_begun=%d clients_after_wait=%zu "
+               "connections_after_wait=%zu child_gone=%d backstop=%d request_completed=%d "
+               "request_status=%d second_after=%d\n",
+               first_close_begun ? 1 : 0, clients_after_admission_wait,
+               connections_after_admission_wait, child_gone_without_backstop ? 1 : 0,
+               cleanup_backstop_used ? 1 : 0, request_completed ? 1 : 0, (int)call.status,
+               second_usable_after ? 1 : 0);
+    }
+
     ASSERT_TRUE(snapshots_ok);
     ASSERT_TRUE(paths_ready);
+    ASSERT_TRUE(path_bin_ready);
     ASSERT_TRUE(seeded);
     ASSERT_TRUE(environment_ready);
     ASSERT_TRUE(started);
@@ -3639,7 +3717,14 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
 
 TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop) {
     static const uint8_t request[] = {'i', 'g', 'n', 'o', 'r', 'e'};
-    enum { STOP_BOUND_MS = 50, STOP_OBSERVED_MAX_MS = 500 };
+    /* STOP_OBSERVED_MAX_MS is a coarse hang-detector, not a tight latency
+     * bound: the invariant is that a deadline-bounded stop RETURNS (proven by
+     * reaching the assertions below — a hang would deadlock the test) rather
+     * than blocking indefinitely on the stuck callback. The window is well
+     * above the STOP_BOUND_MS deadline yet far below a real hang, so heavy
+     * scheduler starvation (the CBM_LOCAL_CI_CPUS=4 fidelity pass, CI runners)
+     * cannot make it test-significant. */
+    enum { STOP_BOUND_MS = 50, STOP_OBSERVED_MAX_MS = 5000 };
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_application_context_t context;
@@ -4252,11 +4337,187 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
 }
 #endif
 
+
+TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
+    static const uint8_t request[] = {'b', 'l', 'o', 'c', 'k'};
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_application_context_t context;
+    runtime_application_context_init(&context, true);
+    atomic_bool request_thread_completed;
+    atomic_init(&request_thread_completed, false);
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start_application(&fixture, "close-intent-admission",
+                                                          &identity, &context);
+    cbm_daemon_runtime_client_t *client = NULL;
+    cbm_daemon_runtime_connect_result_t result = {0};
+    runtime_application_client_call_t call = {
+        .request = request,
+        .request_length = (uint32_t)sizeof(request),
+        .completed = &request_thread_completed,
+        .status = CBM_DAEMON_RUNTIME_APPLICATION_OK,
+    };
+    cbm_thread_t request_thread;
+    int request_thread_create_rc = -1;
+    bool request_thread_started = false;
+    bool callback_started = false;
+    bool close_begun = false;
+    bool admission_released_at_begin = false;
+    bool request_thread_joined = false;
+    bool request_ended_without_payload = false;
+    bool exited = false;
+
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &result);
+    }
+    if (client) {
+        call.client = client;
+        request_thread_create_rc = cbm_thread_create(
+            &request_thread, 128U * 1024U, runtime_application_client_request_thread, &call);
+        request_thread_started = request_thread_create_rc == 0;
+        callback_started =
+            request_thread_started &&
+            runtime_test_wait_atomic_bool(&context.first_request_started, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (callback_started) {
+        close_begun = cbm_daemon_runtime_client_close_begin(client);
+    }
+    /* The parity contract: after close_begin alone — before the handle
+     * closes — the daemon has released this client's admission. POSIX learns
+     * through shutdown()/EOF; Windows through the CLOSE_INTENT frame. */
+    admission_released_at_begin =
+        close_begun &&
+        cbm_daemon_runtime_service_wait_for_clients(fixture.service, 0, RUNTIME_TEST_TIMEOUT_MS);
+    if (request_thread_started) {
+        request_thread_joined = cbm_thread_join(&request_thread) == 0;
+        request_thread_started = false;
+    }
+    request_ended_without_payload =
+        request_thread_joined &&
+        (call.status == CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR ||
+         call.status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) &&
+        call.response == NULL && call.response_length == 0;
+    if (client) {
+        (void)(close_begun
+                   ? cbm_daemon_runtime_client_close_finish(client, RUNTIME_TEST_TIMEOUT_MS)
+                   : cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS));
+        client = NULL;
+    }
+    if (started) {
+        exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    free(call.response);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(request_thread_create_rc, 0);
+    ASSERT_TRUE(callback_started);
+    ASSERT_TRUE(close_begun);
+    ASSERT_TRUE(admission_released_at_begin);
+    ASSERT_TRUE(request_thread_joined);
+    ASSERT_TRUE(request_ended_without_payload);
+    ASSERT_TRUE(exited);
+    ASSERT_EQ(atomic_load(&context.opened), 1);
+    ASSERT_EQ(atomic_load(&context.requests), 1);
+    ASSERT_EQ(atomic_load(&context.cancelled), 1);
+    ASSERT_EQ(atomic_load(&context.closed), 1);
+    PASS();
+}
+
+TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    runtime_test_fixture_permanent = true;
+    bool started = runtime_test_fixture_start(&fixture, "permanent-lifecycle", &identity);
+    runtime_test_fixture_permanent = false;
+    cbm_daemon_runtime_client_t *client = NULL;
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    bool survived = false;
+    bool status_ok = false;
+    bool stop_ok = false;
+    bool exited = false;
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &connect_result);
+    }
+    if (client) {
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+        client = NULL;
+        /* Give a wrongly-armed teardown time to fire before asserting. */
+        survived =
+            !cbm_daemon_runtime_service_wait_exited(fixture.service, 300U) &&
+            cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+        cbm_daemon_runtime_status_t status = {0};
+        status_ok = cbm_daemon_runtime_request_status(fixture.endpoint, &identity,
+                                                      RUNTIME_TEST_TIMEOUT_MS, &status) &&
+                    status.permanent && !status.stopping && status.committed_clients == 0;
+        cbm_daemon_runtime_stop_result_t stop_result = {0};
+        stop_ok = cbm_daemon_runtime_request_stop(fixture.endpoint, &identity,
+                                                  RUNTIME_TEST_TIMEOUT_MS, &stop_result) &&
+                  stop_result.accepted && !stop_result.busy;
+        exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    runtime_test_fixture_finish(&fixture);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(survived);
+    ASSERT_TRUE(status_ok);
+    ASSERT_TRUE(stop_ok);
+    ASSERT_TRUE(exited);
+    PASS();
+}
+
+TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    runtime_test_fixture_permanent = true;
+    bool started = runtime_test_fixture_start(&fixture, "stop-refuse-busy", &identity);
+    runtime_test_fixture_permanent = false;
+    cbm_daemon_runtime_client_t *client = NULL;
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    bool refused = false;
+    bool accepted_after_close = false;
+    bool exited = false;
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &connect_result);
+    }
+    if (client) {
+        cbm_daemon_runtime_stop_result_t busy_result = {0};
+        refused = cbm_daemon_runtime_request_stop(fixture.endpoint, &identity,
+                                                  RUNTIME_TEST_TIMEOUT_MS, &busy_result) &&
+                  busy_result.busy && !busy_result.accepted && busy_result.committed_clients == 1 &&
+                  busy_result.client_count == 1 &&
+                  busy_result.client_pids[0] == (uint32_t)connect_result.authenticated_process_id;
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+        client = NULL;
+        cbm_daemon_runtime_stop_result_t stop_result = {0};
+        accepted_after_close =
+            cbm_daemon_runtime_service_wait_for_clients(fixture.service, 0,
+                                                        RUNTIME_TEST_TIMEOUT_MS) &&
+            cbm_daemon_runtime_request_stop(fixture.endpoint, &identity, RUNTIME_TEST_TIMEOUT_MS,
+                                            &stop_result) &&
+            stop_result.accepted && !stop_result.busy;
+        exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    runtime_test_fixture_finish(&fixture);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(accepted_after_close);
+    ASSERT_TRUE(exited);
+    PASS();
+}
+
 SUITE(daemon_runtime) {
+    RUN_TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop);
+    RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);
     RUN_TEST(daemon_host_refuses_unopenable_runtime_config_database);
     RUN_TEST(daemon_host_http_reconcile_rate_limits_and_retries_transient_failures);
     RUN_TEST(daemon_host_http_retry_backoff_is_bounded);
+    RUN_TEST(daemon_host_http_reconcile_retains_busy_server_until_free_succeeds);
 #ifndef _WIN32
     RUN_TEST(daemon_host_failed_listener_reservation_starts_no_background_work);
     RUN_TEST(daemon_host_persistent_cleanup_release_failure_is_process_bounded);
@@ -4296,6 +4557,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_consumes_busy_application_token_before_response);
     RUN_TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange);
     RUN_TEST(daemon_runtime_disconnect_cancels_blocked_application_before_exit);
+    RUN_TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request);
     RUN_TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_other_session);
     RUN_TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop);
     RUN_TEST(daemon_runtime_application_busy_cap_and_malformed_are_isolated);

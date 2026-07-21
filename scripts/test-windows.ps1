@@ -28,11 +28,10 @@
                       * (none currently - test_cli_non_ascii_arg.py was promoted to a
                         guard when the wide-argv fix for #423/#20 landed)
 
-    Determinism: the runner sets CBM_INDEX_SUPERVISOR=0 so the path / hook / drive
-    guards index in-process (the pass-level readers under test, e.g. #700's cbm_fopen
-    routing, run in-process either way). The non-ASCII CLI guard is the exception - it
-    drops that override to cross the real supervisor -> worker spawn, where the second
-    half of #423/#20 lives (CreateProcessW delivering the wide command line).
+    Indexing runs through the real supervisor -> worker spawn on every guard:
+    under the mandatory coordination daemon CBM_INDEX_SUPERVISOR=0 is a
+    fail-closed refusal seam, never an in-process fallback, so the old
+    determinism override would turn every indexing guard into a refusal.
 
     On native Windows the MinGW/LLVM toolchain ships no libasan/libubsan, so the
     build disables sanitizers (SANITIZE=). Where the toolchain provides
@@ -188,7 +187,6 @@ try {
     $env:TMP = $guardRoot
     $env:TMPDIR = $guardRoot
     $env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
-    $env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
 
 # Green regression guards - must stay GREEN (exit 0). RED (exit 1) = the fix for
 # the referenced issue regressed. The drive-picker guard needs the embedded HTTP
@@ -197,6 +195,7 @@ try {
 $guards = @(
     "tests\windows\test_non_ascii_path.py",
     "tests\windows\test_non_ascii_cache_dump.py",
+    "tests\windows\test_daemon_lifecycle.py",
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py",

@@ -53,7 +53,7 @@ static char *config_read_file(const char *path, size_t *length_out, bool *opened
         return NULL;
     }
 #ifdef _WIN32
-    wchar_t *wide_path = cbm_utf8_to_wide(path);
+    wchar_t *wide_path = cbm_path_to_wide(path);
     if (!wide_path) {
         return NULL;
     }
@@ -188,7 +188,7 @@ static bool config_parent_directory(const char *path, char *directory, size_t di
 static volatile LONG g_config_temp_sequence = 0;
 
 static bool config_write_atomic(const char *path, const char *json, size_t json_length) {
-    wchar_t *wide_path = cbm_utf8_to_wide(path);
+    wchar_t *wide_path = cbm_path_to_wide(path);
     if (!wide_path) {
         return false;
     }

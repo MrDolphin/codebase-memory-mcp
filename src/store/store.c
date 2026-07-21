@@ -664,7 +664,16 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
         flags |= SQLITE_OPEN_MEMORY;
     }
 
-    int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
+    char open_path[4096];
+    const char *effective_path = path;
+    if (path && !in_memory) {
+        if (!cbm_path_for_file_api(path, open_path, sizeof(open_path))) {
+            free(s);
+            return NULL;
+        }
+        effective_path = open_path;
+    }
+    int rc = sqlite3_open_v2(effective_path, &s->db, flags, NULL);
     if (rc != SQLITE_OK) {
         sqlite3_close(s->db);
         free(s);
@@ -807,7 +816,12 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
      *
      * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
      * (no ghost .db for unknown/unindexed projects). */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    char open_path[4096];
+    if (!cbm_path_for_file_api(db_path, open_path, sizeof(open_path))) {
+        free(s);
+        return NULL;
+    }
+    int rc = sqlite3_open_v2(open_path, &s->db, SQLITE_OPEN_READONLY, NULL);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
         if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=

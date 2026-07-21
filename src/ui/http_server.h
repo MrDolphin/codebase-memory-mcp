@@ -10,6 +10,8 @@
 #ifndef CBM_UI_HTTP_SERVER_H
 #define CBM_UI_HTTP_SERVER_H
 
+#include "ui/httpd.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -28,15 +30,26 @@ typedef void (*cbm_http_project_mutation_end_fn)(void *context, const char *proj
  * Returns NULL on failure (e.g. port in use). */
 cbm_http_server_t *cbm_http_server_new(int port);
 
-/* Free the HTTP server (call after thread has been joined). */
-void cbm_http_server_free(cbm_http_server_t *srv);
+/* Free a quiescent HTTP server. Returns false without freeing if the run loop
+ * or an index callback can still access it; callers must fail-stop rather than
+ * continue cleanup in that state. */
+bool cbm_http_server_free(cbm_http_server_t *srv);
 
 /* Signal the HTTP server to stop (safe to call from any thread). */
 void cbm_http_server_stop(cbm_http_server_t *srv);
 
-/* Run the HTTP server event loop (call from background thread).
+/* Claim a future run before handing the server pointer to a new thread. This
+ * closes the create-to-child-start lifetime gap. If thread creation fails,
+ * cancel the still-scheduled run before freeing. */
+bool cbm_http_server_schedule_run(cbm_http_server_t *srv);
+bool cbm_http_server_cancel_scheduled_run(cbm_http_server_t *srv);
+
+/* Run the scheduled HTTP server event loop from the background thread.
  * Blocks until cbm_http_server_stop() is called. */
 void cbm_http_server_run(cbm_http_server_t *srv);
+
+/* Observation-only phase seam for deterministic concurrency tests. */
+cbm_httpd_activity_t cbm_http_server_activity_for_test(cbm_http_server_t *srv);
 
 /* Check if the server started successfully (listener bound). */
 bool cbm_http_server_is_running(const cbm_http_server_t *srv);

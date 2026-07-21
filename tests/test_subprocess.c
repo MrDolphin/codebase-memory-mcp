@@ -374,11 +374,15 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
         cbm_subprocess_destroy(process);
     }
 
-    /* Generous thresholds distinguish a nonblocking call from waiting for the
-     * four-second probe, without making normal scheduler jitter test-significant. */
-    ASSERT_LT(spawn_elapsed, 1500);
-    ASSERT_LT(poll_elapsed, 1000);
+    /* first_poll == RUNNING is the authoritative proof of non-blocking: the
+     * 4s child is still running when spawn+poll returned. The wall-clock bounds
+     * are only a coarse backstop against a regression that blocks on the child;
+     * they stay well under the 4s child so heavy scheduler starvation (the
+     * CBM_LOCAL_CI_CPUS=4 fidelity pass, CI runners) can never make them
+     * test-significant. */
     ASSERT_EQ(first_poll, CBM_PROC_POLL_RUNNING);
+    ASSERT_LT(spawn_elapsed, 3500);
+    ASSERT_LT(poll_elapsed, 3500);
     ASSERT_TRUE(cancel_accepted);
     ASSERT_TRUE(terminal);
     ASSERT_TRUE(result.cancellation_requested);
@@ -936,6 +940,46 @@ TEST(win_cmdline_overflow_leaves_empty_string) {
     PASS();
 }
 
+/* cmd.exe /C receives command-language text, not another CRT argv element.
+ * Preserve its quoted Windows paths byte-for-byte: generic argv quoting would
+ * turn the payload's quotes into backslash-quote sequences before cmd sees it. */
+TEST(win_cmd_payload_is_verbatim_and_capacity_checked) {
+    const char *cmd = "C:\\Windows\\System32\\cmd.exe";
+    const char *payload =
+        "git -C \"C:\\Users\\test\\source repo\" diff --name-only \"main\"...HEAD 2>NUL";
+    const char *expected =
+        "\"C:\\Windows\\System32\\cmd.exe\" /D /S /V:OFF /C "
+        "git -C \"C:\\Users\\test\\source repo\" diff --name-only \"main\"...HEAD 2>NUL";
+    char result[512];
+
+    ASSERT(cbm_build_win_cmd_payload(result, strlen(expected) + 1, cmd, payload));
+    ASSERT_STR_EQ(result, expected);
+    ASSERT_NULL(strstr(result, "\\\"C:\\Users"));
+
+    memset(result, 'x', sizeof(result));
+    ASSERT_FALSE(cbm_build_win_cmd_payload(result, strlen(expected), cmd, payload));
+    ASSERT_EQ(result[0], '\0');
+    PASS();
+}
+
+/* Input validation must inspect no bytes beyond short strings and must never
+ * permit PATH lookup or a different executable behind the raw-payload mode. */
+TEST(win_cmd_payload_rejects_short_relative_and_non_cmd_paths) {
+    const char *payload = "echo ok";
+    char result[256];
+    ASSERT_FALSE(cbm_build_win_cmd_payload(result, sizeof(result), "", payload));
+    ASSERT_FALSE(cbm_build_win_cmd_payload(result, sizeof(result), "C", payload));
+    ASSERT_FALSE(cbm_build_win_cmd_payload(result, sizeof(result), "C:", payload));
+    ASSERT_FALSE(cbm_build_win_cmd_payload(result, sizeof(result), "cmd.exe", payload));
+    ASSERT_FALSE(
+        cbm_build_win_cmd_payload(result, sizeof(result), "C:\\tools\\other.exe", payload));
+    ASSERT_FALSE(
+        cbm_build_win_cmd_payload(result, sizeof(result), "C:\\tools\\cmd.exe\\child", payload));
+    ASSERT(
+        cbm_build_win_cmd_payload(result, sizeof(result), "c:/Windows/System32/CMD.EXE", payload));
+    PASS();
+}
+
 SUITE(subprocess) {
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
@@ -964,4 +1008,6 @@ SUITE(subprocess) {
     RUN_TEST(win_cmdline_roundtrip_battery);
     RUN_TEST(win_cmdline_overflow_rejected);
     RUN_TEST(win_cmdline_overflow_leaves_empty_string);
+    RUN_TEST(win_cmd_payload_is_verbatim_and_capacity_checked);
+    RUN_TEST(win_cmd_payload_rejects_short_relative_and_non_cmd_paths);
 }

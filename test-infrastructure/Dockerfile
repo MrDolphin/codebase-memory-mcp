@@ -9,12 +9,16 @@
 FROM ubuntu:noble
 
 # Minimal: gcc + zlib only. sqlite3 is vendored (compiled from source with ASan).
+# curl + zsh mirror the GitHub runner images: the self-update tests shell out
+# to curl, and the shell-activation tests exercise zsh rc files.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make \
     zlib1g-dev \
     pkg-config \
     python3 \
     git \
+    curl \
+    zsh \
     ccache \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*

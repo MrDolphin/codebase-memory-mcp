@@ -2959,6 +2959,13 @@ void cbm_daemon_ipc_connection_close(cbm_daemon_ipc_connection_t *connection) {
     free(connection);
 }
 
+void cbm_daemon_ipc_connection_drain(cbm_daemon_ipc_connection_t *connection, uint32_t timeout_ms) {
+    /* POSIX stream sockets deliver buffered data after close; the final
+     * response cannot be lost to an immediate close, so no wait is needed. */
+    (void)connection;
+    (void)timeout_ms;
+}
+
 void cbm_daemon_ipc_connection_interrupt(cbm_daemon_ipc_connection_t *connection) {
     if (connection && connection->fd >= 0) {
         (void)shutdown(connection->fd, SHUT_RDWR);
@@ -3345,6 +3352,14 @@ struct cbm_daemon_ipc_listener {
     wchar_t *pipe_name;
     HANDLE pipe;
     bool first_instance;
+    /* The pending overlapped ConnectNamedPipe persists across accept-poll
+     * timeouts. Destroying a listening instance on every poll timeout races
+     * clients attaching in the teardown window: they end up severed or,
+     * worse, attached to an orphaned pipe object no server will ever read,
+     * silently absorbing their HELLO until their own timeout expires. */
+    HANDLE connect_event;
+    OVERLAPPED connect_overlapped;
+    bool connect_pending;
     cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation;
     cbm_daemon_ipc_participant_guard_t *participant_guard;
 };
@@ -5091,6 +5106,9 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
         (void)DisconnectNamedPipe(listener->pipe);
         (void)CloseHandle(listener->pipe);
     }
+    if (listener->connect_event) {
+        (void)CloseHandle(listener->connect_event);
+    }
     cbm_daemon_ipc_lifetime_reservation_release(listener->lifetime_reservation);
     ipc_participant_guard_release_complete(&listener->participant_guard);
     free(listener->pipe_name);
@@ -5221,34 +5239,57 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
     if (listener->pipe == INVALID_HANDLE_VALUE) {
         listener->pipe = win_pipe_instance_new(listener->pipe_name, listener->first_instance);
         listener->first_instance = false;
+        listener->connect_pending = false;
         if (listener->pipe == INVALID_HANDLE_VALUE) {
             return -1;
         }
     }
 
-    OVERLAPPED overlapped;
-    memset(&overlapped, 0, sizeof(overlapped));
-    overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!overlapped.hEvent) {
-        return -1;
-    }
-    BOOL connected = ConnectNamedPipe(listener->pipe, &overlapped);
-    int result = 1;
-    if (!connected) {
-        DWORD connect_error = GetLastError();
+    if (!listener->connect_pending) {
+        if (!listener->connect_event) {
+            listener->connect_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (!listener->connect_event) {
+                return -1;
+            }
+        }
+        if (!ResetEvent(listener->connect_event)) {
+            return -1;
+        }
+        memset(&listener->connect_overlapped, 0, sizeof(listener->connect_overlapped));
+        listener->connect_overlapped.hEvent = listener->connect_event;
+        BOOL connected = ConnectNamedPipe(listener->pipe, &listener->connect_overlapped);
+        DWORD connect_error = connected ? ERROR_PIPE_CONNECTED : GetLastError();
         if (connect_error == ERROR_IO_PENDING) {
-            DWORD transferred = 0;
-            result = win_overlapped_wait(listener->pipe, &overlapped, timeout_ms, &transferred);
+            listener->connect_pending = true;
         } else if (connect_error != ERROR_PIPE_CONNECTED) {
-            result = -1;
+            (void)DisconnectNamedPipe(listener->pipe);
+            (void)CloseHandle(listener->pipe);
+            listener->pipe = INVALID_HANDLE_VALUE;
+            return -1;
         }
     }
-    (void)CloseHandle(overlapped.hEvent);
-    if (result != 1) {
-        (void)DisconnectNamedPipe(listener->pipe);
-        (void)CloseHandle(listener->pipe);
-        listener->pipe = INVALID_HANDLE_VALUE;
-        return result;
+
+    if (listener->connect_pending) {
+        DWORD wait = WaitForSingleObject(listener->connect_event, timeout_ms);
+        if (wait == WAIT_TIMEOUT) {
+            /* Keep the instance and its pending connect armed: a listening
+             * pipe must stay available for clients between polls. */
+            return 0;
+        }
+        DWORD transferred = 0;
+        if (wait != WAIT_OBJECT_0 ||
+            !GetOverlappedResult(listener->pipe, &listener->connect_overlapped, &transferred,
+                                 FALSE)) {
+            DWORD connect_error = GetLastError();
+            listener->connect_pending = false;
+            if (connect_error != ERROR_PIPE_CONNECTED) {
+                (void)DisconnectNamedPipe(listener->pipe);
+                (void)CloseHandle(listener->pipe);
+                listener->pipe = INVALID_HANDLE_VALUE;
+                return -1;
+            }
+        }
+        listener->connect_pending = false;
     }
     cbm_daemon_ipc_connection_t *connection = malloc(sizeof(*connection));
     if (!connection) {
@@ -5523,6 +5564,33 @@ void cbm_daemon_ipc_connection_close(cbm_daemon_ipc_connection_t *connection) {
         (void)CloseHandle(connection->handle);
     }
     free(connection);
+}
+
+static int win_io_once(cbm_daemon_ipc_connection_t *connection, void *buffer, DWORD length,
+                       bool writing, uint64_t deadline_ms, DWORD *transferred_out);
+
+void cbm_daemon_ipc_connection_drain(cbm_daemon_ipc_connection_t *connection, uint32_t timeout_ms) {
+    if (!connection || connection->handle == INVALID_HANDLE_VALUE ||
+        connection->role != CBM_DAEMON_IPC_PIPE_ROLE_ACCEPTED_SERVER ||
+        atomic_load_explicit(&connection->poisoned, memory_order_acquire)) {
+        return;
+    }
+    /* Closing the server end of a named pipe discards data the client has not
+     * read yet, so a final response followed by an immediate close races the
+     * client's decode. Reading until peer EOF proves consumption: clients
+     * close only after draining their pending response. A poisoned or
+     * interrupted connection returns immediately above/below, so ordinary
+     * EOF-triggered teardown pays nothing here. */
+    uint64_t deadline_ms = ipc_deadline_after(timeout_ms);
+    for (;;) {
+        uint8_t discard[256];
+        DWORD transferred = 0;
+        int result =
+            win_io_once(connection, discard, sizeof(discard), false, deadline_ms, &transferred);
+        if (result != 1 || transferred == 0) {
+            return;
+        }
+    }
 }
 
 void cbm_daemon_ipc_connection_interrupt(cbm_daemon_ipc_connection_t *connection) {

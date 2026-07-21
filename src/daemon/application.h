@@ -96,6 +96,11 @@ typedef enum {
 
 cbm_daemon_application_t *cbm_daemon_application_new(const cbm_daemon_application_config_t *config);
 
+/* A PERMANENT application layer (backing a `daemon start` generation) keeps
+ * admitting new sessions after its last live session ends; only the explicit
+ * stop/drain paths latch it stopping. */
+void cbm_daemon_application_set_permanent(cbm_daemon_application_t *application, bool permanent);
+
 /* Cancel and reap all daemon-owned operations within timeout_ms. Normal final
  * client shutdown calls this before watcher/store teardown. Idempotent. */
 bool cbm_daemon_application_shutdown(cbm_daemon_application_t *application, uint32_t timeout_ms);

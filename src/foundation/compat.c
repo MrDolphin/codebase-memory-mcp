@@ -75,7 +75,7 @@ static bool win_mkdtemp_private_create(const char *path) {
     TOKEN_USER *user = NULL;
     PACL acl = NULL;
     DWORD needed = 0;
-    wchar_t *wide = cbm_utf8_to_wide(path);
+    wchar_t *wide = cbm_path_to_wide(path);
     if (wide && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
         !GetTokenInformation(token, TokenUser, NULL, 0, &needed) &&
         GetLastError() == ERROR_INSUFFICIENT_BUFFER && (user = malloc(needed)) != NULL &&
@@ -127,15 +127,31 @@ char *cbm_mkdtemp(char *tmpl) {
     } else {
         snprintf(buf, sizeof(buf), "%s", tmpl);
     }
-    if (!_mktemp(buf))
+    /* Wide-API template expansion: the ANSI CRT interprets the UTF-8 bytes of
+     * non-ASCII cache/temp components in the local codepage and fails. */
+    wchar_t *wide_template = cbm_utf8_to_wide(buf);
+    if (!wide_template || !_wmktemp(wide_template)) {
+        free(wide_template);
         return NULL;
+    }
+    char *expanded = cbm_wide_to_utf8(wide_template);
+    free(wide_template);
+    if (!expanded || strlen(expanded) >= sizeof(buf)) {
+        free(expanded);
+        return NULL;
+    }
+    strcpy(buf, expanded);
+    free(expanded);
     if (!win_mkdtemp_private_create(buf)) {
         /* One-time note: every private-namespace validation downstream
          * depends on the explicit descriptor, so a silent fallback turns
          * into unexplained owner/DACL refusals far from this call site. */
         static bool fallback_reported;
         DWORD create_error = GetLastError();
-        if (_mkdir(buf) != 0)
+        wchar_t *wide_directory = cbm_utf8_to_wide(buf);
+        int mkdir_result = wide_directory ? _wmkdir(wide_directory) : -1;
+        free(wide_directory);
+        if (mkdir_result != 0)
             return NULL;
         if (!fallback_reported) {
             fallback_reported = true;
@@ -158,6 +174,34 @@ char *cbm_mkdtemp(char *tmpl) {
     return tmpl;
 }
 #endif
+
+bool cbm_path_for_file_api(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_path_to_wide(path);
+    char *narrow = wide ? cbm_wide_to_utf8(wide) : NULL;
+    free(wide);
+    if (!narrow) {
+        return false;
+    }
+    size_t needed = strlen(narrow);
+    bool fits = needed < out_size;
+    if (fits) {
+        memcpy(out, narrow, needed + 1U);
+    }
+    free(narrow);
+    return fits;
+#else
+    size_t needed = strlen(path);
+    if (needed >= out_size) {
+        return false;
+    }
+    memcpy(out, path, needed + 1U);
+    return true;
+#endif
+}
 
 /* ── mkstemp (Windows lacks it) ───────────────────────────────── */
 
@@ -182,11 +226,35 @@ int cbm_mkstemp(char *tmpl) {
         errno = ENAMETOOLONG;
         return CBM_NOT_FOUND;
     }
-    if (!_mktemp(buf))
+    /* Wide-API expansion and open: worker staging files land inside
+     * CBM_CACHE_DIR, which users may place at non-ASCII paths; the ANSI CRT
+     * (_mktemp/_open) mangles those bytes in the local codepage. */
+    wchar_t *wide_template = cbm_utf8_to_wide(buf);
+    if (!wide_template || !_wmktemp(wide_template)) {
+        free(wide_template);
         return CBM_NOT_FOUND;
-    int fd = _open(buf, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
-    if (fd >= 0)
-        strcpy(tmpl, buf);
+    }
+    char *expanded_for_open = cbm_wide_to_utf8(wide_template);
+    wchar_t *wide_open = expanded_for_open ? cbm_path_to_wide(expanded_for_open) : NULL;
+    free(expanded_for_open);
+    if (!wide_open) {
+        free(wide_template);
+        return CBM_NOT_FOUND;
+    }
+    int fd = _wopen(wide_open, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+    free(wide_open);
+    if (fd >= 0) {
+        char *expanded = cbm_wide_to_utf8(wide_template);
+        if (!expanded || strlen(expanded) >= sizeof(buf)) {
+            free(expanded);
+            free(wide_template);
+            (void)_close(fd);
+            return CBM_NOT_FOUND;
+        }
+        strcpy(tmpl, expanded);
+        free(expanded);
+    }
+    free(wide_template);
     return fd;
 }
 #endif

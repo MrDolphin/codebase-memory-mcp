@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import sys
 
 
@@ -29,6 +30,121 @@ def read(relative: str) -> str:
 def require(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
+
+
+# The real-Windows local-CI drivers are documented as direct host entrypoints.
+# Keep their Git checkout modes executable, and ensure the daily smoke command
+# uses the isolated CI-equivalent harness rather than mutating the VM user's
+# actual managed installation.
+vm_host_scripts = (
+    "test-infrastructure/vm/provision-windows.sh",
+    "test-infrastructure/vm/vm-smoke.sh",
+    "test-infrastructure/vm/win.sh",
+)
+for relative in vm_host_scripts:
+    indexed = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--stage", "--", relative],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    indexed_mode = indexed.stdout.split(maxsplit=1)[0] if indexed.returncode == 0 and indexed.stdout else ""
+    require(
+        indexed_mode == "100755"
+        if indexed_mode
+        else (root / relative).stat().st_mode & 0o111 != 0,
+        f"{relative} must be executable as documented",
+    )
+
+vm_driver = read("test-infrastructure/vm/win.sh")
+vm_provision = read("test-infrastructure/vm/provision-windows.sh")
+vm_common = read("test-infrastructure/vm/ssh-common.sh")
+require(
+    "JOBS='$(nproc)'" in vm_driver,
+    "win.sh must defer nproc expansion to the remote MSYS shell without over-escaping it",
+)
+for relative, source in (
+    ("test-infrastructure/vm/win.sh", vm_driver),
+    ("test-infrastructure/vm/provision-windows.sh", vm_provision),
+):
+    require(
+        "StrictHostKeyChecking=no" not in source
+        and "UserKnownHostsFile=/dev/null" not in source,
+        f"{relative} must not disable SSH server identity verification",
+    )
+    require(
+        "CBM_VM_HOST_KEY_SHA256" in source,
+        f"{relative} must require the pinned VM SSH host-key fingerprint",
+    )
+
+require(
+    "msys2-x86_64-latest" not in vm_provision
+    and "msys2-base-x86_64-20260611.sfx.exe" in vm_provision
+    and "c105946e64e08f099ac0e4647461ce762b95333ad211777666476a9a41451d65"
+    in vm_provision,
+    "provision-windows.sh must pin the official MSYS2 image and SHA-256 digest",
+)
+require(
+    "pacman -Syu --noconfirm --noprogressbar\" || true" not in vm_provision,
+    "provision-windows.sh must fail rather than hide an incomplete MSYS2 upgrade",
+)
+require(
+    "feat/shared-coordination-daemon" not in vm_driver
+    and "feat/shared-coordination-daemon" not in vm_provision,
+    "Windows VM drivers must not default permanently to the feature branch",
+)
+
+local_ci_driver = read("test-infrastructure/run.sh")
+require(
+    "mac-vm)" not in local_ci_driver and "CBM_WIN_VM_SSH" not in local_ci_driver,
+    "run.sh must not retain duplicate mutable VM drivers outside vm/win.sh",
+)
+
+vm_bootstrap = read("test-infrastructure/vm/windows-bootstrap.ps1")
+require(
+    re.search(r"ssh-(?:ed25519|rsa)\s+[A-Za-z0-9+/]{40,}={0,3}", vm_bootstrap) is None,
+    "windows-bootstrap.ps1 must never embed an administrator-authorized SSH key",
+)
+require(
+    "SshPublicKeyPath" in vm_bootstrap,
+    "windows-bootstrap.ps1 must require an explicit caller-supplied SSH public key file",
+)
+smoke_case = re.search(r"^smoke-install\)\n(?P<body>.*?)^\s*;;", vm_driver, re.MULTILINE | re.DOTALL)
+require(smoke_case is not None, "win.sh must expose the smoke-install command")
+require(
+    smoke_case is not None
+    and "bash test-infrastructure/vm/vm-smoke.sh" in smoke_case.group("body"),
+    "win.sh smoke-install must run the isolated CI-equivalent vm-smoke harness",
+)
+sync_case = re.search(r"^sync\)\n(?P<body>.*?)^\s*;;", vm_driver, re.MULTILINE | re.DOTALL)
+require(sync_case is not None, "win.sh must expose an exact local-worktree sync command")
+require(
+    sync_case is not None
+    and "cbm_vm_write_untracked_manifest" in sync_case.group("body")
+    and "git -C \"$ROOT\" diff --binary" in sync_case.group("body")
+    and "git reset --hard" in sync_case.group("body")
+    and "git clean -fdx" in sync_case.group("body")
+    and 'exec "$0" build' in sync_case.group("body")
+    and "ls-files" in vm_common
+    and '"$link"/*' in vm_common
+    and "-e build" not in sync_case.group("body"),
+    "win.sh sync must apply the binary Git diff plus untracked files, invalidate stale build "
+    "outputs, and rebuild automatically",
+)
+require(
+    sync_case is not None
+    and "COPYFILE_DISABLE=1" in sync_case.group("body")
+    and "--no-xattrs" in sync_case.group("body")
+    and "--no-mac-metadata" in sync_case.group("body"),
+    "win.sh sync must suppress macOS metadata instead of creating Windows AppleDouble files",
+)
+require(
+    sync_case is not None
+    and 'remote_head="$(vm clangarm64 "cd /c/cbm && git rev-parse --verify HEAD")"'
+    in sync_case.group("body")
+    and 'test \\"\\$(git rev-parse --verify HEAD)\\"' not in sync_case.group("body"),
+    "win.sh sync must compare the remote HEAD locally instead of nesting shell quotes through cmd.exe",
+)
 
 
 def yaml_run_blocks(text: str) -> list[str]:
@@ -422,6 +538,22 @@ require(
     unsafe_acl_test.count('(extended_launcher, "extended DOS")') >= 2,
     "native Windows coverage must reject unsafe ancestor ACLs through extended DOS paths",
 )
+add_only_start = windows_launcher_test.find(
+    "def assert_add_only_ancestor_acl_allowed("
+)
+add_only_grant = windows_launcher_test.find(
+    'grant = run(["icacls", ancestor, "/grant", "*S-1-1-0:(AD)"]',
+    add_only_start,
+)
+add_only_before_ace = windows_launcher_test[add_only_start:add_only_grant]
+require(
+    add_only_start >= 0
+    and add_only_grant > add_only_start
+    and 'before_ace = run([launcher, "--version"], env)' in add_only_before_ace
+    and "launcher context failed before the add-only ACE was installed"
+    in add_only_before_ace,
+    "native add-only coverage must prove launcher-context authentication before mutating the ACL",
+)
 require(
     windows_launcher_test.count("assert_launcher_death_contains_payload(") >= 2
     and "server.proc.kill()" in windows_launcher_test
@@ -446,6 +578,225 @@ require(
     and "WaitForMultipleObjects" in launcher_source
     and "TerminateJobObject" in launcher_source,
     "the permanent launcher must contain payloads and supervise immediate-parent death",
+)
+
+# Launcher-context authentication accepts the launcher's bounded privileged
+# owner set without widening the exact-current-owner policy used by mutable
+# state transactions.
+launcher_state_source = read("src/cli/windows_launcher_state.c")
+generic_opener_start = launcher_state_source.find(
+    "static HANDLE windows_open_regular_no_reparse_links("
+)
+context_opener_start = launcher_state_source.find(
+    "static HANDLE windows_open_launcher_context_file("
+)
+generic_opener = launcher_state_source[generic_opener_start:context_opener_start]
+context_opener_end = launcher_state_source.find(
+    "static HANDLE windows_open_directory_secure_access(", context_opener_start
+)
+context_opener = launcher_state_source[context_opener_start:context_opener_end]
+context_consume_start = launcher_state_source.rfind(
+    "bool cbm_windows_launcher_context_consume("
+)
+context_consume_end = launcher_state_source.find(
+    "bool cbm_windows_launcher_context_complete(", context_consume_start
+)
+context_consume = launcher_state_source[context_consume_start:context_consume_end]
+require(
+    generic_opener_start >= 0
+    and context_opener_start > generic_opener_start
+    and "windows_owner_is_current(file)" in generic_opener
+    and "windows_owner_secure(file, false)" not in generic_opener,
+    "generic Windows transaction-file opens must continue requiring the exact current owner",
+)
+require(
+    context_opener_end > context_opener_start
+    and all(
+        needle in context_opener
+        for needle in (
+            "windows_path_tree_plain(path)",
+            "windows_file_identity_links(file, &information, expected_links)",
+            "windows_owner_secure(file, false)",
+            "windows_acl_secure(file)",
+            "FILE_FLAG_OPEN_REPARSE_POINT",
+        )
+    ),
+    "launcher-context file opens must use the launcher trusted-owner set without weakening path, "
+    "link-count, reparse-point, or ACL checks",
+)
+require(
+    context_consume_start >= 0
+    and context_consume_end > context_consume_start
+    and all(
+        needle in context_consume
+        for needle in (
+            "GetNamedPipeServerProcessId(pipe, &actual_pid)",
+            "actual_pid == claimed_pid",
+            "windows_filetime_equal(&actual_creation, &claimed_creation)",
+            "QueryFullProcessImageNameW(server, 0U, actual_path, &actual_path_length)",
+            "windows_open_launcher_context_file(actual_path, expected_launcher_links)",
+            "windows_open_launcher_context_file(claimed_path, expected_launcher_links)",
+            "windows_file_identity_links(actual_file, &actual_info, expected_launcher_links)",
+            "windows_file_identity_links(claimed_file, &claimed_info, expected_launcher_links)",
+            "windows_same_identity(&actual_info, &claimed_info)",
+            "Windows launcher context actual image failed secure open",
+            "Windows launcher context claimed path failed secure open",
+            "Windows launcher context actual/claimed file identity mismatch",
+        )
+    ),
+    "launcher-context consumption must bind PID/creation/file identity and diagnose each file-auth "
+    "stage",
+)
+
+# Managed generations are exact two-file directories. Publication creates the
+# canonical name as the generation launcher's second hard link; update and
+# uninstall use mapped-image-safe namespace transactions rather than attempting
+# to delete the mapped executable directly.
+require(
+    all(
+        needle in launcher_state_source
+        for needle in (
+            "windows_generation_layout_exact",
+            "CreateHardLinkW(stage, backing_path, NULL)",
+            "windows_posix_rename_handle(stage_file, target_path)",
+            "cbm_windows_managed_launcher_backing",
+            "canonical launcher has no unique exact generation backing",
+            "windows_open_regular_no_reparse_links(launcher_path, GENERIC_READ, 1U)",
+        )
+    ),
+    "Windows launcher publication must enforce an exact two-file generation and exact-two "
+    "canonical/backing hard-link identity",
+)
+capability_probe_start = launcher_state_source.rfind(
+    "static bool windows_launcher_capability_probe_once("
+)
+capability_probe = launcher_state_source[capability_probe_start:]
+require(
+    capability_probe_start >= 0
+    and "bool cbm_windows_launcher_capability_probe(" in capability_probe,
+    "the capability probe implementation must keep its cold-scan retry wrapper",
+)
+require(
+    all(
+        needle in capability_probe
+        for needle in (
+            "old_generation",
+            "new_generation",
+            "windows_generation_layout_exact(old_generation, 2U, NULL)",
+            "cbm_windows_launcher_replace_atomic(canonical, new_backing",
+            "cbm_windows_launcher_remove_posix(canonical",
+            "windows_posix_rename_handle_no_replace(state, retired_directory)",
+            "windows_posix_rename_handle_no_replace(state, state_directory)",
+            "WaitForSingleObject(child_b.hProcess, 0U) == WAIT_TIMEOUT",
+        )
+    ),
+    "the capability probe must exercise the real exact-generation hard-link transaction and "
+    "mapped state-directory retire/restore before session drain",
+)
+uninstall_commit_start = launcher_state_source.rfind(
+    "bool cbm_windows_launcher_uninstall_commit("
+)
+uninstall_commit_end = launcher_state_source.find(
+    "static bool windows_generation_directory_path(", uninstall_commit_start
+)
+uninstall_commit = launcher_state_source[uninstall_commit_start:uninstall_commit_end]
+require(
+    all(
+        needle in uninstall_commit
+        for needle in (
+            "cbm_windows_retired_state_path",
+            "windows_posix_rename_handle_no_replace(state, retired_directory)",
+            "cbm_windows_launcher_remove_posix",
+            "original_canonical_survived",
+            "windows_same_identity(&canonical_information, &original_backing_information)",
+            "windows_posix_rename_handle_no_replace(state, state_directory)",
+        )
+    ),
+    "uninstall must retire state before its final canonical unlink and restore only when the "
+    "original exact launcher identity survived",
+)
+
+cleanup_start = launcher_source.find("static bool launcher_schedule_managed_cleanup(")
+cleanup_end = launcher_source.find("static bool launcher_read_all(", cleanup_start)
+cleanup_source = launcher_source[cleanup_start:cleanup_end]
+require(
+    cleanup_start >= 0
+    and all(
+        needle in cleanup_source
+        for needle in (
+            "cbm_windows_retired_state_path",
+            "cbm_windows_managed_launcher_backing",
+            "GetSystemDirectoryW",
+            'L"%ls\\\\cmd.exe"',
+            'L"%ls\\\\ping.exe"',
+            "DETACHED_PROCESS",
+            "CREATE_NEW_PROCESS_GROUP",
+            "CreateProcessW(command_path, mutable_command, NULL, NULL, FALSE",
+            "retired_basename",
+        )
+    )
+    and "rd /s /q .cbm" not in cleanup_source
+    and "exist .cbm" not in cleanup_source,
+    "launcher cleanup must delete only the authenticated retired basename via validated absolute "
+    "System32 utilities and must preserve a concurrent reinstall's new .cbm",
+)
+
+cli_uninstall_source = read("src/cli/cli.c")
+managed_uninstall_match = re.search(
+    r"static int cli_windows_managed_uninstall_activate\(.*?\n}\n",
+    cli_uninstall_source,
+    re.DOTALL,
+)
+managed_uninstall = managed_uninstall_match.group(0) if managed_uninstall_match else ""
+require(
+    "cbm_windows_launcher_uninstall_commit" in managed_uninstall
+    and "activation->state.payload_sha256" in managed_uninstall
+    and "cbm_windows_launcher_remove_posix" not in managed_uninstall,
+    "managed uninstall must use the state-retirement/final-unlink commit API rather than unlinking "
+    "the mapped launcher directly",
+)
+
+require(
+    all(
+        needle in windows_launcher_test
+        for needle in (
+            "interrupted launcher-first initial install",
+            "os.link(interrupted_backing, interrupted_launcher)",
+            "assert_failed_uninstall_restores_state",
+            "assert_uninstall_immediate_reinstall_safe",
+            "retired_state_siblings",
+            "old detached cleanup deleted or replaced",
+            "canonical.samefile(backing)",
+            "canonical.stat().st_nlink == 2",
+        )
+    ),
+    "native Windows coverage must exercise interrupted hard-link publication, unlink rollback, "
+    "retired cleanup, and immediate reinstall isolation",
+)
+
+# On Windows subprocess supervision receives a non-NULL lpApplicationName, so
+# a literal `git` would not use PATH. Resolve only git.exe beneath inherited
+# absolute PATH entries and never permit the current-directory search implied
+# by empty or relative entries. POSIX retains execvp via argv[0].
+watcher_source = read("src/watcher/watcher.c")
+require(
+    all(
+        needle in watcher_source
+        for needle in (
+            "watcher_resolve_git_executable",
+            'GetEnvironmentVariableW(L"PATH"',
+            'L"%ls\\\\git.exe"',
+            "GetFullPathNameW",
+            "watcher_windows_path_absolute",
+            "FILE_FLAG_OPEN_REPARSE_POINT",
+            ".bin = git_executable",
+            ".bin = argv[0]",
+            "empty/relative entries",
+        )
+    )
+    and "popen(" not in watcher_source,
+    "Windows watcher Git commands must resolve an explicit absolute git.exe without cwd search "
+    "while POSIX retains literal argv supervision",
 )
 
 # The build system exposes a distinct launcher artifact; release jobs later copy
@@ -486,7 +837,7 @@ ancestor_security_contracts = {
         "windows_acl_secure_for_mutation(component, mutation)",
         "windows_private_mutation_rights()",
         "if (index < directory_length)",
-        "if (created->count > 0U)",
+        "windows_private_mutation_rights() & ~((DWORD)FILE_ADD_SUBDIRECTORY)",
         "mutation &= ~((DWORD)FILE_ADD_SUBDIRECTORY)",
         "FILE_ADD_FILE",
         "FILE_DELETE_CHILD",
@@ -606,6 +957,12 @@ require(
 # use an explicit file:// CBM_DOWNLOAD_URL only for its local fixture, while the
 # installer and raw-curl phases continue to exercise the loopback HTTP server.
 smoke_script = read("scripts/smoke-test.sh")
+require(
+    'copy_smoke_binary "$FAKE_HOME/.local/bin/codebase-memory-mcp.exe"' not in smoke_script
+    and 'copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"'
+    not in smoke_script,
+    "Windows smoke must leave managed canonical targets absent for authenticated install",
+)
 require(
     "smoke_mktemp_file" in smoke_script
     and "smoke_mktemp_dir" in smoke_script

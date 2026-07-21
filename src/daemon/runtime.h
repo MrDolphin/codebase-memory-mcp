@@ -46,6 +46,14 @@
  * requester excludes itself). */
 #define CBM_DAEMON_ACTIVATION_SHUTDOWN_REQUEST_SIZE 137U
 #define CBM_DAEMON_ACTIVATION_SHUTDOWN_RESPONSE_SIZE 24U
+
+/* STATUS/STOP wire sizes. Requests carry only the requester's claimed build
+ * fingerprint (kernel-peer-verified, cross-build by design). Responses are
+ * fixed-size with a capped committed-client pid table. */
+#define CBM_DAEMON_CONTROL_REQUEST_SIZE 65U
+#define CBM_DAEMON_CONTROL_CLIENT_CAP 8U
+#define CBM_DAEMON_STATUS_RESPONSE_SIZE 121U
+#define CBM_DAEMON_STOP_RESPONSE_SIZE 40U
 #define CBM_DAEMON_RUNTIME_PROJECT_KEY_MAX 4096U
 #define CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX (CBM_DAEMON_MAX_FRAME_SIZE - 16U)
 
@@ -62,6 +70,21 @@ typedef enum {
     CBM_DAEMON_RUNTIME_OP_APPLICATION_REQUEST = 6,
     CBM_DAEMON_RUNTIME_OP_APPLICATION_CANCEL = 7,
     CBM_DAEMON_RUNTIME_OP_ACTIVATION_SHUTDOWN = 8,
+    /* Fire-and-forget departure notice sent by close_begin when it interrupts
+     * an in-flight exchange. POSIX peers additionally signal departure via
+     * shutdown()/EOF; Windows named pipes have no client half-close, so this
+     * frame is what releases admission before the handle closes. No response
+     * is sent: the client's receive path is already interrupted. */
+    CBM_DAEMON_RUNTIME_OP_CLOSE_INTENT = 9,
+    /* `daemon status` observability probe. Like ACTIVATION_SHUTDOWN this is a
+     * one-shot authenticated first frame — no cohort, no HELLO, no admission —
+     * so it works across build skew, which is exactly when status matters. */
+    CBM_DAEMON_RUNTIME_OP_STATUS = 10,
+    /* `daemon stop`. Same authentication shape as STATUS. Refuses while
+     * committed clients exist (their pids come back in the response) and
+     * otherwise begins the normal stopping sequence — including for a
+     * PERMANENT generation, which this op and process kill alone may end. */
+    CBM_DAEMON_RUNTIME_OP_STOP = 11,
 } cbm_daemon_runtime_operation_t;
 
 typedef enum {
@@ -170,6 +193,10 @@ typedef struct {
      * required. Function pointers and context are copied; the context's owner
      * must keep it alive until service_free returns true. */
     cbm_daemon_runtime_application_callbacks_t application;
+    /* Born via `daemon start`: the service does not begin stopping when its
+     * last committed client disconnects; only the stop/drain ops or an
+     * explicit process kill end it. */
+    bool permanent;
 } cbm_daemon_runtime_service_config_t;
 
 typedef enum {
@@ -226,6 +253,40 @@ bool cbm_daemon_runtime_request_activation_shutdown(
     const cbm_daemon_ipc_endpoint_t *endpoint, const cbm_daemon_build_identity_t *identity,
     cbm_daemon_runtime_activation_action_t action, uint32_t timeout_ms,
     cbm_daemon_runtime_activation_result_t *result_out);
+
+typedef struct {
+    bool permanent;
+    bool stopping;
+    uint16_t committed_clients;
+    uint32_t daemon_pid;
+    uint8_t client_count; /* entries in client_pids, capped at the wire limit */
+    uint32_t client_pids[CBM_DAEMON_CONTROL_CLIENT_CAP];
+    char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char semantic_version[12];
+} cbm_daemon_runtime_status_t;
+
+typedef struct {
+    bool accepted; /* stopping was initiated */
+    bool busy;     /* refused: committed clients hold the daemon */
+    uint16_t committed_clients;
+    uint8_t client_count;
+    uint32_t client_pids[CBM_DAEMON_CONTROL_CLIENT_CAP];
+} cbm_daemon_runtime_stop_result_t;
+
+/* One-shot authenticated status probe (no cohort, no HELLO, no admission).
+ * Works across build skew. A true return means a valid response arrived. */
+bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                       const cbm_daemon_build_identity_t *identity,
+                                       uint32_t timeout_ms,
+                                       cbm_daemon_runtime_status_t *status_out);
+
+/* One-shot authenticated stop request. Refuses while committed clients exist
+ * (result_out lists their pids); otherwise begins the stopping sequence, for
+ * permanent generations too. */
+bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                     const cbm_daemon_build_identity_t *identity,
+                                     uint32_t timeout_ms,
+                                     cbm_daemon_runtime_stop_result_t *result_out);
 
 /* Performs the complete guarded first-participant handoff, starts listening
  * synchronously, then owns both that participant claim and its

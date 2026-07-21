@@ -17,7 +17,8 @@
 #include <stdint.h>
 
 #define CBM_DAEMON_INTERNAL_ARG "--cbm-daemon-internal"
-#define CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC 2U
+#define CBM_DAEMON_PERMANENT_ARG "--cbm-daemon-permanent"
+#define CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC 3U
 
 typedef enum {
     CBM_DAEMON_PROCESS_INVALID = 0,
@@ -27,6 +28,7 @@ typedef enum {
     CBM_DAEMON_PROCESS_MCP_CLIENT,
     CBM_DAEMON_PROCESS_LOCAL_CLI,
     CBM_DAEMON_PROCESS_HOOK_CLIENT,
+    CBM_DAEMON_PROCESS_DAEMON_CTL,
 } cbm_daemon_process_role_t;
 
 /* Pure argv classifier. argv[0] is the executable. The hidden daemon role is
@@ -59,6 +61,12 @@ typedef struct {
 bool cbm_daemon_bootstrap_launch_spec_init(const char *executable_path,
                                            cbm_daemon_bootstrap_launch_spec_t *spec_out);
 
+/* Same launch policy, but the child is born PERMANENT: it survives its last
+ * client disconnect and stops only via `daemon stop`, the install/update
+ * drain, or an explicit process kill. Only `daemon start` uses this. */
+bool cbm_daemon_bootstrap_launch_spec_init_permanent(const char *executable_path,
+                                                     cbm_daemon_bootstrap_launch_spec_t *spec_out);
+
 typedef enum {
     CBM_DAEMON_BOOTSTRAP_FAILED = 0,
     CBM_DAEMON_BOOTSTRAP_BYPASSED,
@@ -73,6 +81,10 @@ typedef struct {
     const char *executable_path;
     uint32_t connect_timeout_ms;
     uint32_t startup_timeout_ms;
+    /* `daemon start` only: an absent endpoint is replaced by a PERMANENT
+     * generation instead of an ephemeral one. Client bootstraps leave this
+     * false — they must never mint permanence implicitly. */
+    bool spawn_permanent;
 } cbm_daemon_bootstrap_config_t;
 
 typedef struct {

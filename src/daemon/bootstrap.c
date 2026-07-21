@@ -139,8 +139,17 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
 
     int daemon_arg = bootstrap_find_arg(argc, argv, CBM_DAEMON_INTERNAL_ARG);
     if (daemon_arg >= 0) {
-        return argc == 2 && daemon_arg == 1 ? CBM_DAEMON_PROCESS_DAEMON
-                                            : CBM_DAEMON_PROCESS_INVALID;
+        /* Byte-exact daemon-role grammar, deliberately unforgiving: the bare
+         * internal marker, or the marker followed by exactly the permanent
+         * flag. Every other shape — reordered, repeated, or extended — is
+         * INVALID, so argv smuggling cannot reach the daemon role. */
+        if (argc == 2 && daemon_arg == 1) {
+            return CBM_DAEMON_PROCESS_DAEMON;
+        }
+        if (argc == 3 && daemon_arg == 1 && bootstrap_arg_is(argv[2], CBM_DAEMON_PERMANENT_ARG)) {
+            return CBM_DAEMON_PROCESS_DAEMON;
+        }
+        return CBM_DAEMON_PROCESS_INVALID;
     }
 
     int worker_arg = bootstrap_find_arg(argc, argv, "--index-worker");
@@ -170,6 +179,12 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
         if (bootstrap_arg_is(argv[arg], "config")) {
             return bootstrap_has_help_after(argc, argv, arg + 1) ? CBM_DAEMON_PROCESS_STATELESS
                                                                  : CBM_DAEMON_PROCESS_LOCAL_CLI;
+        }
+        /* Placed after the `cli` check on purpose: `cbm cli search "daemon
+         * start"` is opaque tool input and must stay LOCAL_CLI. */
+        if (bootstrap_arg_is(argv[arg], "daemon")) {
+            return bootstrap_has_help_after(argc, argv, arg + 1) ? CBM_DAEMON_PROCESS_STATELESS
+                                                                 : CBM_DAEMON_PROCESS_DAEMON_CTL;
         }
         if (bootstrap_arg_is(argv[arg], "--version") || bootstrap_arg_is(argv[arg], "--help") ||
             bootstrap_arg_is(argv[arg], "-h")) {
@@ -206,10 +221,20 @@ bool cbm_daemon_bootstrap_launch_spec_init(const char *executable_path,
     spec_out->executable_path = executable_path;
     spec_out->argv[0] = executable_path;
     spec_out->argv[1] = CBM_DAEMON_INTERNAL_ARG;
-    spec_out->argc = CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC;
+    spec_out->argc = 2U;
     spec_out->detached = true;
     spec_out->inherit_standard_handles = false;
     spec_out->use_shell = false;
+    return true;
+}
+
+bool cbm_daemon_bootstrap_launch_spec_init_permanent(const char *executable_path,
+                                                     cbm_daemon_bootstrap_launch_spec_t *spec_out) {
+    if (!cbm_daemon_bootstrap_launch_spec_init(executable_path, spec_out)) {
+        return false;
+    }
+    spec_out->argv[2] = CBM_DAEMON_PERMANENT_ARG;
+    spec_out->argc = 3U;
     return true;
 }
 
@@ -286,7 +311,9 @@ static cbm_daemon_bootstrap_status_t bootstrap_finish_probe(
                        connect_result && connect_result->message[0]
                            ? connect_result->message
                            : "CBM could not start because a conflicting CBM process is active; "
-                             "close all CBM sessions and commands, then retry");
+                             "close all CBM sessions and commands, then retry. If a permanent "
+                             "daemon from another build is running, `codebase-memory-mcp daemon "
+                             "stop` retires it");
         if (ops->visible_diagnostic) {
             ops->visible_diagnostic(ops->context, result->message);
         }
@@ -437,8 +464,11 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
 
         cbm_daemon_bootstrap_launch_spec_t spec;
-        if (!cbm_daemon_bootstrap_launch_spec_init(config->executable_path, &spec) ||
-            !ops->startup_lock_prepare_handoff(ops->context, startup_lock) ||
+        bool spec_ready =
+            config->spawn_permanent
+                ? cbm_daemon_bootstrap_launch_spec_init_permanent(config->executable_path, &spec)
+                : cbm_daemon_bootstrap_launch_spec_init(config->executable_path, &spec);
+        if (!spec_ready || !ops->startup_lock_prepare_handoff(ops->context, startup_lock) ||
             !ops->spawn_daemon(ops->context, &spec)) {
             probe = CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
             break;
